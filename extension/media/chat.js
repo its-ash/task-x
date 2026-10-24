@@ -926,7 +926,7 @@
   }
   function recallPrompt(i) {
     histIndex = i;
-    input.value = i < 0 ? histDraft : promptHistory[i];
+    input.value = i < 0 ? histDraft : promptHistory.at(-1 - i);
     input.setSelectionRange(input.value.length, input.value.length);
     autosize();
   }
