@@ -36,6 +36,10 @@ const MAX_LISTED_FILES = 20_000;
 const FILE_EXCLUDE = '**/{node_modules,.git,target,out,dist,build,.next,.venv,__pycache__}/**';
 const CLAUDE_SESSIONS_KEY = 'task-x.claudeSessions';
 const TASK_KEY = 'task-x.taskId';
+/** Saved chats for the History tab, newest first; this also keeps Claude Code chats, which the runtime does not store. */
+const CHATS_KEY = 'task-x.chats';
+const MAX_CHATS = 50;
+const MAX_TITLE = 80;
 const MAX_ITEMS = 400;
 const MAX_INPUT_CHARS = 100_000;
 const MAX_SELECTION_CHARS = 20_000;
@@ -146,7 +150,9 @@ type Inbound =
   | { type: 'toggleEditor'; include: boolean }
   | { type: 'showGraph' }
   | { type: 'listTasks' }
-  | { type: 'openTask'; id: string };
+  | { type: 'openTask'; id: string }
+  | { type: 'deleteTask'; id: string }
+  | { type: 'clearHistory' };
 
 /** One saved task in the History tab. */
 interface TaskRow {
@@ -156,6 +162,21 @@ interface TaskRow {
   chatMode: ChatMode;
   updatedMs: number;
   changedFiles: string[];
+}
+
+/** One row of the History tab. */
+interface HistoryRow {
+  id: string;
+  title: string;
+  status: string;
+  mode: ChatMode;
+  updatedMs: number;
+  files: number;
+}
+
+/** A chat transcript saved in workspace state. */
+interface SavedChat extends HistoryRow {
+  items: Item[];
 }
 
 interface PendingFile {
@@ -328,6 +349,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   async clear(): Promise<void> {
     this.cancel();
+    await this.archive();
     this.items = [];
     this.taskId = undefined;
     this.diffs.clear();
@@ -366,10 +388,70 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     void this.view?.webview.postMessage(msg);
   }
 
-  private async persist(): Promise<void> {
+  private async persist(archive = true): Promise<void> {
     this.items = this.items.slice(-MAX_ITEMS);
     await this.ctx.workspaceState.update(TRANSCRIPT_KEY, this.items);
     await this.ctx.workspaceState.update(TASK_KEY, this.taskId);
+    if (archive) await this.archive();
+  }
+
+  private chats(): SavedChat[] {
+    const list = this.ctx.workspaceState.get<SavedChat[]>(CHATS_KEY, []);
+    return Array.isArray(list) ? list.filter((c) => typeof c?.id === 'string' && Array.isArray(c.items)) : [];
+  }
+
+  /** Saves the current chat to the History list. The time changes only when the transcript grows. */
+  private async archive(): Promise<void> {
+    const id = this.taskId;
+    const first = this.items.find((i): i is Extract<Item, { kind: 'user' }> => i.kind === 'user');
+    if (!id || !first) return;
+    const all = this.chats();
+    const prev = all.find((c) => c.id === id);
+    const last = this.items.findLast((i): i is Extract<Item, { kind: 'summary' }> => i.kind === 'summary');
+    const chat: SavedChat = {
+      id,
+      title: first.text.trim().split('\n')[0].slice(0, MAX_TITLE) || '(untitled)',
+      status: last ? (last.ok ? 'completed' : 'failed') : 'cancelled',
+      mode: first.mode,
+      updatedMs: prev && prev.items.length === this.items.length ? prev.updatedMs : Date.now(),
+      files: new Set(this.items.flatMap((i) => (i.kind === 'file' ? [i.path] : []))).size,
+      items: this.items,
+    };
+    const rest = all.filter((c) => c.id !== id);
+    await this.ctx.workspaceState.update(CHATS_KEY, [chat, ...rest].sort((a, b) => b.updatedMs - a.updatedMs).slice(0, MAX_CHATS));
+  }
+
+  /** Deletes one saved chat here and in the runtime; the open chat starts fresh when it is the one deleted. */
+  async deleteTask(id: string): Promise<void> {
+    await this.ctx.workspaceState.update(CHATS_KEY, this.chats().filter((c) => c.id !== id));
+    await this.getClient()
+      .then((c) => c.request('agent/deleteTask', { taskId: id }))
+      .catch((e) => this.log('warn', `deleteTask: ${describeError(e)}`));
+    if (id === this.taskId) {
+      this.items = [];
+      await this.newChat();
+    }
+    await this.postTasks();
+  }
+
+  /** Deletes all saved chats after the user confirms. */
+  async clearHistory(): Promise<void> {
+    const ok = 'Delete All';
+    if ((await vscode.window.showWarningMessage('Delete all saved chats? You cannot undo this.', { modal: true }, ok)) !== ok) return;
+    const ids = new Set(this.chats().map((c) => c.id));
+    try {
+      const client = await this.getClient();
+      for (const t of await client.request<TaskRow[]>('agent/tasks')) if (typeof t?.id === 'string') ids.add(t.id);
+      for (const id of ids) await client.request('agent/deleteTask', { taskId: id });
+    } catch (e) {
+      this.log('warn', `clearHistory: ${describeError(e)}`);
+    }
+    await this.ctx.workspaceState.update(CHATS_KEY, []);
+    if (this.taskId && ids.has(this.taskId)) {
+      this.items = [];
+      await this.newChat();
+    }
+    await this.postTasks();
   }
 
   private add(item: Item): void {
@@ -445,6 +527,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (typeof m.id === 'string' && m.id.length <= 100) {
           await this.openTask(m.id).catch((e) => vscode.window.showErrorMessage(`task-x: ${describeError(e)}`));
         }
+        break;
+      case 'deleteTask':
+        if (typeof m.id === 'string' && m.id.length <= 100) await this.deleteTask(m.id);
+        break;
+      case 'clearHistory':
+        await this.clearHistory();
         break;
       case 'keep':
       case 'revert':
@@ -566,18 +654,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.post({ type: 'editor', file: rel ?? null, selection: sel, include: this.includeEditor });
   }
 
-  /** Saved tasks for the History tab, newest first. */
+  /** Saved chats for the History tab: runtime tasks merged with the chats kept here, newest first. */
   private async postTasks(): Promise<void> {
+    const byId = new Map<string, HistoryRow>();
+    let error: string | undefined;
     try {
       const rows = await (await this.getClient()).request<TaskRow[]>('agent/tasks');
-      const tasks = rows
-        .filter((t) => typeof t?.id === 'string')
-        .sort((a, b) => (b.updatedMs ?? 0) - (a.updatedMs ?? 0))
-        .map((t) => ({ id: t.id, title: t.title || '(untitled)', status: t.status, mode: t.chatMode, updatedMs: t.updatedMs, files: t.changedFiles?.length ?? 0 }));
-      this.post({ type: 'tasks', tasks, current: this.taskId ?? null });
+      for (const t of rows) {
+        if (typeof t?.id !== 'string') continue;
+        byId.set(t.id, { id: t.id, title: t.title || '(untitled)', status: t.status, mode: t.chatMode, updatedMs: t.updatedMs ?? 0, files: t.changedFiles?.length ?? 0 });
+      }
     } catch (e) {
-      this.post({ type: 'tasks', tasks: [], current: this.taskId ?? null, error: describeError(e) });
+      error = describeError(e);
     }
+    for (const { items: _, ...c } of this.chats()) {
+      const r = byId.get(c.id);
+      byId.set(c.id, r ? { ...r, updatedMs: Math.max(r.updatedMs, c.updatedMs), files: Math.max(r.files, c.files) } : c);
+    }
+    const tasks = [...byId.values()].sort((a, b) => b.updatedMs - a.updatedMs);
+    this.post({ type: 'tasks', tasks, current: this.taskId ?? null, error: tasks.length ? undefined : error });
   }
 
   /** Indexing status for the input's index button and the welcome screen. */
@@ -996,6 +1091,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Switches the chat to an earlier task and shows its conversation. */
   async openTask(taskId: string): Promise<void> {
     if (this.busy) return void vscode.window.showWarningMessage('task-x is busy. Stop the current request first.');
+    await this.archive();
+    const saved = this.chats().find((c) => c.id === taskId);
+    this.items = saved ? saved.items : await this.loadTask(taskId);
+    this.taskId = taskId;
+    this.diffs.clear();
+    this.outputs.clear();
+    await this.persist(false);
+    this.post({ type: 'history', items: this.items });
+    this.post({ type: 'contextUsage', used: 0, window: 0 });
+    this.post({ type: 'view', view: 'chat' });
+    await vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
+  }
+
+  /** Rebuilds a transcript from a task the runtime saved. */
+  private async loadTask(taskId: string): Promise<Item[]> {
     const client = await this.getClient();
     const t = await client.request<{ summary: AgentSummary; messages: { role: 'user' | 'assistant'; content: { type: string; text?: string }[] }[] }>('agent/task', { taskId });
     const items: Item[] = [];
@@ -1010,14 +1120,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
     }
     items.push({ kind: 'summary', ...summaryText(t.summary) });
-    this.items = items;
-    this.taskId = taskId;
-    this.diffs.clear();
-    await this.persist();
-    this.post({ type: 'history', items: this.items });
-    this.post({ type: 'contextUsage', used: 0, window: 0 });
-    this.post({ type: 'view', view: 'chat' });
-    await vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
+    return items;
   }
 
   get currentTaskId(): string | undefined {

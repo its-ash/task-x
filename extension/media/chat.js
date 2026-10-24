@@ -824,29 +824,66 @@
     if (d.getFullYear() === now.getFullYear()) return d.toLocaleString(undefined, { month: 'long' });
     return String(d.getFullYear());
   }
+  const SORTS = {
+    recent: ['Newest first', (a, b) => b.updatedMs - a.updatedMs],
+    oldest: ['Oldest first', (a, b) => a.updatedMs - b.updatedMs],
+    title: ['Title A–Z', (a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base', numeric: true }) || b.updatedMs - a.updatedMs],
+  };
+  let historySort = SORTS[vscode.getState()?.historySort] ? vscode.getState().historySort : 'recent';
+  let lastTasks = null;
+  function historyHead(count) {
+    const head = el('div', 'history-head');
+    const sel = el('select', 'history-sort');
+    sel.setAttribute('aria-label', 'Sort history');
+    for (const [k, [label]] of Object.entries(SORTS)) {
+      const o = el('option', '', label);
+      o.value = k;
+      o.selected = k === historySort;
+      sel.append(o);
+    }
+    sel.addEventListener('change', () => {
+      historySort = sel.value;
+      vscode.setState({ ...(vscode.getState() || {}), historySort });
+      renderTasks(lastTasks);
+      historyBox.querySelector('.history-sort')?.focus();
+    });
+    head.append(el('span', 'history-count', `${count} chat${count === 1 ? '' : 's'}`), el('span', 'spacer'), sel,
+      button('btn small history-clear', [icon('trash'), 'Clear all'], () => vscode.postMessage({ type: 'clearHistory' }), 'Delete all saved chats'));
+    return head;
+  }
   function renderTasks(m) {
+    lastTasks = m;
     historyBox.replaceChildren();
     if (m.error) return void historyBox.append(el('div', 'history-empty', `Could not load history: ${m.error}`));
-    if (!m.tasks.length) return void historyBox.append(el('div', 'history-empty', 'No saved tasks yet.'));
+    if (!m.tasks.length) return void historyBox.append(el('div', 'history-empty', 'No saved chats yet.'));
+    historyBox.append(historyHead(m.tasks.length));
+    const tasks = [...m.tasks].sort(SORTS[historySort][1]);
     let group = null, list = null;
-    m.tasks.forEach((t, i) => {
-      const g = dayGroup(t.updatedMs);
-      if (g !== group) {
+    tasks.forEach((t, i) => {
+      const g = historySort === 'title' ? '' : dayGroup(t.updatedMs);
+      if (!list || g !== group) {
         group = g;
-        historyBox.append(el('div', 'history-group', g));
+        if (g) historyBox.append(el('div', 'history-group', g));
         list = el('div', 'history-list');
         historyBox.append(list);
       }
       const [name, ...mods] = (STATUS_ICONS[t.status] || 'warning').split(' ');
-      const row = button('history-row' + (t.id === m.current ? ' current' : ''), [], () => vscode.postMessage({ type: 'openTask', id: t.id }), t.title);
-      row.style.setProperty('--i', String(Math.min(i, 20)));
+      const item = el('div', 'history-item' + (t.id === m.current ? ' current' : ''));
+      item.style.setProperty('--i', String(Math.min(i, 20)));
+      const row = button('history-row', [], () => vscode.postMessage({ type: 'openTask', id: t.id }), t.title);
+      const del = button('history-delete', icon('trash'), () => {
+        m.tasks = m.tasks.filter((x) => x.id !== t.id);
+        renderTasks(m);
+        vscode.postMessage({ type: 'deleteTask', id: t.id });
+      }, `Delete "${t.title}"`);
+      item.append(row, del);
       const time = new Date(t.updatedMs);
       const when = g === 'Today' || g === 'Yesterday' ? time.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : time.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
       const meta = [t.mode === 'ask' ? 'Ask' : 'Agent', t.files ? `${t.files} file${t.files > 1 ? 's' : ''}` : '', when].filter(Boolean).join(' · ');
       const text = el('span', 'history-text');
       text.append(el('span', 'history-title', t.title), el('span', 'history-meta', meta));
       row.append(icon(name, ['status', t.status, ...mods].join(' ')), text);
-      list.append(row);
+      list.append(item);
     });
   }
 

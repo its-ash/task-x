@@ -67,10 +67,18 @@ body[data-view="history"] #log, body[data-view="history"] #changes, body[data-vi
 #history { flex: 1; overflow-y: auto; padding: 6px 8px 16px; }
 #history[hidden] { display: none; }
 .history-group { padding: 12px 8px 4px; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.history-head { display: flex; align-items: center; gap: 6px; padding: 4px 8px 2px; font-size: 11px; color: var(--muted); }
+.history-head .spacer { flex: 1; }
+.history-sort { padding: 2px 4px; border: 1px solid var(--border); border-radius: 6px; font: inherit; color: var(--fg); background: var(--vscode-dropdown-background, transparent); }
+.history-clear { display: inline-flex; align-items: center; gap: 4px; }
 .history-list { display: flex; flex-direction: column; gap: 2px; }
-.history-row { display: flex; align-items: flex-start; gap: 10px; width: 100%; padding: 8px; border: 0; border-radius: 8px; font: inherit; text-align: left; color: var(--fg); background: none; cursor: pointer; animation: md-enter var(--md-duration-short4) var(--md-motion-emphasized-decelerate) both; animation-delay: calc(var(--i, 0) * 18ms); }
-.history-row:hover { background: color-mix(in srgb, var(--fg) 7%, transparent); }
-.history-row.current { background: var(--accent-soft); }
+.history-item { display: flex; align-items: flex-start; border-radius: 8px; animation: md-enter var(--md-duration-short4) var(--md-motion-emphasized-decelerate) both; animation-delay: calc(var(--i, 0) * 18ms); }
+.history-item:hover { background: color-mix(in srgb, var(--fg) 7%, transparent); }
+.history-item.current { background: var(--accent-soft); }
+.history-row { display: flex; flex: 1; align-items: flex-start; gap: 10px; min-width: 0; padding: 8px; border: 0; border-radius: 8px; font: inherit; text-align: left; color: var(--fg); background: none; cursor: pointer; }
+.history-delete { flex: none; margin: 4px 4px 0 0; padding: 4px; border: 0; border-radius: 6px; color: var(--muted); background: none; cursor: pointer; opacity: 0; }
+.history-item:hover .history-delete, .history-delete:focus-visible { opacity: 1; }
+.history-delete:hover { color: var(--bad); background: color-mix(in srgb, var(--fg) 10%, transparent); }
 .history-row .status { margin-top: 2px; color: var(--muted); }
 .history-row .status.completed { color: var(--ok); }
 .history-row .status.failed { color: var(--bad); }
@@ -78,7 +86,7 @@ body[data-view="history"] #log, body[data-view="history"] #changes, body[data-vi
 .history-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .history-meta { font-size: 11px; color: var(--muted); }
 .history-empty { padding: 24px 8px; text-align: center; color: var(--muted); }
-@media (prefers-reduced-motion: reduce) { .history-row { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .history-item { animation: none; } }
 
 /* Turns */
 .turn { padding: 14px 0 4px; }
