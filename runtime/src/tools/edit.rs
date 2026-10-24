@@ -3,7 +3,7 @@
 
 use super::schema::{int, object, path};
 use super::{FileChange, Permission, ToolCtx, ToolDef, ToolError, ToolErrorKind, ToolResult, fingerprint, parse, patch, tool};
-use crate::context::index::MAX_FILE_BYTES;
+use crate::context::index::{MAX_FILE_BYTES, is_secret};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use similar::TextDiff;
@@ -117,6 +117,10 @@ pub struct Change {
 }
 
 pub fn diff(rel: &str, before: Option<&str>, after: Option<&str>) -> String {
+    // Secret files show no content: the diff goes to the model, the UI, and the saved transcript.
+    if is_secret(rel) {
+        return format!("{rel}: secret file, contents not shown\n");
+    }
     TextDiff::from_lines(before.unwrap_or(""), after.unwrap_or(""))
         .unified_diff()
         .context_radius(3)
@@ -125,7 +129,7 @@ pub fn diff(rel: &str, before: Option<&str>, after: Option<&str>) -> String {
 }
 
 fn load(c: &ToolCtx, raw: &str) -> Result<(PathBuf, String, String), ToolError> {
-    let (abs, rel) = c.resolve_existing(raw)?;
+    let (abs, rel) = c.resolve_existing_write(raw)?;
     let text = read_existing(&abs, &rel)?;
     Ok((abs, rel, text))
 }
@@ -291,7 +295,7 @@ fn edit_files(c: &ToolCtx, input: Value) -> ToolResult {
         let mut v = raw;
         let all = v.as_object_mut().and_then(|o| o.remove("all")).is_some_and(|a| a.as_bool() == Some(true));
         let e: ReplaceIn = parse(v).map_err(|err| ToolError::invalid(format!("edits[{k}]: {}", err.message)))?;
-        let (abs, rel) = c.resolve_existing(&e.path)?;
+        let (abs, rel) = c.resolve_existing_write(&e.path)?;
         let idx = match changes.iter().position(|ch| ch.rel == rel) {
             Some(x) => x,
             None => {
@@ -380,7 +384,7 @@ fn create_file(c: &ToolCtx, input: Value) -> ToolResult {
         overwrite: bool,
     }
     let i: In = parse(input)?;
-    let (abs, rel) = c.resolve_new_secret(&i.path)?;
+    let (abs, rel) = c.resolve_write(&i.path)?;
     if abs.is_dir() {
         return Err(ToolError::invalid(format!("{rel} is a directory")));
     }
@@ -407,7 +411,7 @@ fn rename_file(c: &ToolCtx, input: Value) -> ToolResult {
     }
     let i: In = parse(input)?;
     let (from_abs, from_rel, text) = load(c, &i.from)?;
-    let (to_abs, to_rel) = c.resolve(&i.to)?;
+    let (to_abs, to_rel) = c.resolve_write(&i.to)?;
     if to_abs.exists() {
         return Err(ToolError::new(ToolErrorKind::Conflict, format!("{to_rel} already exists")));
     }
@@ -443,7 +447,7 @@ fn apply_patch(c: &ToolCtx, input: Value) -> ToolResult {
     let mut changes = Vec::new();
     for fp in &files {
         let target = fp.new_path.as_ref().or(fp.old_path.as_ref()).ok_or_else(|| ToolError::invalid("patch has no file path"))?;
-        let (abs, rel) = c.resolve(target)?;
+        let (abs, rel) = c.resolve_write(target)?;
         if changes.iter().any(|ch: &Change| ch.rel == rel) {
             return Err(ToolError::invalid(format!("{rel} appears twice in the patch")));
         }
@@ -461,7 +465,7 @@ fn apply_patch(c: &ToolCtx, input: Value) -> ToolResult {
         };
         if let (Some(old), Some(new)) = (&fp.old_path, &fp.new_path) {
             if old != new {
-                let (old_abs, old_rel) = c.resolve(old)?;
+                let (old_abs, old_rel) = c.resolve_write(old)?;
                 changes.push(Change { abs: old_abs, rel: old_rel, before: before.clone(), after: None });
                 changes.push(Change { abs, rel, before: None, after });
                 continue;

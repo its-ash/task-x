@@ -388,9 +388,9 @@ impl ToolCtx {
         self.resolve_with(raw, false)
     }
 
-    /// Like `resolve`, but a secret file name (`.env`, keys) is allowed. Only `create_file` uses it,
-    /// so the agent can write new config files without reading or searching them.
-    pub fn resolve_new_secret(&self, raw: &str) -> Result<(PathBuf, String), ToolError> {
+    /// Like `resolve`, but secret file names (`.env`, keys) are allowed. Used by write tools only:
+    /// the agent can change config files without reading or searching them.
+    pub fn resolve_write(&self, raw: &str) -> Result<(PathBuf, String), ToolError> {
         self.resolve_with(raw, true)
     }
 
@@ -433,7 +433,16 @@ impl ToolCtx {
     /// Like `resolve`, but a missing path that names exactly one indexed file by its trailing
     /// components (e.g. `Grid.vue` for `src/components/Grid.vue`) resolves to that file.
     pub fn resolve_existing(&self, raw: &str) -> Result<(PathBuf, String), ToolError> {
-        let (abs, rel) = self.resolve(raw)?;
+        self.existing(raw, false)
+    }
+
+    /// `resolve_existing` for write tools, which may target secret file names.
+    pub fn resolve_existing_write(&self, raw: &str) -> Result<(PathBuf, String), ToolError> {
+        self.existing(raw, true)
+    }
+
+    fn existing(&self, raw: &str, allow_secret: bool) -> Result<(PathBuf, String), ToolError> {
+        let (abs, rel) = self.resolve_with(raw, allow_secret)?;
         if abs.exists() {
             return Ok((abs, rel));
         }
@@ -441,7 +450,7 @@ impl ToolCtx {
         let hits: Vec<String> =
             self.with_workspace(|w| w.index.files().filter(|f| f.rel.ends_with(&suffix)).take(6).map(|f| f.rel.clone()).collect()).unwrap_or_default();
         match hits.as_slice() {
-            [one] => self.resolve(one),
+            [one] => self.resolve_with(one, allow_secret),
             [] => Ok((abs, rel)),
             many => Err(ToolError::new(ToolErrorKind::Ambiguous, format!("{rel} matches several files; use the full path: {}", many.join(", ")))),
         }
@@ -703,10 +712,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn create_file_writes_secret_names_but_reads_stay_blocked() {
-        let c = ctx(&[("a.txt", "x")]);
-        run(&c, "create_file", json!({ "path": ".env", "content": "KEY=1\n" })).unwrap();
-        assert_eq!(std::fs::read_to_string(c.root.join(".env")).unwrap(), "KEY=1\n");
+    fn write_tools_handle_secret_names_but_reads_and_diffs_stay_blocked() {
+        let c = ctx(&[("a.txt", "x"), (".env", "KEY=old\n")]);
+        run(&c, "create_file", json!({ "path": ".env.local", "content": "TOKEN=abc\n" })).unwrap();
+        assert_eq!(std::fs::read_to_string(c.root.join(".env.local")).unwrap(), "TOKEN=abc\n");
+        c.seen.lock().unwrap().clear();
+        let r = run(&c, "replace_text", json!({ "path": ".env", "oldText": "KEY=old", "newText": "KEY=new" })).unwrap();
+        assert_eq!(std::fs::read_to_string(c.root.join(".env")).unwrap(), "KEY=new\n");
+        assert!(!r.to_string().contains("KEY="), "secret values stay out of tool output");
         assert_eq!(c.resolve(".env").unwrap_err().kind, ToolErrorKind::Forbidden);
         assert!(run(&c, "create_file", json!({ "path": ".git/x", "content": "" })).is_err());
     }
