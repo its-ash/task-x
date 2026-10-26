@@ -445,8 +445,8 @@
         },
         "task-x.ollama.model": {
           "type": "string",
-          "default": "qwen3",
-          "description": "Ollama model name."
+          "default": "",
+          "description": "Ollama model name, such as qwen3:8b. Empty: pick an installed model in the model picker."
         },
         "task-x.ollama.baseUrl": {
           "type": "string",

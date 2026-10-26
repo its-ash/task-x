@@ -82,6 +82,22 @@ pub fn show_request(cfg: &ResolvedConfig) -> HttpRequest {
     HttpRequest::post(cfg.endpoint("/api/show"), headers(cfg), json!({ "model": cfg.model }))
 }
 
+/// `/api/show` for one named model.
+pub fn show_model_request(cfg: &ResolvedConfig, model: &str) -> HttpRequest {
+    HttpRequest::post(cfg.endpoint("/api/show"), headers(cfg), json!({ "model": model }))
+}
+
+/// One installed model: its `/api/tags` entry, and its `/api/show` answer when that worked.
+pub fn model_info(name: &str, tag: &Value, show: Option<&Value>) -> ModelInfo {
+    // `ModelInfo::new` keeps the known capabilities (Ollama also lists `completion` and `insert`).
+    let caps: Vec<&str> = show.and_then(|s| s["capabilities"].as_array()).into_iter().flatten().filter_map(Value::as_str).collect();
+    let mut info = ModelInfo::new(name, show.and_then(parse_context_window), &caps);
+    let d = &tag["details"];
+    let details: Vec<&str> = [d["parameter_size"].as_str(), d["quantization_level"].as_str()].into_iter().flatten().collect();
+    info.details = (!details.is_empty()).then(|| details.join(" · "));
+    info
+}
+
 /// The model's own context length from `/api/show` (`model_info.<arch>.context_length`).
 pub fn parse_context_window(v: &Value) -> Option<usize> {
     v["model_info"].as_object()?.iter().find(|(k, _)| k.ends_with(".context_length")).and_then(|(_, n)| n.as_u64()).map(|n| n as usize)

@@ -33,6 +33,7 @@ tracing-subscriber = "0.3"
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "net", "process"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 url = "2"
+tokio-tungstenite = "0.30"
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "net", "process"] }

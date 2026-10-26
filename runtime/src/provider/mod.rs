@@ -20,6 +20,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ERROR_BODY: usize = 64 * 1024;
 const MAX_ERROR_MESSAGE: usize = 500;
 const MAX_LISTED_MODELS: usize = 500;
+/// Ollama models asked about with `/api/show`, and how many of those requests run at once.
+const MAX_SHOWN_MODELS: usize = 100;
+const SHOW_BATCH: usize = 8;
 const SENSITIVE_HEADERS: [&str; 2] = ["authorization", "x-api-key"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +212,43 @@ impl Providers {
         Ok(models)
     }
 
+    /// Every model the endpoint offers, with its window and capabilities where they are known.
+    /// For Ollama, each installed model is asked about with `/api/show` (8 at a time).
+    pub async fn model_infos(&self, cfg: &ProviderConfig, cancel: &CancellationToken) -> Result<Vec<ModelInfo>, ProviderError> {
+        let r = cfg.resolve()?;
+        let mut out = match r.kind {
+            ProviderKind::Anthropic => {
+                anthropic::parse_model_infos(&self.get_json(anthropic::models_request(&r), r.timeout, cancel).await?)
+            }
+            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => {
+                openai::parse_model_infos(r.kind, &self.get_json(openai::models_request(&r), r.timeout, cancel).await?)
+            }
+            ProviderKind::Ollama => {
+                let tags = self.get_json(ollama::models_request(&r), r.timeout, cancel).await?;
+                let list: Vec<&Value> = tags["models"].as_array().into_iter().flatten().filter(|t| t["name"].is_string()).collect();
+                let mut infos = Vec::with_capacity(list.len());
+                for (i, chunk) in list.chunks(SHOW_BATCH).enumerate() {
+                    let shows = futures_util::future::join_all(chunk.iter().map(|t| async {
+                        let name = t["name"].as_str().unwrap_or_default();
+                        if i * SHOW_BATCH >= MAX_SHOWN_MODELS {
+                            return None;
+                        }
+                        self.get_json(ollama::show_model_request(&r, name), r.timeout, cancel).await.ok()
+                    }))
+                    .await;
+                    infos.extend(
+                        chunk.iter().zip(&shows).map(|(t, s)| ollama::model_info(t["name"].as_str().unwrap_or_default(), t, s.as_ref())),
+                    );
+                }
+                infos
+            }
+        };
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out.dedup_by(|a, b| a.id == b.id);
+        out.truncate(MAX_LISTED_MODELS);
+        Ok(out)
+    }
+
     /// Verifies connectivity and credentials, and refines capabilities where the endpoint exposes them.
     pub async fn test(&self, cfg: &ProviderConfig, cancel: &CancellationToken) -> Result<TestReport, ProviderError> {
         let resolved = cfg.resolve()?;
@@ -358,6 +398,42 @@ mod tests {
         assert_eq!(anthropic::parse_context_window("other", &anthropic), None);
         let openai = json!({ "data": [{ "id": "m", "context_length": 64_000 }] });
         assert_eq!(openai::parse_model_info("m", &openai), Some(64_000));
+    }
+
+    #[test]
+    fn describes_each_model_with_window_and_capabilities() {
+        let a = anthropic::parse_model_infos(
+            &json!({ "data": [{ "id": "claude-sonnet-4-6", "max_input_tokens": 1_000_000 }, { "id": "claude-3-5-haiku" }] }),
+        );
+        assert_eq!(a[0].context_window, Some(1_000_000));
+        assert_eq!(a[0].capabilities, ["tools", "vision", "thinking"]);
+        assert_eq!((a[1].context_window, a[1].capabilities.len()), (Some(200_000), 2), "the estimate fills in; 3.5 does not think");
+        let router = json!({ "data": [
+            { "id": "qwen/qwen3", "context_length": 40_960, "supported_parameters": ["tools", "reasoning"], "architecture": { "input_modalities": ["text"] } },
+            { "id": "google/gemma", "top_provider": { "context_length": 8192 }, "architecture": { "input_modalities": ["text", "image"] } },
+            { "id": "local", "max_model_len": 32_768 },
+            { "id": "bare" }
+        ] });
+        let r = openai::parse_model_infos(ProviderKind::OpenAiCompatible, &router);
+        assert_eq!((r[0].context_window, r[0].capabilities.clone()), (Some(40_960), vec!["tools".to_owned(), "thinking".to_owned()]));
+        assert_eq!((r[1].context_window, r[1].capabilities.clone()), (Some(8192), vec!["vision".to_owned()]));
+        assert_eq!(r[2].context_window, Some(32_768), "vLLM max_model_len");
+        assert_eq!((r[3].context_window, r[3].capabilities.len()), (None, 0), "unknown stays unknown");
+        let o = openai::parse_model_infos(
+            ProviderKind::OpenAi,
+            &json!({ "data": [{ "id": "gpt-4.1-mini" }, { "id": "text-embedding-3-small" }] }),
+        );
+        assert_eq!((o[0].context_window, o[0].capabilities.clone()), (Some(1_000_000), vec!["tools".to_owned(), "vision".to_owned()]));
+        assert_eq!(o[1].capabilities, ["embedding"]);
+        let tag = json!({ "name": "qwen3:8b", "details": { "parameter_size": "8.2B", "quantization_level": "Q4_K_M" } });
+        let show = json!({ "capabilities": ["completion", "tools", "thinking"], "model_info": { "qwen3.context_length": 40_960 } });
+        let l = ollama::model_info("qwen3:8b", &tag, Some(&show));
+        assert_eq!(
+            (l.context_window, l.capabilities.clone(), l.details.as_deref()),
+            (Some(40_960), vec!["tools".to_owned(), "thinking".to_owned()], Some("8.2B · Q4_K_M"))
+        );
+        assert_eq!(ollama::model_info("x", &json!({}), None), ModelInfo::new("x", None, &[]), "a failed /api/show leaves it unknown");
+        assert_eq!(serde_json::to_value(&l).unwrap()["contextWindow"], 40_960);
     }
 
     #[test]

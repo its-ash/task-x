@@ -19,13 +19,14 @@ This file records the state of the work between sessions. Mark an item done only
 - The timeline UI, the Anthropic sign-in flow, and the Logs panel inside VS Code
 - Inside VS Code: the project graph panel, the index status, the @ file menu and context chips, syntax highlighting, notifications, subagent lanes, the Team mode tab, the Compare panel (best of N), background tasks and the status bar count, and review findings in the Problems panel
 - Team mode and best of N against real models (only mock providers so far)
+- The `browser` tool against a live Chrome: only its endpoint check, argument validation, and JavaScript escaping are covered by tests; click, type, and navigation have not run against a real page
 
 | Phase | Status | Where |
 |---|---|---|
 | 1 Foundation, providers, JSON-RPC | ✅ | `runtime/src/{rpc,server}.rs`, `runtime/src/provider/`, `extension/src/{rpc,runtime,providerDialog}.ts` |
 | 2 Project discovery and context | ✅ | `runtime/src/context/`, `docs/context.md` |
 | 3 Prompt enrichment | ✅ | `runtime/src/agent/prompt.rs` |
-| 4 Tool registry (37 tools) | ✅ | `runtime/src/tools/` |
+| 4 Tool registry (38 tools) | ✅ | `runtime/src/tools/` |
 | 5 Agent loop | ✅ | `runtime/src/agent/{mod,store}.rs` |
 | 6 VS Code experience | ✅ core | `extension/src/{chatView,editorCommands,workspace}.ts`, `extension/media/` |
 | 7 Permissions, sandbox, recovery | ✅ | `agent/policy.rs`, `tools/exec.rs` (sandbox), `tools/mod.rs` (undo, keep/revert), `docs/security.md` |
@@ -43,8 +44,10 @@ This file records the state of the work between sessions. Mark an item done only
 | 17 Input context | ✅ runtime, 🟡 UI | `@path` mentions (`EditorContext.mentions`), file and selection chips, syntax highlighting (highlight.js), notifications (`task-x.notifications`) |
 | 21 MCP from Claude and Copilot, HTTP transports | ✅ runtime and import (unit tests), 🟡 manual check with Figma and Chrome DevTools | `runtime/src/mcp.rs` (stdio, streamable HTTP, HTTP+SSE), `extension/src/{mcpImport,mcpSources}.ts`, `task-x.mcp.import`, `claude/run` `mcpServers` |
 | 22 Images in chat | ✅ runtime (unit tests), 🟡 UI and real models | `ContentPart::Image` and `image_parts` in `provider/types.rs`, all three providers, `agent/run` and `claude/run` `images`; paste, drop, and pick in `media/chat.js` |
+| 24 Provider dialog and model picker | ✅ runtime and list logic (unit tests), 🟡 not checked inside VS Code | `provider/models` (`ModelInfo` in `provider/types.rs`), `extension/src/{models,providerDialog}.ts`, picker in `media/chat.js` |
 | 23 Release | 🟡 not run yet | `make deploy` (publishes `task-x.vsix` on the GitHub release), `make add` (installs it) |
 | 20 Safety and observability | 🟡 | `agent/policy.rs` (destructive tools need an `allow` entry), `tools/mod.rs` (`ErrorClass`, `TOOL_ATTEMPTS`, `retry_backoff`), `agent/mod.rs` (`synthesize` at the iteration and tool-call limits, retries for read-only calls, `info!` events for model and tool calls), `main.rs` (`TASK_X_LOG`) |
+| 25 Browser automation | ✅ runtime (unit tests), 🟡 not checked against a live Chrome | `tools/browser.rs` (CDP over a websocket), the `browser` tool: tabs, open, goto, click, type, press, screenshot, text, html, eval, wait, back, forward, close; `docs/security.md` |
 
 ## What each phase delivers
 

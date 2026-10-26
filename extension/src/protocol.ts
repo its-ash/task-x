@@ -215,6 +215,16 @@ export const USER_MODES: readonly ChatMode[] = ['agent'];
 export type ApprovalMode = 'readOnly' | 'askBeforeEdit' | 'askBeforeExecution' | 'autonomous';
 export type ApprovalDecision = 'allow' | 'allowSession' | 'deny';
 
+/** One entry of `provider/models`. */
+export interface ModelInfo {
+  id: string;
+  contextWindow?: number;
+  /** Any of `tools`, `vision`, `thinking`, `embedding`; empty when the endpoint does not say. */
+  capabilities: string[];
+  /** Size and quantization of a local model, such as `8.2B · Q4_K_M`. */
+  details?: string;
+}
+
 /** An image attached to a prompt: base64 `data` without a `data:` prefix. */
 export interface ImageInput {
   mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';

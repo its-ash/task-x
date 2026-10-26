@@ -92,7 +92,8 @@
       else if (e.key === 'ArrowUp') i <= 0 && search ? (e.preventDefault(), search.focus()) : go(i - 1);
       else if (e.key === 'Home' && !inSearch) go(0);
       else if (e.key === 'End' && !inSearch) go(items.length - 1);
-      else if (e.key === 'Tab') menu.hidePopover();
+      // The model picker has more than one area (search, providers, models), so Tab moves between them.
+      else if (e.key === 'Tab' && !menu.classList.contains('model-picker')) menu.hidePopover();
     });
     return menu;
   }
@@ -121,39 +122,78 @@
     menu.append(b);
   }
   const menuHeader = (menu, text) => menu.append(el('div', 'menu-header', text));
-  const menuSep = (menu) => menu.append(el('div', 'menu-sep'));
 
-  // Models picked before, listed first in the model menu.
+  // ---------- Model picker: providers on the left, their models on the right ----------
+  // Models picked before, listed first on the "All models" page.
   const MAX_RECENT = 5;
+  const CAPS = { tools: ['tools', 'Tools'], vision: ['eye', 'Vision'], thinking: ['lightbulb', 'Thinking'], embedding: ['symbol-array', 'Embedding'] };
   const recentModels = () => vscode.getState()?.recent ?? [];
   function rememberModel(kind, model) {
     const recent = [{ kind, model }, ...recentModels().filter((r) => r.kind !== kind || r.model !== model)].slice(0, MAX_RECENT);
     vscode.setState({ ...(vscode.getState() || {}), recent });
   }
-  const providerName = (kind) => state.modelGroups.find((g) => g.kind === kind)?.label.split(' · ')[0] ?? kind;
-  // Model list with search; refilled when the model list or the query changes.
+  // Every word of the query must appear in the model id, its provider, its size, or its capabilities.
+  const hits = (query, m, g) => {
+    const hay = `${m.id} ${g.label} ${m.details} ${m.caps.join(' ')}`.toLowerCase();
+    return query.split(/\s+/).filter(Boolean).every((w) => hay.includes(w));
+  };
+  // The picker is refilled when the model lists, the query, or the provider page change.
   let modelMenu = null;
   // The model menu sets the chat model, or a Night mode model: 'planner' (Think) or 'worker' (Loop, provider models only).
   const menuTarget = () => modelMenu?.target ?? 'main';
   const targetModel = (t) => (t === 'planner' ? state.nightPlanner : t === 'worker' ? state.nightWorker : state.active);
   const menuGroups = () => (menuTarget() === 'worker' ? state.modelGroups.filter((g) => g.kind !== 'claudeCode') : state.modelGroups);
-  // One tab per provider (built-in or named), plus All. The tab narrows the list below the search box.
-  function renderModelTabs() {
-    const { tabs } = modelMenu;
-    const all = [{ kind: 'all', label: 'All' }, ...menuGroups()];
-    if (!all.some((g) => g.kind === modelMenu.tab)) modelMenu.tab = 'all';
-    tabs.replaceChildren(...all.map((g) => {
-      const label = g.label.split(' · ')[0];
-      const t = button('model-tab', label, () => { modelMenu.tab = g.kind; fillModels(); }, label);
+  // The same model: an Ollama name without a tag means `:latest`.
+  const sameModel = (a, b) => !!a && !!b && (a === b || a === `${b}:latest` || b === `${a}:latest`);
+  const isCurrent = (current, g, m) => current?.kind === g.kind && sameModel(current?.model, m.id);
+  const groupIcon = (g) => (g.kind === 'claudeCode' ? 'sparkle' : g.local ? 'vm' : 'cloud');
+  // One row per model: id, context size, capability icons, and size or provider below.
+  function modelRow(list, g, m, { showProvider, checked, onSelect }) {
+    const b = el('button', 'menu-item model-item');
+    b.type = 'button';
+    b.setAttribute('role', 'menuitemradio');
+    b.setAttribute('aria-checked', String(!!checked));
+    const meta = el('span', 'model-meta');
+    if (m.ctx) meta.append(el('span', 'model-ctx', m.ctx));
+    for (const c of m.caps) {
+      const [ic, label] = CAPS[c] ?? ['circle-small', c];
+      const i = icon(ic, 'model-cap');
+      i.title = label;
+      meta.append(i);
+    }
+    // The name gets the whole first line; size, context, and capabilities go on the line below it.
+    const sub = [showProvider ? g.label : '', m.details].filter(Boolean).join(' · ');
+    if (sub) meta.append(el('span', 'model-sub', sub));
+    b.append(icon('check', 'check'), el('span', 'title', m.id));
+    if (meta.childNodes.length) b.append(meta);
+    b.title = [m.id, m.ctx && `${m.ctx} context`, m.caps.map((c) => CAPS[c]?.[1] ?? c).join(', '), m.details].filter(Boolean).join(' · ');
+    b.addEventListener('click', () => { b.closest('.menu')?.hidePopover(); onSelect(); });
+    list.append(b);
+  }
+  // Left side: All models, then one page per provider with its model count and status.
+  function renderModelSide() {
+    const { side, menu } = modelMenu;
+    const groups = menuGroups();
+    if (modelMenu.tab !== 'all' && !groups.some((g) => g.kind === modelMenu.tab)) modelMenu.tab = 'all';
+    const page = (kind, label, ic, count, status) => {
+      const t = button('mp-prov', [icon(ic), el('span', 'mp-name', label)], () => { modelMenu.tab = kind; fillModels(); modelMenu.input.focus(); }, label);
       t.setAttribute('role', 'tab');
-      t.setAttribute('aria-selected', String(g.kind === modelMenu.tab));
+      t.setAttribute('aria-selected', String(kind === modelMenu.tab));
+      t.append(status === 'loading' ? icon('loading', 'codicon-modifier-spin mp-status') : status === 'error' ? icon('warning', 'mp-status warn') : el('span', 'mp-count', count));
       return t;
-    }));
+    };
+    const total = groups.reduce((n, g) => n + g.models.length, 0);
+    const add = button('mp-prov mp-add', [icon('add'), el('span', 'mp-name', 'Add provider…')], () => { menu.hidePopover(); vscode.postMessage({ type: 'addProvider' }); }, 'Add a provider');
+    side.replaceChildren(
+      page('all', 'All models', 'list-flat', String(total)),
+      ...groups.map((g) => page(g.kind, g.label, groupIcon(g), String(g.models.length), g.loading ? 'loading' : g.error ? 'error' : '')),
+      add,
+    );
   }
   function fillModels() {
     if (!modelMenu) return;
     const { list, input: q } = modelMenu;
-    renderModelTabs();
+    renderModelSide();
     const query = q.value.trim().toLowerCase();
     const focused = document.activeElement === q;
     list.replaceChildren();
@@ -163,30 +203,37 @@
       rememberModel(kind, model);
       vscode.postMessage(target === 'main' ? { type: 'selectModel', kind, model } : { type: 'selectNightModel', role: target, kind, model });
     };
+    const all = modelMenu.tab === 'all';
+    const groups = all ? menuGroups() : menuGroups().filter((g) => g.kind === modelMenu.tab);
     let shown = 0;
-    const recent = query ? [] : recentModels().filter((r) => (modelMenu.tab === 'all' || modelMenu.tab === r.kind) && menuGroups().some((g) => g.kind === r.kind && g.models.includes(r.model)));
-    if (recent.length) {
-      menuHeader(list, 'Recent');
-      for (const r of recent) menuItem(list, { title: r.model, desc: providerName(r.kind), checked: current?.kind === r.kind && current?.model === r.model, onSelect: () => pick(r.kind, r.model) });
+    if (all && !query) {
+      const recent = recentModels()
+        .map((r) => { const g = groups.find((x) => x.kind === r.kind); const m = g?.models.find((x) => x.id === r.model); return g && m ? { g, m } : null; })
+        .filter(Boolean);
+      if (recent.length) menuHeader(list, 'Recent');
+      for (const { g, m } of recent) modelRow(list, g, m, { showProvider: true, checked: isCurrent(current, g, m), onSelect: () => pick(g.kind, m.id) });
     }
-    const groups = modelMenu.tab === 'all' ? menuGroups() : menuGroups().filter((g) => g.kind === modelMenu.tab);
     for (const g of groups) {
-      const groupHit = query && g.label.toLowerCase().includes(query);
-      const models = g.models.filter((n) => !query || groupHit || n.toLowerCase().includes(query));
+      const models = g.models.filter((m) => !query || hits(query, m, g));
       if (query && !models.length) continue;
-      menuHeader(list, g.label);
-      if (!g.models.length) list.append(el('div', 'menu-header muted', 'No model set'));
-      for (const name of models) {
-        const checked = current?.kind === g.kind && current?.model === name;
-        menuItem(list, { title: name, checked, onSelect: () => pick(g.kind, name) });
+      const head = el('div', 'menu-header mp-head');
+      head.append(icon(groupIcon(g)), el('span', null, g.label));
+      if (g.loading) head.append(icon('loading', 'codicon-modifier-spin'));
+      list.append(head);
+      if (g.error) list.append(el('div', 'menu-note error', g.error));
+      if (g.note) list.append(el('div', 'menu-note', g.note));
+      if (!g.models.length) list.append(el('div', 'menu-empty', g.loading ? 'Loading models…' : 'No models found.'));
+      for (const m of models) {
+        modelRow(list, g, m, { showProvider: false, checked: isCurrent(current, g, m), onSelect: () => pick(g.kind, m.id) });
         shown++;
       }
     }
     if (query && !shown) list.append(el('div', 'menu-empty', 'No models match.'));
+    // A model id the list does not have can still be set, for the open provider page or the current provider.
     const raw = q.value.trim();
-    const base = current ?? state.active;
-    if (raw && base && !(target === 'worker' && base.kind === 'claudeCode') && !menuGroups().some((g) => g.kind === base.kind && g.models.includes(raw))) {
-      menuItem(list, { icon: 'add', title: `Use "${raw}"`, desc: 'Set this model id for the current provider.', onSelect: () => pick(base.kind, raw) });
+    const base = all ? (current ?? state.active) : { kind: modelMenu.tab };
+    if (raw && base && !(target === 'worker' && base.kind === 'claudeCode') && !menuGroups().some((g) => g.kind === base.kind && g.models.some((m) => sameModel(m.id, raw)))) {
+      menuItem(list, { icon: 'add', title: `Use "${raw}"`, desc: `Set this model id for ${menuGroups().find((g) => g.kind === base.kind)?.label ?? 'the current provider'}.`, onSelect: () => pick(base.kind, raw) });
     }
     if (focused) q.focus();
     modelMenu.menu.place?.();
@@ -204,22 +251,22 @@
       q.addEventListener('keydown', (e) => {
         if (e.key !== 'Enter') return;
         e.preventDefault();
-        [...list.querySelectorAll('.menu-item')][0]?.click();
+        list.querySelector('.menu-item')?.click();
       });
-      box.append(icon('search'), q);
-      const list = el('div', 'menu-list');
-      const tabs = el('div', 'model-tabs');
-      tabs.setAttribute('role', 'tablist');
-      tabs.setAttribute('aria-label', 'Providers');
-      menu.classList.add('searchable');
+      const refresh = button('action', icon('refresh'), () => vscode.postMessage({ type: 'loadModels', force: true }), 'Load the model lists again');
+      box.append(icon('search'), q, refresh);
+      const side = el('div', 'mp-side');
+      side.setAttribute('role', 'tablist');
+      side.setAttribute('aria-label', 'Providers');
+      side.setAttribute('aria-orientation', 'vertical');
+      const list = el('div', 'menu-list mp-list');
+      const body = el('div', 'mp-body');
+      body.append(side, list);
+      menu.classList.add('searchable', 'model-picker');
       menu.addEventListener('toggle', (e) => { if (e.newState === 'closed' && modelMenu?.menu === menu) modelMenu = null; });
-      menu.append(box, tabs, list);
-      modelMenu = { menu, list, input: q, tabs, target, tab: targetModel(target)?.kind ?? state.active?.kind ?? 'all' };
+      menu.append(box, body);
+      modelMenu = { menu, list, side, input: q, target, tab: targetModel(target)?.kind ?? 'all' };
       fillModels();
-      menuSep(menu);
-      menuItem(menu, { icon: 'add', title: 'Add provider…', onSelect: () => vscode.postMessage({ type: 'addProvider' }) });
-      if (state.auth?.loggedIn) menuItem(menu, { icon: 'sign-out', title: 'Sign out of Anthropic', desc: state.auth.email, onSelect: () => vscode.postMessage({ type: 'signOut' }) });
-      else menuItem(menu, { icon: 'account', title: 'Sign in with Anthropic…', desc: 'Use your Claude account through Claude Code.', onSelect: () => vscode.postMessage({ type: 'signIn' }) });
     });
   }
   modelBtn.addEventListener('click', () => openModelMenu(modelBtn, 'main'));
@@ -1326,7 +1373,6 @@
       case 'models':
         state.modelGroups = m.groups;
         state.active = m.active;
-        state.auth = m.auth;
         renderToolbar();
         fillModels();
         break;

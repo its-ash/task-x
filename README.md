@@ -25,7 +25,7 @@ The `.vsix` holds a runtime built for the machine that published it (now macOS o
 **To use it:**
 
 1. Open the **task-x** view in the activity bar.
-2. Click **Add provider…** in the model picker, or run **task-x: Add LLM Provider…**. Set the type, base URL, key, and model, then click **Test connection** and **Save and use**. Or sign in with Anthropic to use Claude Code (`claude auth login`).
+2. Click **Add provider…** in the model picker, or run **task-x: Add LLM Provider…**. Select a provider on the left, fill in the base URL and key, select a model in the list, then click **Save and use**. Ollama models show without any setup. To use Claude, install the Claude Code CLI and run `claude auth login`.
 3. Type a request and press Enter. To show the agent a screenshot or a design, paste the image into the input, drop it on the input, or click the image button.
 4. Review the changed files in the panel above the input: open the diff, then click **Keep** or **Undo**.
 
@@ -42,7 +42,7 @@ The `.vsix` holds a runtime built for the machine that published it (now macOS o
 - **Auto-commit** (checkbox in the toolbar): when a task ends, commits the files that task changed, with the message `task-x: <first line of your request>`. Other staged or unstaged work in the repository is left alone. A failed commit, such as one blocked by a pre-commit hook, is reported in the chat and does not fail the task.
 - **Live edit cards:** each file edit appears in the timeline as it happens, with its `+/-` counts and an expandable diff. Keep or Undo a single edit from its card.
 - **Changed-files panel** above the input: open a file's diff, then Keep or Undo it, or Keep or Undo all changes.
-- **Model picker:** search, provider tabs, and a *Recent* list of the last five models you used.
+- **Model picker:** providers on the left, their models on the right, with each model's context size and capabilities (tools, vision, thinking). It lists the models of every configured provider at once, keeps the lists for 5 minutes (the refresh button loads them again), and searches every word you type across model ids, providers, sizes, and capabilities. *All models* starts with the last five models you used. Claude Code models show when the `claude` CLI is installed.
 - **Streaming Markdown** with syntax highlighting, copy buttons, and a tool timeline. Command output can be copied or opened in an editor.
 - **Input:** `@path` mentions for files and folders, `/` for skills, file and selection chips for the active editor (toggle whether they are sent), and queued messages while a task runs.
 - **Images:** paste, drop, or attach PNG, JPEG, GIF, or WebP images (up to 8, 5 MB each). They go to the model with the message: Anthropic, OpenAI, and OpenAI-compatible endpoints, Ollama vision models, and Claude Code. The model must support images.
@@ -62,8 +62,9 @@ The `.vsix` holds a runtime built for the machine that published it (now macOS o
 
 ### Providers
 
-- **Anthropic, OpenAI, OpenAI-compatible endpoints, and Ollama.** Use **Add LLM Provider…** to set the type, base URL, key, and model, then test the connection. API keys are stored in VS Code SecretStorage.
-- **Sign in with Anthropic:** run `claude auth login` in a terminal, then use your Claude account. Chat then runs through Claude Code (`task-x.engine`), and `task-x.claudeCode.useTaskXTools` gives it task-x's tools.
+- **OpenAI, OpenAI-compatible endpoints, and Ollama.** **Add LLM Provider…** lists the providers on the left. On the right, set the base URL and key, then pick a model from the list (with its size, context size, and capabilities) and **Save and use**. API keys are stored in VS Code SecretStorage.
+- **Ollama is found by itself:** the dialog lists the installed models from the Ollama server, or from `ollama list` when the server is not running (it then says how to start it).
+- **Claude through Claude Code:** with the `claude` CLI installed and signed in (`claude auth login` in a terminal), its models appear in the model picker, and chat runs through Claude Code (`task-x.engine`). `task-x.claudeCode.useTaskXTools` gives it task-x's tools.
 - **Routing and fallback:** pick a model per task kind (`task-x.routing`), and optionally fall back to other providers when one fails (`task-x.fallbackProviders`).
 
 ### Context and instructions
@@ -157,6 +158,7 @@ The tests use mock providers and local git repositories. They do not need API ke
 
 ## Documentation
 
+- [Landing page](docs/index.html) — served by GitHub Pages from `docs/`
 - [Runtime protocol](docs/protocol.md)
 - [Providers](docs/providers.md)
 - [Workspace context](docs/context.md)

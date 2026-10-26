@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
-import { activeRef, hasApiKey, isProviderRef, modelFor, nightModels, providerConfig, providerConfigWith, providerRefs, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
+import { activeRef, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
 import {
   type AgentEvent,
   type AgentEventParams,
@@ -18,12 +18,14 @@ import {
   type EditorContext,
   type ImageInput,
   imagesFrom,
+  type ModelInfo,
   type ProviderErrorData,
   type RefineResult,
   type ResolvedSkill,
   type SkillInfo,
 } from './protocol.js';
-import { CLAUDE_KIND, CLAUDE_LABEL, CLAUDE_MODELS, claudeAuth, claudeModel, claudePermissions, claudeSignIn, claudeSignOut, engine, findClaude, useClaude } from './claudeCode.js';
+import { CLAUDE_KIND, CLAUDE_LABEL, claudeAuth, claudeModel, claudePermissions, claudeSignIn, claudeSignOut, engine, findClaude, useClaude } from './claudeCode.js';
+import { CLAUDE_MODEL_INFO, type Listed, MODEL_LIST_TTL_MS, formatTokens, listModels, missingNote, withSaved } from './models.js';
 import { type JsonRpcClient, RpcError } from './rpc.js';
 import { diffStats, formatOutput } from './output.js';
 import { formatCost, limits, routes, runParams } from './runParams.js';
@@ -50,7 +52,8 @@ const MAX_TITLE = 80;
 const MAX_ITEMS = 400;
 const MAX_INPUT_CHARS = 100_000;
 const MAX_SELECTION_CHARS = 20_000;
-const MAX_PICKER_MODELS = 100;
+/** Models per provider in the picker. OpenRouter lists hundreds; a lower cap hid models from search. */
+const MAX_PICKER_MODELS = 500;
 const MAX_OPEN_FILES = 10;
 const MAX_DIAGNOSTICS = 50;
 const MAX_QUEUE = 10;
@@ -172,7 +175,7 @@ type Inbound =
   | { type: 'cancel' }
   | { type: 'clear' }
   | { type: 'selectModel'; kind: string; model: string }
-  | { type: 'loadModels' }
+  | { type: 'loadModels'; force?: boolean }
   | { type: 'addProvider' }
   | { type: 'signIn' }
   | { type: 'listSkills' }
@@ -346,7 +349,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private abort?: AbortController;
   private items: Item[];
   private taskId: string | undefined;
-  private readonly listed = new Map<string, string[]>();
+  /** Models listed per provider: when, what, and why a listing failed or came from somewhere else. */
+  private readonly listed = new Map<string, Listed & { at: number }>();
+  /** Providers whose models are being listed now. */
+  private readonly listing = new Set<string>();
   // Context window per `kind:model`; 0 means unknown.
   private readonly windows = new Map<string, number>();
   /** Messages sent while a request was running; each one runs after the one before it. */
@@ -735,27 +741,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.refreshStatus();
   }
 
-  /** Configured providers with their saved model, plus models listed from the active endpoint. */
+  /**
+   * Providers the picker shows: the active one, every named endpoint, providers that need no key
+   * (Ollama), and providers with a saved key. The Anthropic API shows only when it has a key:
+   * Claude runs through the Claude Code CLI.
+   */
+  private async pickerRefs(): Promise<string[]> {
+    const active = activeRef();
+    const out: string[] = [];
+    for (const ref of providerRefs()) {
+      const keyed = await hasApiKey(this.ctx.secrets, ref);
+      if (ref === 'anthropic' ? keyed : ref === active || !isProviderKind(ref) || keyed || !refNeedsKey(ref)) out.push(ref);
+    }
+    return out;
+  }
+
+  /** Every provider's models with their context size and capabilities, plus Claude Code when its CLI is installed. */
   private async postModels(): Promise<void> {
     const active = activeRef();
+    const row = (m: ModelInfo) => ({ id: m.id, ctx: formatTokens(m.contextWindow), caps: m.capabilities, details: m.details ?? '' });
     const groups = [];
-    for (const ref of providerRefs()) {
-      const saved = modelFor(ref);
-      const ready = ref === active || (saved && (!refNeedsKey(ref) || (await hasApiKey(this.ctx.secrets, ref))));
-      if (!ready) continue;
-      const models = [...new Set([saved, ...(this.listed.get(ref) ?? [])].filter(Boolean))].slice(0, MAX_PICKER_MODELS);
-      groups.push({ kind: ref, label: refLabel(ref), models });
+    for (const ref of await this.pickerRefs()) {
+      const l = this.listed.get(ref);
+      const local = refKind(ref) === 'ollama';
+      // A list the endpoint answered is complete: the saved model shows only if it is really there.
+      const complete = !!l && !l.error;
+      const models = withSaved(l?.models ?? [], modelFor(ref), complete).slice(0, MAX_PICKER_MODELS).map(row);
+      const note = [l?.note, complete ? missingNote(l.models, modelFor(ref), local) : undefined].filter(Boolean).join(' ') || undefined;
+      groups.push({ kind: ref, label: refLabel(ref), local, models, loading: this.listing.has(ref), note, error: l?.models.length ? undefined : l?.error });
     }
-    const auth = await claudeAuth();
-    if (auth.loggedIn) groups.push({ kind: CLAUDE_KIND, label: auth.email ? `${CLAUDE_LABEL} · ${auth.email}` : CLAUDE_LABEL, models: [...new Set([claudeModel(), ...CLAUDE_MODELS])] });
+    if (findClaude()) groups.push({ kind: CLAUDE_KIND, label: CLAUDE_LABEL, local: false, models: withSaved(CLAUDE_MODEL_INFO, claudeModel()).map(row), loading: false });
     const current = engine() === 'claudeCode' ? { kind: CLAUDE_KIND, model: claudeModel() } : { kind: active, model: modelFor(active), window: this.windowFor(active, modelFor(active)) };
-    this.post({ type: 'models', active: current, groups, auth });
+    this.post({ type: 'models', active: current, groups });
   }
 
   /** The window for the chat model: the user setting, a cached answer, or undefined while the runtime is asked. */
   private windowFor(kind: string, model: string | undefined): number | undefined {
     const set = limits().contextWindowTokens;
     if (set || !model || !isProviderRef(kind)) return set;
+    const listed = this.listed.get(kind)?.models.find((m) => m.id === model)?.contextWindow;
+    if (listed) return listed;
     const key = `${kind}:${model}`;
     if (!this.windows.has(key)) void this.loadWindow(kind, key);
     return this.windows.get(key) || undefined;
@@ -776,21 +801,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     await this.postModels();
   }
 
-  private async loadModels(): Promise<void> {
-    const kind = activeRef();
-    if (this.listed.has(kind)) return;
-    this.listed.set(kind, []);
-    try {
-      const provider = await providerConfig(this.ctx.secrets, kind);
-      const client = await this.getClient();
-      const { models } = await client.request<{ models: string[] }>('provider/listModels', { provider }, { timeoutMs: settings().timeoutMs });
-      this.listed.set(kind, models);
-    } catch {
-      // The picker still offers the saved model; listing is best effort.
-      this.listed.delete(kind);
-      return;
-    }
+  /**
+   * Lists the models of every provider in the picker, at the same time. A list is reused for
+   * `MODEL_LIST_TTL_MS` unless `force` (the refresh button). A provider with no model set yet is
+   * listed too; a failure is shown in the picker instead of hiding the provider's models.
+   */
+  private async loadModels(force = false): Promise<void> {
+    const stale = (ref: string) => force || Date.now() - (this.listed.get(ref)?.at ?? 0) > MODEL_LIST_TTL_MS;
+    const refs = (await this.pickerRefs()).filter((ref) => !this.listing.has(ref) && stale(ref));
+    if (!refs.length) return;
+    for (const ref of refs) this.listing.add(ref);
     await this.postModels();
+    const timeoutMs = settings().timeoutMs;
+    await Promise.all(
+      refs.map(async (ref) => {
+        try {
+          const client = await this.getClient();
+          const provider = await providerConfigWith(this.ctx.secrets, ref, modelFor(ref) || 'probe');
+          const r = await listModels(async (p) => (await client.request<{ models: ModelInfo[] }>('provider/models', { provider: p }, { timeoutMs })).models, provider);
+          this.listed.set(ref, { ...r, at: Date.now() });
+        } catch (e) {
+          this.listed.set(ref, { models: [], error: describeError(e), at: Date.now() });
+        } finally {
+          this.listing.delete(ref);
+        }
+        await this.postModels();
+      }),
+    );
   }
 
   private async onMessage(m: Inbound): Promise<void> {
@@ -855,7 +892,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         await this.newChat();
         break;
       case 'loadModels':
-        await this.loadModels();
+        await this.loadModels(m.force === true);
         break;
       case 'addProvider':
         this.onAddProvider();

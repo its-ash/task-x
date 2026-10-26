@@ -106,6 +106,58 @@ pub fn parse_models(v: &Value) -> Vec<String> {
     v["data"].as_array().into_iter().flatten().filter_map(|m| m["id"].as_str().map(str::to_owned)).collect()
 }
 
+/// Every model `/models` lists, with the window and capabilities it reports. OpenRouter and
+/// similar servers report `context_length`, `supported_parameters`, and input modalities; vLLM
+/// reports `max_model_len`. The official API reports none, so known model families fill in.
+pub fn parse_model_infos(kind: ProviderKind, v: &Value) -> Vec<ModelInfo> {
+    v["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m["id"].as_str()?;
+            let window = ["context_length", "max_context_length", "context_window", "max_model_len", "max_token_size"]
+                .iter()
+                .find_map(|f| m[*f].as_u64())
+                .or_else(|| m["top_provider"]["context_length"].as_u64())
+                .map(|n| n as usize)
+                .or_else(|| (kind == ProviderKind::OpenAi).then(|| context_window(id)));
+            let params: Vec<&str> = m["supported_parameters"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            let mut caps = Vec::new();
+            if params.contains(&"tools") {
+                caps.push("tools");
+            }
+            if m["architecture"]["input_modalities"].as_array().is_some_and(|a| a.iter().any(|x| x == "image")) {
+                caps.push("vision");
+            }
+            if params.iter().any(|p| matches!(*p, "reasoning" | "include_reasoning")) {
+                caps.push("thinking");
+            }
+            if caps.is_empty() && kind == ProviderKind::OpenAi {
+                caps = known_capabilities(id);
+            }
+            if id.contains("embedding") {
+                caps = vec!["embedding"];
+            }
+            Some(ModelInfo::new(id, window, &caps))
+        })
+        .collect()
+}
+
+/// Capabilities of OpenAI model families, for the official API that does not report them.
+fn known_capabilities(id: &str) -> Vec<&'static str> {
+    let reasoning = ["o1", "o3", "o4", "gpt-5"].iter().any(|p| id.starts_with(p));
+    if reasoning {
+        vec!["tools", "vision", "thinking"]
+    } else if ["gpt-4o", "gpt-4.1", "gpt-4-turbo"].iter().any(|p| id.starts_with(p)) {
+        vec!["tools", "vision"]
+    } else if id.starts_with("gpt-4") || id.starts_with("gpt-3.5") {
+        vec!["tools"]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Extract context window from model metadata when available
 pub fn parse_model_info(model_id: &str, v: &Value) -> Option<usize> {
     if let Some(data) = v["data"].as_array() {

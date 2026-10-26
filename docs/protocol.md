@@ -48,6 +48,16 @@ No params. The result is the `providers` array from `initialize`.
 
 Params: `{ "provider": ProviderConfig }`. Result: `{ "models": string[] }` (sorted, max 500).
 
+### `provider/models` (request)
+
+Params: `{ "provider": ProviderConfig }`. Result: `{ "models": ModelInfo[] }` (sorted by id, max 500), where `ModelInfo` is `{ id, contextWindow?, capabilities, details? }`:
+
+- `contextWindow`: the input window the endpoint reports (Anthropic `max_input_tokens`; OpenAI-compatible `context_length`, `max_context_length`, `context_window`, `max_model_len` (vLLM), or `top_provider.context_length` (OpenRouter); Ollama `/api/show`), else the built-in estimate for Anthropic and OpenAI. Absent when unknown.
+- `capabilities`: any of `tools`, `vision`, `thinking`, `embedding`, in that order. Ollama reports them in `/api/show`; OpenRouter in `supported_parameters` and `architecture.input_modalities`. For Anthropic and the official OpenAI API they come from the model family. Empty when unknown.
+- `details`: size and quantization of an Ollama model, such as `8.2B · Q4_K_M`.
+
+For Ollama, the runtime asks `/api/show` about each installed model, 8 at a time, for the first 100 models.
+
 ### `provider/contextWindow` (request)
 
 Params: `{ "provider": ProviderConfig }`. Result: `{ "tokens": number }`, the context window of `provider.model`. The runtime asks the provider first (the same lookup and 5-minute cache as `limits.contextWindowTokens`). If the provider does not say, the result is the built-in estimate.

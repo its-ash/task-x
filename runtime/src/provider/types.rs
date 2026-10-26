@@ -198,6 +198,29 @@ pub enum ContentPart {
     },
 }
 
+/// One model an endpoint offers, with what it reports (or what is known) about it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub id: String,
+    /// Input window in tokens; absent when neither the endpoint nor the built-in table knows it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
+    /// Any of `tools`, `vision`, `thinking`, `embedding`, in that order; empty when unknown.
+    pub capabilities: Vec<String>,
+    /// Size and quantization of a local model, such as `8.0B · Q4_K_M`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
+impl ModelInfo {
+    pub fn new(id: &str, context_window: Option<usize>, capabilities: &[&str]) -> Self {
+        let order = ["tools", "vision", "thinking", "embedding"];
+        let capabilities = order.iter().filter(|c| capabilities.contains(c)).map(|c| (*c).to_owned()).collect();
+        Self { id: id.to_owned(), context_window, capabilities, details: None }
+    }
+}
+
 /// An image attached to a prompt: `{ mediaType, data }`, where `data` is base64 without a `data:` prefix.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

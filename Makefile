@@ -7,6 +7,9 @@ VSIX = $(EXT)/task-x-$(VERSION).vsix
 # GitHub repository for releases, and the stable asset name `make add` downloads.
 REPO ?= its-ash/task-x
 ASSET := task-x.vsix
+# The `code` CLI itself calls Node's legacy `url.parse()`, which prints DEP0169 on every install.
+# Silence only that warning, not all of them (Node 21+).
+NODE_NO_DEP0169 = NODE_OPTIONS="--disable-warning=DEP0169"
 
 .PHONY: run build deploy install add
 
@@ -31,7 +34,7 @@ install: build
 	rm -f $(EXT)/*.vsix
 	npm --prefix $(EXT) run package
 	@$(CODE) --uninstall-extension its-ash.anvil-agent >/dev/null 2>&1 || true
-	$(CODE) --install-extension $(VSIX) --force
+	$(NODE_NO_DEP0169) $(CODE) --install-extension $(VSIX) --force
 	@echo "Installed $(VSIX). Reload VS Code windows to use it."
 
 # Builds the .vsix, pushes main, and publishes the .vsix on the GitHub release v<version>
@@ -63,5 +66,5 @@ add:
 		curl -fSL --progress-bar -o "$$tmp/$(ASSET)" "https://github.com/$(REPO)/releases/latest/download/$(ASSET)"; \
 	fi; \
 	$(CODE) --uninstall-extension its-ash.anvil-agent >/dev/null 2>&1 || true; \
-	$(CODE) --install-extension "$$tmp/$(ASSET)" --force; \
+	$(NODE_NO_DEP0169) $(CODE) --install-extension "$$tmp/$(ASSET)" --force; \
 	echo "Installed task-x. Reload VS Code windows to use it."

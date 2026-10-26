@@ -49,6 +49,9 @@ Only this configuration and your approvals control permissions. Instructions, sk
 ## Web access
 
 - `web_fetch` reads public pages only. It refuses loopback, private, link-local, and other non-public addresses, cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`), and names such as `localhost` or `*.internal` — including when a redirect points at one. Pages are untrusted input, so a poisoned page cannot use the agent to reach a service on your machine.
+- `browser` drives a real Chrome or Edge over the DevTools Protocol (CDP). It is the one tool that must reach loopback, so its endpoint has its own rule: only `http` on `127.0.0.1`, `::1`, or `localhost` is accepted, and a non-local endpoint is refused with a message that says how to start the browser. The endpoint is `TASK_X_CDP_ENDPOINT`, default `http://127.0.0.1:9222`.
+- A VS Code **Simple Browser** view is a webview and publishes no DevTools protocol, so it cannot be driven. The browser must be a real Chrome or Edge started with `--remote-debugging-port`.
+- `browser` has the `network` permission class: it needs approval unless `task-x.agent.approveAll` is on or the tool is in `task-x.agent.allowTools`. `browser` can run arbitrary JavaScript in the page (`eval`), so treat it as running untrusted input. Pages opened with it are not restricted to public hosts — it is your own browser, so a page it opens may reach your intranet, exactly as it would if you opened it.
 
 ## Secrets and privacy
 

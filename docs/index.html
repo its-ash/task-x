@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>task-x: a model-agnostic coding agent for VS Code</title>
+<meta name="description" content="A coding agent for VS Code that is not tied to a vendor. A Rust runtime indexes your repository, runs 44 tools, and drives the agent loop. Works with Claude, OpenAI, Ollama, and OpenAI-compatible endpoints." />
+<meta name="color-scheme" content="dark light" />
+<meta property="og:title" content="task-x: a model-agnostic coding agent for VS Code" />
+<meta property="og:description" content="Bring your own model. Claude, OpenAI, Ollama, and OpenAI-compatible endpoints. 44 tools, sandboxed commands, team mode, and undo that keeps your edits." />
+<meta property="og:type" content="website" />
+<link rel="icon" href="logo.svg" type="image/svg+xml" />
+<link rel="preload" href="fonts/FiraCode.woff2" as="font" type="font/woff2" crossorigin />
+<link rel="preload" href="codicons/codicon.ttf" as="font" type="font/ttf" crossorigin />
+<link rel="stylesheet" href="codicons/codicon.css" />
+<script>
+  /* Runs before paint so the theme never flashes. */
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem('taskx-theme'); } catch (e) {}
+    var light = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+    document.documentElement.setAttribute('data-theme', saved || (light ? 'light' : 'dark'));
+  })();
+</script>
+<style>
+  /* Tokens follow the extension's own design roles (media/tokens.css): one blue primary, green for
+     additions, amber for review. Self-hosted fonts only, no CDN. */
+  :root {
+    --bg: #0b1116;
+    --bg-elev: #101a23;
+    --bg-card: #131e28;
+    --bg-soft: #0f151c;
+    --border: #223140;
+    --fg: #e6edf4;
+    --fg-muted: #9db0c0;
+    --primary: #9fcaff;
+    --on-primary: #08202f;
+    --primary-tint: color-mix(in srgb, #9fcaff 12%, transparent);
+    --accent: #76daa1;
+    --amber: #edc21f;
+    --radius: 14px;
+    --maxw: 1120px;
+    --font: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  [data-theme="light"] {
+    --bg: #fbfcfe;
+    --bg-elev: #f3f7fb;
+    --bg-card: #ffffff;
+    --bg-soft: #f4f7fa;
+    --border: #d8e2ec;
+    --fg: #13212e;
+    --fg-muted: #526579;
+    --primary: #0061a4;
+    --on-primary: #ffffff;
+    --primary-tint: color-mix(in srgb, #0061a4 9%, transparent);
+    --accent: #006d43;
+    --amber: #725c00;
+  }
+
+  * { box-sizing: border-box; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font);
+    font-size: 15.5px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--primary); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  :focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; border-radius: 4px; }
+  h1, h2, h3 { text-wrap: balance; margin: 0; }
+  p { text-wrap: pretty; }
+
+  .wrap { max-width: var(--maxw); margin-inline: auto; padding-inline: 24px; }
+  .skip { position: absolute; inset-inline-start: -9999px; }
+  .skip:focus { inset-inline-start: 12px; inset-block-start: 12px; background: var(--bg-card); color: var(--fg); padding: 10px 14px; border-radius: 8px; z-index: 100; }
+
+  /* ---------- header: one line, 64px, everything reachable ---------- */
+  .site-header {
+    position: sticky; inset-block-start: 0; z-index: 20;
+    background: color-mix(in srgb, var(--bg) 86%, transparent);
+    -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  .bar { display: flex; align-items: center; gap: 20px; min-height: 64px; }
+  .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: -.01em; color: var(--fg); }
+  .brand:hover { text-decoration: none; }
+  /* The hippo mark: mid grays by default (reads on light), lifted to lighter grays on dark. */
+  .hippo { display: block; flex: none; }
+  .hippo .c1 { fill: #6c6c70; }
+  .hippo .c2 { fill: #56565a; }
+  .hippo .c3 { fill: #2d2d2d; }
+  .hippo .c4 { fill: #a0a0a4; }
+  .hippo .c5 { fill: #6c6c70; }
+  [data-theme="dark"] .hippo .c1 { fill: #d5dade; }
+  [data-theme="dark"] .hippo .c2 { fill: #b9c0c6; }
+  [data-theme="dark"] .hippo .c3 { fill: #e6edf4; }
+  [data-theme="dark"] .hippo .c4 { fill: #94a1ac; }
+  [data-theme="dark"] .hippo .c5 { fill: #e6edf4; }
+  .brand img { display: block; border-radius: 5px; }
+  .nav { margin-inline-start: auto; display: flex; align-items: center; gap: 4px; }
+  .nav a { color: var(--fg-muted); font-size: 14px; padding: 10px 10px; border-radius: 8px; font-weight: 500; }
+  .nav a:hover { color: var(--fg); background: var(--primary-tint); text-decoration: none; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    min-height: 44px; padding: 10px 16px; border-radius: 10px;
+    font: inherit; font-weight: 600; font-size: 14.5px;
+    border: 1px solid var(--border); background: var(--bg-card); color: var(--fg);
+    cursor: pointer; transition: transform .12s ease, border-color .12s ease, background .12s ease;
+  }
+  .btn:hover { text-decoration: none; border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); }
+  .btn:active { transform: scale(.98); }
+  .btn.primary { background: var(--primary); color: var(--on-primary); border-color: transparent; }
+  .btn.primary:hover { background: color-mix(in srgb, #000 12%, var(--primary)); }
+  @media (hover: hover) and (pointer: fine) {
+    .card:hover { border-color: color-mix(in srgb, var(--primary) 40%, var(--border)); transform: translateY(-2px); }
+    .doc:hover { border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); }
+  }
+  .icon-btn { padding: 10px; }
+  .nav > .btn { margin-inline-start: 6px; }
+  @media (max-width: 740px) {
+    .nav a[data-hide='sm'] { display: none; }
+    .nav .label { display: none; }
+  }
+
+  /* ---------- hero: split, text left, terminal right ---------- */
+  .hero { position: relative; padding-block: clamp(48px, 10vh, 92px) 72px; }
+  .hero-grid { display: grid; gap: 40px 48px; grid-template-columns: minmax(0, 1.02fr) minmax(0, .98fr); align-items: center; }
+  @media (max-width: 960px) { .hero-grid { grid-template-columns: 1fr; } }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 13.5px; font-weight: 600; color: var(--fg-muted);
+    border: 1px solid var(--border); background: var(--bg-elev);
+    padding: 6px 12px; border-radius: 999px; margin: 0 0 24px;
+  }
+  .hero h1 {
+    font-size: clamp(2.5rem, 6vw, 4.1rem);
+    line-height: 1.03; letter-spacing: -.035em; font-weight: 800;
+    max-width: 19ch; margin-bottom: 22px;
+  }
+  .hero h1 .alt { color: var(--primary); }
+  .lede { font-size: clamp(1.05rem, 1.7vw, 1.2rem); color: var(--fg-muted); max-width: 52ch; margin: 0 0 28px; }
+  .lede strong { color: var(--fg); font-weight: 600; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 22px; }
+
+  /* Entry: hero children appear with a small stagger, once, transform and opacity only. */
+  .rise { animation: rise .55s cubic-bezier(.2, 0, 0, 1) both; }
+  .hero .rise:nth-child(2), .term-col .rise:nth-child(2) { animation-delay: 60ms; }
+  .hero .rise:nth-child(3), .term-col .rise:nth-child(3) { animation-delay: 120ms; }
+  .hero .rise:nth-child(4), .term-col .rise:nth-child(4) { animation-delay: 180ms; }
+  .hero .rise:nth-child(5), .term-col .rise:nth-child(5) { animation-delay: 240ms; }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+
+  /* ---------- terminal: real product output, no fake chrome ---------- */
+  .term { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-soft); overflow: clip; }
+  .term-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .term-head .codicon { font-size: 14px; color: var(--fg-muted); }
+  .term-head .name { font-size: 12.5px; color: var(--fg-muted); }
+  .copy {
+    margin-inline-start: auto; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+    padding: 4px 10px; border-radius: 7px; border: 1px solid var(--border);
+    background: transparent; color: var(--fg-muted);
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .copy:hover { color: var(--fg); border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); }
+  .term pre { margin: 0; padding: 18px 18px 20px; overflow-x: auto; font-size: 13.5px; line-height: 1.75; }
+  .cmt { color: var(--fg-muted); }
+  .pr { color: var(--accent); user-select: none; }
+
+  /* ---------- sections: one layout family per section ---------- */
+  section { padding-block: 72px; border-top: 1px solid var(--border); }
+  .sec-head { max-width: 60ch; margin-bottom: 40px; }
+  .sec-head h2 { font-size: clamp(1.7rem, 3.2vw, 2.3rem); letter-spacing: -.02em; font-weight: 750; margin-bottom: 12px; }
+  .sec-head p { color: var(--fg-muted); font-size: 16px; margin: 0; }
+
+  /* Bento features: mixed spans, varied cell backgrounds. */
+  .bento { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; }
+  .card {
+    grid-column: span 2;
+    display: flex; flex-direction: column;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--bg-card); padding: 22px;
+    transition: border-color .15s ease, transform .15s ease;
+  }
+  .card.span3 { grid-column: span 3; }
+  .card.tint { background: var(--primary-tint); border-color: color-mix(in srgb, var(--primary) 22%, var(--border)); }
+  .card.inverse { background: var(--primary); border-color: transparent; color: var(--on-primary); }
+  .card.inverse h3, .card.inverse p, .card.inverse li, .card.inverse li strong { color: var(--on-primary); }
+  .card.inverse .codicon { color: var(--on-primary); }
+  @media (max-width: 900px) {
+    .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .card, .card.span3 { grid-column: auto; }
+    .card.span3 { grid-column: span 2; }
+  }
+  @media (max-width: 560px) { .bento { grid-template-columns: 1fr; } .card, .card.span3 { grid-column: auto; } }
+  .card .codicon { font-size: 20px; color: var(--primary); }
+  .card.inverse .codicon { color: var(--on-primary); }
+  .card h3 { display: flex; align-items: center; gap: 10px; font-size: 16.5px; font-weight: 650; letter-spacing: -.01em; margin-bottom: 8px; }
+  .card p { color: var(--fg-muted); font-size: 14.5px; line-height: 1.6; margin: 0; }
+  .card.inverse p { color: color-mix(in srgb, var(--on-primary) 88%, transparent); }
+  .card.tint p { color: color-mix(in srgb, var(--fg) 78%, transparent); }
+  .card ul { margin: 12px 0 0; padding-inline-start: 17px; color: var(--fg-muted); font-size: 14px; }
+  .card li { margin-block: 5px; }
+  .card li strong { color: var(--fg); font-weight: 600; }
+  .card.inverse li, .card.inverse li strong { color: color-mix(in srgb, var(--on-primary) 88%, transparent); }
+  .stat { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+  .stat b { font-size: 44px; line-height: 1; letter-spacing: -.03em; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .stat span { font-size: 14.5px; font-weight: 600; }
+  code {
+    font-family: var(--font); font-size: .88em;
+    background: color-mix(in srgb, currentColor 9%, transparent);
+    padding: 1.5px 5px; border-radius: 5px;
+  }
+  .card code { background: color-mix(in srgb, var(--fg-muted) 16%, transparent); }
+  .card.inverse code { background: color-mix(in srgb, var(--on-primary) 16%, transparent); }
+
+  /* Architecture: a two-way split. */
+  .split { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; }
+  @media (max-width: 760px) { .split { grid-template-columns: 1fr; } }
+
+  /* Safety: rows, not cards. Icon left, bold lead, text right, lines between. */
+  .rows { border-top: 1px solid var(--border); margin: 0; padding: 0; list-style: none; }
+  .rows > li {
+    display: grid; grid-template-columns: 30px 240px 1fr; gap: 10px 18px;
+    padding-block: 18px; border-bottom: 1px solid var(--border);
+  }
+  .rows .codicon { font-size: 17px; color: var(--accent); }
+  .rows h3 { font-size: 15.5px; font-weight: 650; }
+  .rows p { margin: 0; color: var(--fg-muted); font-size: 14.5px; }
+  @media (max-width: 700px) {
+    .rows > li { grid-template-columns: 30px 1fr; }
+    .rows p { grid-column: 2; }
+  }
+
+  /* Docs: compact link chips. */
+  .docs { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+  .doc {
+    display: block; padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px;
+    background: var(--bg-card); color: var(--fg);
+    transition: border-color .15s ease, transform .15s ease;
+  }
+  .doc b { display: flex; align-items: center; gap: 7px; font-size: 14.5px; margin-bottom: 3px; }
+  .doc b .codicon { font-size: 15px; color: var(--primary); }
+  .doc span { color: var(--fg-muted); font-size: 13.5px; display: block; }
+  .note {
+    margin-top: 26px; padding: 14px 18px;
+    border-inline-start: 3px solid var(--amber);
+    background: color-mix(in srgb, var(--amber) 8%, transparent);
+    color: var(--fg-muted); font-size: 14.5px;
+  }
+  .note strong { color: var(--fg); }
+
+  footer.site { border-top: 1px solid var(--border); padding-block: 32px 48px; color: var(--fg-muted); font-size: 14px; }
+  .foot-row { display: flex; flex-wrap: wrap; gap: 12px 22px; align-items: center; }
+  .foot-row a { color: var(--fg-muted); padding: 8px 0; }
+  .foot-row a:hover { color: var(--fg); }
+  .foot-right { margin-inline-start: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 18px; }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap bar">
+    <a class="brand" href="#main">
+      <svg class="hippo" width="24" height="24" viewBox="0 0 64 64" aria-hidden="true">
+        <path class="c1" d="M57,41c0,7.39-5.74,11.62-13,12-.33,0-.66,0-1,0a13.83,13.83,0,0,1-5-.92l-.07,0a16.19,16.19,0,0,0-11.86,0l-.07,0A13.83,13.83,0,0,1,21,53c-.34,0-.67,0-1,0-7.26-.35-13-4.58-13-12,0-5.18,2.81-7.7,7-10.12V24.5A17.49,17.49,0,0,1,43,11.33c.3.26.58.52.86.8a17.64,17.64,0,0,1,2.89,3.81A17.34,17.34,0,0,1,49,24.5v5.85C53.73,32.6,57,35.42,57,41Z" />
+        <path class="c2" d="M20.91,10.58A17.34,17.34,0,0,0,16.21,16a4.5,4.5,0,1,1,4.7-5.41Z" />
+        <circle class="c3" cx="23.5" cy="20.5" r="1.5" />
+        <circle class="c3" cx="40.5" cy="20.5" r="1.5" />
+        <path class="c2" d="M52,11.5a4.51,4.51,0,0,1-5.24,4.44,17.64,17.64,0,0,0-2.89-3.81c-.28-.28-.56-.54-.86-.8a4.5,4.5,0,0,1,9,.17Z" />
+        <path class="c4" d="M26,52.08V56a1,1,0,0,1-1,1H21a1,1,0,0,1-1-1V53c.33,0,.66,0,1,0A13.83,13.83,0,0,0,26,52.08Z" />
+        <path class="c4" d="M44,53v3a1,1,0,0,1-1,1H39a1,1,0,0,1-1-1V52.08A13.83,13.83,0,0,0,43,53C43.34,53,43.67,53,44,53Z" />
+        <circle class="c5" cx="18.5" cy="41.5" r="2.5" />
+        <circle class="c5" cx="45.5" cy="41.5" r="2.5" />
+      </svg>
+      task-x
+    </a>
+    <nav class="nav" aria-label="Main">
+      <a href="#features">Features</a>
+      <a href="#protocol" data-hide="sm">Protocol</a>
+      <a href="#safety" data-hide="sm">Safety</a>
+      <a href="#docs">Docs</a>
+      <button class="btn icon-btn" id="theme" type="button" aria-label="Switch color theme">
+        <span class="codicon codicon-color-mode" aria-hidden="true"></span>
+      </button>
+      <a class="btn" href="https://github.com/its-ash/task-x">
+        <span class="codicon codicon-github" aria-hidden="true"></span><span class="label">GitHub</span>
+      </a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <!-- Hero: eyebrow, headline, one lede, two CTAs, three facts. -->
+  <div class="hero">
+    <div class="wrap hero-grid">
+      <div class="col-a">
+        <p class="eyebrow rise">Open source, MIT licensed, running on your own keys</p>
+        <h1 class="rise">Your repository. <span class="alt">Your model.</span> Your rules.</h1>
+        <p class="lede rise">A coding agent for VS Code, not tied to a vendor. A Rust runtime, <strong>44 tools</strong>, and undo that keeps your edits.</p>
+        <div class="cta rise">
+          <a class="btn primary" href="https://github.com/its-ash/task-x/releases/latest">
+            <span class="codicon codicon-cloud-download" aria-hidden="true"></span>Install
+          </a>
+          <a class="btn" href="#docs">Read the docs</a>
+        </div>
+      </div>
+
+      <div class="col-b term-col rise">
+        <div class="term">
+          <div class="term-head">
+            <span class="codicon codicon-terminal" aria-hidden="true"></span>
+            <span class="name">install</span>
+            <button class="copy" id="copy" type="button"><span class="codicon codicon-copy" aria-hidden="true"></span><span id="copyLabel">Copy</span></button>
+          </div>
+<pre><code><span class="cmt"># from the latest release</span>
+<span class="pr">$</span> code --install-extension task-x.vsix
+
+<span class="cmt"># from a clone of this repo</span>
+<span class="pr">$</span> make add</code></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Features: bento, mixed spans, varied cell backgrounds. -->
+  <section id="features">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>Built, not promised</h2>
+        <p>Each of these ships in this repository today. The test suites run against mock providers, so trying it does not need a paid key.</p>
+      </div>
+
+      <div class="bento">
+        <article class="card">
+          <h3><span class="codicon codicon-plug" aria-hidden="true"></span>Any provider</h3>
+          <p>Claude through Claude Code, OpenAI, OpenAI-compatible endpoints, and Ollama, which is found by itself.</p>
+          <ul>
+            <li>A model per task kind with <strong>routes</strong></li>
+            <li>Opt-in <strong>fallback</strong> providers</li>
+            <li>Keys live in SecretStorage only</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h3><span class="codicon codicon-hubot" aria-hidden="true"></span>Team mode</h3>
+          <p>The lead plans a dependency graph. Ready steps run as parallel subagents, each writer in its own <strong>git worktree</strong>.</p>
+          <ul>
+            <li>Merges through the edit log</li>
+            <li>A lane per subagent, with cost and Stop</li>
+          </ul>
+        </article>
+
+        <article class="card inverse">
+          <div class="stat"><b class="num">44</b><span>built-in tools</span></div>
+          <p>Read, search, exact-match edits with stale detection, git, validation, and commands. Every tool declares a schema and a permission class.</p>
+        </article>
+
+        <article class="card">
+          <h3><span class="codicon codicon-compare-changes" aria-hidden="true"></span>Best of N</h3>
+          <p>Two to four models do the same task in separate worktrees. The Compare panel shows results side by side; Keep applies one and discards the rest.</p>
+        </article>
+
+        <article class="card">
+          <h3><span class="codicon codicon-zap" aria-hidden="true"></span>Night Mode</h3>
+          <p>For free or local models that drop requests: an unfinished run retries until it lands.</p>
+          <ul>
+            <li><strong>Think</strong> splits the work into <code>todo.md</code></li>
+            <li><strong>Loop</strong> works it one item at a time</li>
+          </ul>
+        </article>
+
+        <article class="card tint">
+          <h3><span class="codicon codicon-map" aria-hidden="true"></span>Context engine</h3>
+          <p>A .gitignore-aware index, Tree-sitter symbols, a dependency graph, and retrieval inside a token budget.</p>
+          <ul>
+            <li>Reads <code>CLAUDE.md</code> and Copilot instructions</li>
+            <li>Compresses history automatically</li>
+          </ul>
+        </article>
+
+        <article class="card span3">
+          <h3><span class="codicon codicon-diff" aria-hidden="true"></span>Reviewable by default</h3>
+          <p>Each edit lands on the timeline with its diff. Keep or Undo one edit, a file, or everything; the log survives a restart, and your own concurrent edits survive the undo.</p>
+        </article>
+
+        <article class="card span3 tint">
+          <h3><span class="codicon codicon-mcp" aria-hidden="true"></span>Extends without edits</h3>
+          <p>Skills with <code>/name</code>, lifecycle hooks, and MCP servers. It imports the servers you already set up in Claude Desktop, Claude Code, Copilot, and the Copilot CLI, local and remote.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Protocol: what the two halves say to each other, as they say it. -->
+  <section id="protocol">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>Two parts, one protocol</h2>
+        <p>The loop is not JavaScript in a webview. It is a binary speaking versioned JSON-RPC over stdio, so the UI and the runtime are tested apart, and both agree on one version constant.</p>
+      </div>
+      <div class="term">
+        <div class="term-head">
+          <span class="codicon codicon-json" aria-hidden="true"></span>
+          <span class="name">docs/protocol.md · agent/run</span>
+          <button class="copy proto-copy" id="protoCopy" type="button"><span class="codicon codicon-copy" aria-hidden="true"></span><span id="protoLabel">Copy</span></button>
+        </div>
+<pre><code><span class="cmt">// the client starts a task; the runtime streams events back</span>
+<span class="pr">{</span> <span class="str">"method"</span><span class="pr">:</span> "agent/run", "params": { "prompt": "…", "chatMode": "agent" } <span class="pr">}</span>
+<span class="pr">{</span> <span class="str">"method"</span><span class="pr">:</span> "agent/event", "params": { "event": { "type": "toolStarted", "tool": "read_file" } } <span class="pr">}</span>
+<span class="pr">{</span> <span class="str">"method"</span><span class="pr">:</span> "agent/event", "params": { "event": { "type": "fileChanged", "path": "src/app.ts" } } <span class="pr">}</span>
+<span class="pr">{</span> <span class="str">"method"</span><span class="pr">:</span> "agent/event", "params": { "event": { "type": "done", "stopReason": "endTurn" } } <span class="pr">}</span>
+
+<span class="cmt">// 26 event types; a breaking change bumps PROTOCOL_VERSION in two files</span></code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- Architecture: a two-way split. -->
+  <section id="architecture">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>How it fits together</h2>
+        <p>Provider code stays in its own module; everything else sees only shared types, so a new provider touches two files.</p>
+      </div>
+      <div class="split">
+        <article class="card">
+          <h3><span class="codicon codicon-vm" aria-hidden="true"></span>runtime/</h3>
+          <p>The Rust runtime: index, providers, the tools, the sandbox, the edit log, and the agent loop. Tokio, JSON-RPC over stdio.</p>
+        </article>
+        <article class="card">
+          <h3><span class="codicon codicon-code" aria-hidden="true"></span>extension/</h3>
+          <p>The TypeScript extension: chat, approvals, the provider dialog, the compare panel, and the editor commands. Its RPC client never imports <code>vscode</code>, so plain Node tests it.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Safety: rows, not cards, because the list is the content. -->
+  <section id="safety">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>What it refuses to do</h2>
+        <p>Enforced in the runtime, not requested in a prompt. Repository text cannot change the policy.</p>
+      </div>
+      <ul class="rows">
+        <li>
+          <span class="codicon codicon-lock" aria-hidden="true"></span>
+          <h3>Workspace only</h3>
+          <p>File access stays inside the open folder. Traversal, symlink escapes, and <code>.git</code> internals are refused.</p>
+        </li>
+        <li>
+          <span class="codicon codicon-shield" aria-hidden="true"></span>
+          <h3>Every command is sandboxed</h3>
+          <p><code>sandbox-exec</code> on macOS, <code>bwrap</code> on Linux. Commands write only to the workspace, temp folders, and build caches.</p>
+        </li>
+        <li>
+          <span class="codicon codicon-discard" aria-hidden="true"></span>
+          <h3>Atomic, then undoable</h3>
+          <p>Edits write atomically with rollback. A per-workspace log records every change, so review and undo work after a restart.</p>
+        </li>
+        <li>
+          <span class="codicon codicon-key" aria-hidden="true"></span>
+          <h3>Destructive needs an allow</h3>
+          <p>Deletes and installs run only when you list them in <code>task-x.agent.allowTools</code>. A session grant covers a tool for one run.</p>
+        </li>
+        <li>
+          <span class="codicon codicon-globe" aria-hidden="true"></span>
+          <h3>Web pages are untrusted</h3>
+          <p><code>web_fetch</code> reads public sites only, refuses loopback, private, and cloud-metadata addresses, and checks every redirect.</p>
+        </li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- Docs. -->
+  <section id="docs">
+    <div class="wrap">
+      <div class="sec-head">
+        <h2>Documentation</h2>
+        <p>Design notes for the parts worth reading before you trust them.</p>
+      </div>
+      <div class="docs">
+        <a class="doc" href="protocol.md"><b><span class="codicon codicon-bracket" aria-hidden="true"></span>Runtime protocol</b><span>Methods, events, and the version rule</span></a>
+        <a class="doc" href="providers.md"><b><span class="codicon codicon-plug" aria-hidden="true"></span>Providers</b><span>Adding one, routing, fallback</span></a>
+        <a class="doc" href="context.md"><b><span class="codicon codicon-map" aria-hidden="true"></span>Workspace context</b><span>Index, symbols, retrieval</span></a>
+        <a class="doc" href="security.md"><b><span class="codicon codicon-shield" aria-hidden="true"></span>Security</b><span>Policy, sandbox, secrets</span></a>
+        <a class="doc" href="extensibility.md"><b><span class="codicon codicon-mcp" aria-hidden="true"></span>Skills, hooks, MCP</b><span>Extend without rebuilding</span></a>
+        <a class="doc" href="https://github.com/its-ash/task-x/blob/main/ROADMAP.md"><b><span class="codicon codicon-checklist" aria-hidden="true"></span>Roadmap</b><span>Verified, and not verified yet</span></a>
+      </div>
+      <p class="note">
+        <strong>On the word done.</strong> An item is marked verified only after a test or a manual check proves it. Team mode against real models, and the extension inside a real VS Code window, have so far run against mock providers. The roadmap lists them as unverified rather than finished.
+      </p>
+    </div>
+  </section>
+</main>
+
+<footer class="site">
+  <div class="wrap foot-row">
+    <span>task-x (MIT)</span>
+    <a href="https://github.com/its-ash/task-x">GitHub</a>
+    <a href="https://github.com/its-ash/task-x/releases/latest">Releases</a>
+    <div class="foot-right">
+      <span>Rust 1.85+</span>
+      <span>Node 22+</span>
+      <span>VS Code 1.100+</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    document.getElementById('theme').addEventListener('click', function () {
+      var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      try { localStorage.setItem('taskx-theme', next); } catch (e) {}
+    });
+
+    var reset;
+    function wireCopy(btn, label, text) {
+      btn.addEventListener('click', function () {
+        var done = function (ok) {
+          label.textContent = ok ? 'Copied' : 'Copy failed';
+          clearTimeout(reset);
+          reset = setTimeout(function () { label.textContent = 'Copy'; }, 1600);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+        } else { done(false); }
+      });
+    }
+    wireCopy(document.getElementById('copy'), document.getElementById('copyLabel'), 'code --install-extension task-x.vsix');
+    wireCopy(document.getElementById('protoCopy'), document.getElementById('protoLabel'), 'agent/run -> agent/event (toolStarted, fileChanged, done)');
+  })();
+</script>
+</body>
+</html>

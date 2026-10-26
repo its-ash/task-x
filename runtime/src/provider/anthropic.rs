@@ -75,6 +75,22 @@ pub fn parse_models(v: &Value) -> Vec<String> {
     v["data"].as_array().into_iter().flatten().filter_map(|m| m["id"].as_str().map(str::to_owned)).collect()
 }
 
+/// Every model the models API lists, with its window (`max_input_tokens`, else the built-in
+/// estimate). All current Claude models take tools and images; Claude 3.7 and later can think.
+pub fn parse_model_infos(v: &Value) -> Vec<ModelInfo> {
+    v["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m["id"].as_str()?;
+            let window = m["max_input_tokens"].as_u64().map(|n| n as usize).unwrap_or_else(|| context_window(id));
+            let thinks = !id.starts_with("claude-3-") || id.starts_with("claude-3-7");
+            Some(ModelInfo::new(id, Some(window), if thinks { &["tools", "vision", "thinking"] } else { &["tools", "vision"] }))
+        })
+        .collect()
+}
+
 /// The input window the models API reports for one model (`max_input_tokens`).
 pub fn parse_context_window(model: &str, v: &Value) -> Option<usize> {
     v["data"].as_array()?.iter().find(|m| m["id"].as_str() == Some(model))?["max_input_tokens"].as_u64().map(|n| n as usize)

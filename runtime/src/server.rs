@@ -377,6 +377,7 @@ impl Server {
             ),
             "provider/test"
             | "provider/listModels"
+            | "provider/models"
             | "provider/contextWindow"
             | "chat/send"
             | "workspace/open"
@@ -479,6 +480,7 @@ impl Server {
             let res = match method.as_str() {
                 "provider/test" => this.provider_test(p, &token).await,
                 "provider/listModels" => this.list_models(p, &token).await,
+                "provider/models" => this.model_infos(p, &token).await,
                 "provider/contextWindow" => this.context_window(p, &token).await,
                 "workspace/open" => this.open_workspace(p).await,
                 "workspace/refresh" => this.refresh_workspace().await,
@@ -526,6 +528,11 @@ impl Server {
     async fn list_models(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
         let p: ProviderParams = params(p)?;
         Ok(json!({ "models": self.providers.list_models(&p.provider, cancel).await.map_err(provider_error)? }))
+    }
+
+    async fn model_infos(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
+        let p: ProviderParams = params(p)?;
+        Ok(json!({ "models": self.providers.model_infos(&p.provider, cancel).await.map_err(provider_error)? }))
     }
 
     async fn context_window(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
