@@ -475,7 +475,7 @@
         "task-x.agent.approveAll": {
           "type": "boolean",
           "default": true,
-          "description": "Allow every tool call the agent (or Claude Code) asks about, with no approval prompt. The deny list still applies. Turn off to review deletes, installs, network, git writes, and unsandboxed commands one by one."
+          "description": "Let the model use every tool with no approval prompt: edits, commands, deletes, installs, network, git writes, and all MCP tools (Figma, Chrome DevTools, and others; offered in every chat mode). Only task-x.agent.denyTools refuses a tool. Commands still run in the sandbox. Turn off to review deletes, installs, network, git writes, and MCP calls one by one."
         },
         "task-x.agent.allowTools": {
           "type": "array",
@@ -524,7 +524,7 @@
         "task-x.mcpServers": {
           "type": "object",
           "default": {},
-          "markdownDescription": "MCP servers to start, keyed by name. A local server: `{ \"chrome-devtools\": { \"command\": \"npx\", \"args\": [\"-y\", \"chrome-devtools-mcp@latest\"] } }`. A remote server: `{ \"figma\": { \"type\": \"http\", \"url\": \"http://127.0.0.1:3845/mcp\" } }` (`type` is `stdio`, `http`, or `sse`; `headers` sets HTTP headers such as `Authorization`). These override servers of the same name from `task-x.mcp.import`. Their tools appear as `mcp__<server>__<tool>` and need approval unless listed in `task-x.agent.allowTools`. A trusted workspace can add servers in `.task-x/mcp.json`.",
+          "markdownDescription": "MCP servers to start, keyed by name. A local server: `{ \"chrome-devtools\": { \"command\": \"npx\", \"args\": [\"-y\", \"chrome-devtools-mcp@latest\"] } }`. A remote server: `{ \"figma\": { \"type\": \"http\", \"url\": \"http://127.0.0.1:3845/mcp\" } }` (`type` is `stdio`, `http`, or `sse`; `headers` sets HTTP headers such as `Authorization`). These override servers of the same name from `task-x.mcp.import`. Their tools appear as `mcp__<server>__<tool>`. With `task-x.agent.approveAll` (the default) the model uses them with no prompt; otherwise they need approval unless listed in `task-x.agent.allowTools`. A trusted workspace can add servers in `.task-x/mcp.json`.",
           "scope": "machine-overridable"
         },
         "task-x.mcp.import": {

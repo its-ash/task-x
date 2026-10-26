@@ -100,8 +100,8 @@ task-x also reads the MCP servers you already set up in other tools (`task-x.mcp
 
 - task-x starts each server and lists its tools, following pagination.
 - Tools appear to the model as `mcp__<server>__<tool>`, separate from the built-in tools.
-- Every call needs approval (permission class `network`), unless the tool is in `task-x.agent.allowTools`.
-- Ask and Plan modes do not offer MCP tools.
+- With `task-x.agent.approveAll` (the default), the model uses every MCP tool with no prompt, in every chat mode. Only `task-x.agent.denyTools` refuses one.
+- With `approveAll` off, every call needs approval (permission class `network`) unless the tool is in `task-x.agent.allowTools`, and Ask and Plan modes do not offer MCP tools.
 - Inputs are checked against the tool's schema (required fields and types) before the call. Each call has a timeout (`timeoutMs`, default 60 s) and can be cancelled.
 
 Run **task-x: Show MCP Servers** to see which servers are running, their tools, and their errors.

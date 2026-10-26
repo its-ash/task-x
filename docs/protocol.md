@@ -174,6 +174,8 @@ The prompt is 1..=100 000 characters. With no route and no `provider`, the reque
 | `skills/list` / `worktrees/list` | request | the skills found / the task-x worktree names |
 | `skills/resolve` | request | `{ prompt, paths? }` → `{ active: [{ name, reason, source, text }] }`: the skills that apply (a leading `/name`, a trigger word, or a file pattern), with `{{param}}` values filled in. Clients use it to give skills to another agent, such as the Claude Code CLI. |
 
+`policy` is `{ mode, allow, deny, allowAll? }`. With `allowAll: true`, every tool call runs with no `agent/requestApproval`, destructive tools included; only `deny` refuses a tool. MCP tools are then offered in every mode, and a read-only mode still refuses other writes. Commands stay in the sandbox.
+
 `initialize` also accepts `dataDir` (an absolute path where task files are saved) and `sandbox` (a boolean, default true).
 
 With a `dataDir`, the edit log (checkpoints) is saved per workspace in `dataDir/checkpoints/` after every change and loaded by `workspace/open`. After a restart, `edits/pending`, `edits/undo`, `edits/keep`, and `edits/revert` work on the earlier edits. When the log has more than 500 operations, the contents of old settled operations are dropped; `edits/undo` on one of them fails with "too old to undo".

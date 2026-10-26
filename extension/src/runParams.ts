@@ -19,7 +19,8 @@ export async function configs(secrets: vscode.SecretStorage, refs: unknown[]): P
  */
 export function policy() {
   const strings = (k: string) => cfg().get<string[]>(k, []).filter((x) => typeof x === 'string');
-  return { mode: 'autonomous', allow: strings('agent.allowTools'), deny: strings('agent.denyTools') };
+  // approveAll: no tool is held back or asked about (MCP tools such as Figma included); only the deny list refuses.
+  return { mode: 'autonomous', allow: strings('agent.allowTools'), deny: strings('agent.denyTools'), allowAll: cfg().get<boolean>('agent.approveAll', true) };
 }
 
 export function limits() {
