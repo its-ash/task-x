@@ -215,7 +215,7 @@ Compressed content starts with `[context compressed]`. Events: `compacted` `{ fo
 
 ### Claude Code engine and the task-x tools
 
-`claude/run` also takes `images` (`ImageInput[]`, sent with the prompt as image content blocks) and `mcpServers` (more servers in Claude Code's `mcpServers` format, added to `--mcp-config`; the name `task-x` is reserved).
+`claude/run` also takes `approveAll` (default false; when true, every tool Claude Code asks about, MCP tools included, is allowed with no `agent/requestApproval`), `images` (`ImageInput[]`, sent with the prompt as image content blocks), and `mcpServers` (more servers in Claude Code's `mcpServers` format, added to `--mcp-config`; the name `task-x` is reserved).
 
 Claude Code always runs with `sandbox.allowUnsandboxedCommands: false`, so a command cannot leave the sandbox. A `Bash` call with `dangerouslyDisableSandbox: true` is denied at once, without asking the user.
 

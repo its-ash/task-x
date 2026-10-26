@@ -558,6 +558,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (!planner) return undefined;
     this.add({ kind: 'context', text: `Night mode: ${planner.model} is writing the todo list.` });
     const client = await this.getClient();
+    this.wire(client);
     const planId = `${taskId}-plan${Date.now()}`;
     const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
     const off = client.onNotification('agent/event', (p) => {
@@ -571,7 +572,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const cliPath = findClaude();
         if (!cliPath) throw new Error('Claude Code CLI not found');
         const model = planner.model === 'default' ? undefined : planner.model;
-        summary = await client.request<AgentSummary>('claude/run', { prompt, taskId: planId, cliPath, chatMode: 'plan', model, ...claudePermissions('plan') }, { signal });
+        summary = await client.request<AgentSummary>('claude/run', { prompt, taskId: planId, cliPath, chatMode: 'plan', model, approveAll: vscode.workspace.getConfiguration(SECTION).get<boolean>('agent.approveAll', true), ...claudePermissions('plan') }, { signal });
       } else {
         if (!isProviderRef(planner.kind)) throw new Error(`unknown provider ${planner.kind}`);
         const provider = await providerConfigWith(this.ctx.secrets, planner.kind, planner.model);
@@ -1688,6 +1689,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       throw new Error('Not signed in to Anthropic. Run "task-x: Sign In with Anthropic".');
     }
     const client = await this.getClient();
+    // Claude Code's permission prompts (MCP tools such as Figma, Bash, edits) come back as agent/requestApproval.
+    this.wire(client);
     this.taskId ??= `c${Date.now()}${randomBytes(3).toString('hex')}`;
     const taskId = this.taskId;
     const c = vscode.workspace.getConfiguration(SECTION);
@@ -1719,6 +1722,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         useTaskTools: c.get<boolean>('claudeCode.useTaskXTools', true),
         images,
         mcpServers: claudeMcpServers(this.ctx),
+        approveAll: c.get<boolean>('agent.approveAll', true),
         ...claudePermissions(mode),
       },
       { signal },

@@ -63,6 +63,10 @@ pub struct Params {
     /// VS Code or Copilot). Claude Code loads its own configured servers by itself.
     #[serde(default)]
     pub mcp_servers: serde_json::Map<String, Value>,
+    /// Allow every tool Claude Code asks about (MCP tools such as Figma included) without asking
+    /// the client. A command that asks to leave the sandbox is still refused.
+    #[serde(default)]
+    pub approve_all: bool,
 }
 
 fn default_mode() -> String {
@@ -472,6 +476,9 @@ async fn decide(line: &str, token: &str, call_id: String, task_id: &str, host: &
     if input["dangerouslyDisableSandbox"] == json!(true) {
         return deny(UNSANDBOXED_DENIED);
     }
+    if host.approve_all {
+        return json!({ "behavior": "allow", "updatedInput": input });
+    }
     if !granted.lock().expect("grants lock").contains(&tool) {
         (host.emit)(task_id, json!({ "type": "approvalRequested", "callId": call_id, "tool": tool }));
         let req = crate::agent::ApprovalRequest {
@@ -547,11 +554,13 @@ async fn ask_user(mut input: Value, call_id: String, task_id: &str, host: &Appro
     json!({ "behavior": "allow", "updatedInput": input })
 }
 
+#[derive(Clone)]
 struct ApprovalHost {
     emit: crate::agent::EmitFn,
     approve: crate::agent::ApproveFn,
     ask: crate::agent::AskFn,
     cancel: CancellationToken,
+    approve_all: bool,
 }
 
 /// Answers approval requests from this run's MCP server: one JSON line in, one JSON line out.
@@ -686,7 +695,13 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let token = approval_token();
         approval = Some(format!("{addr} {token}"));
-        let ah = ApprovalHost { emit: host.emit.clone(), approve: host.approve.clone(), ask: host.ask.clone(), cancel: cancel.clone() };
+        let ah = ApprovalHost {
+            emit: host.emit.clone(),
+            approve: host.approve.clone(),
+            ask: host.ask.clone(),
+            cancel: cancel.clone(),
+            approve_all: p.approve_all,
+        };
         approvals = Some(tokio::spawn(serve_approvals(listener, token, p.task_id.clone(), ah)));
     }
     let mut child = Command::new(&p.cli_path)
@@ -956,6 +971,7 @@ mod tests {
             use_task_tools: true,
             images: Vec::new(),
             mcp_servers: serde_json::Map::new(),
+            approve_all: false,
         };
         validate(&p).unwrap();
         assert_eq!(prompt_content(&p), json!("--help me"));
@@ -1049,6 +1065,7 @@ mod tests {
             }),
             ask: Arc::new(|_, _| Box::pin(async { None })),
             cancel: CancellationToken::new(),
+            approve_all: false,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1071,6 +1088,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = seen.clone();
         let host = ApprovalHost {
+            approve_all: false,
             emit: Arc::new(|_, _| {}),
             approve: Arc::new(|_, _| Box::pin(async { crate::agent::ApprovalDecision::Deny })),
             ask: Arc::new(move |req, _| {
@@ -1108,6 +1126,16 @@ mod tests {
         );
         let dismissed = ApprovalHost { ask: Arc::new(|_, _| Box::pin(async { None })), ..host };
         assert_eq!(decide(&line, "tok", "c2".into(), "t", &dismissed, &Mutex::default()).await["behavior"], "deny");
+        let figma =
+            json!({ "token": "tok", "tool_name": "mcp__figma-desktop__get_design_context", "input": { "nodeId": "1:2" } }).to_string();
+        assert_eq!(
+            decide(&figma, "tok", "c5".into(), "t", &dismissed, &Mutex::default()).await["behavior"],
+            "deny",
+            "the deny-all host refuses"
+        );
+        let auto = ApprovalHost { approve_all: true, ..dismissed.clone() };
+        let r = decide(&figma, "tok", "c6".into(), "t", &auto, &Mutex::default()).await;
+        assert_eq!((r["behavior"].as_str(), &r["updatedInput"]["nodeId"]), (Some("allow"), &json!("1:2")), "approveAll never asks");
         let approve_all = ApprovalHost { approve: Arc::new(|_, _| Box::pin(async { crate::agent::ApprovalDecision::Allow })), ..dismissed };
         let unsandboxed =
             json!({ "token": "tok", "tool_name": "Bash", "input": { "command": "cargo test", "dangerouslyDisableSandbox": true } })
