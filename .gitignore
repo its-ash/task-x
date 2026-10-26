@@ -1,0 +1,13 @@
+.DS_Store
+Icon?
+node_modules/
+extension/out/
+extension/bin/
+extension/*.vsix
+runtime/target/
+.env
+.env.*
+!.env.example
+*.log
+extension/media/codicons/
+extension/media/vendor/

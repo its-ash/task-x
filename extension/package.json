@@ -1,0 +1,764 @@
+{
+  "name": "task-x",
+  "displayName": "task-x",
+  "description": "Model-agnostic AI coding agent with a Rust runtime. Works with Claude, OpenAI, Ollama, and OpenAI-compatible endpoints.",
+  "version": "0.1.0",
+  "publisher": "its-ash",
+  "license": "MIT",
+  "private": true,
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.100.0",
+    "node": ">=22.0.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "task-x",
+          "title": "task-x",
+          "icon": "media/logo.svg"
+        }
+      ],
+      "panel": [
+        {
+          "id": "task-x-logs",
+          "title": "task-x Logs",
+          "icon": "media/logs.svg"
+        }
+      ]
+    },
+    "views": {
+      "task-x": [
+        {
+          "type": "webview",
+          "id": "task-x.chat",
+          "name": "Chat"
+        }
+      ],
+      "task-x-logs": [
+        {
+          "type": "webview",
+          "id": "task-x.logs",
+          "name": "Logs"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "task-x.openChat",
+        "title": "Open Chat",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.addProvider",
+        "title": "Add LLM Provider\u2026",
+        "category": "task-x",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "task-x.selectProvider",
+        "title": "Select Provider and Model",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.signIn",
+        "title": "Sign In with Anthropic",
+        "category": "task-x",
+        "icon": "$(account)"
+      },
+      {
+        "command": "task-x.signOut",
+        "title": "Sign Out of Anthropic",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.showLogs",
+        "title": "Show Logs",
+        "category": "task-x",
+        "icon": "$(output)"
+      },
+      {
+        "command": "task-x.clearLogs",
+        "title": "Clear Logs",
+        "category": "task-x",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "task-x.copySelection",
+        "title": "Copy",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.setApiKey",
+        "title": "Set API Key",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.clearApiKey",
+        "title": "Clear API Key",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.testConnection",
+        "title": "Test Model Connection",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.cancel",
+        "title": "Cancel Request",
+        "category": "task-x",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "task-x.clearChat",
+        "title": "Clear Conversation",
+        "category": "task-x",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "task-x.restartRuntime",
+        "title": "Restart Runtime",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.inspectContext",
+        "title": "Inspect Workspace Context",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.previewContext",
+        "title": "Preview Context for a Request\u2026",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.reindex",
+        "title": "Rebuild Workspace Index",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.undoLast",
+        "title": "Undo Last Agent Edit",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.newChat",
+        "title": "New Chat",
+        "category": "task-x",
+        "icon": "$(add)"
+      },
+      {
+        "command": "task-x.askAgent",
+        "title": "Ask Agent\u2026",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.explainSelection",
+        "title": "Explain Selection",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.fixSelection",
+        "title": "Fix Selected Code",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.refactorSelection",
+        "title": "Refactor Selection\u2026",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.generateTests",
+        "title": "Generate Tests",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.reviewChanges",
+        "title": "Review Changes",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.explainError",
+        "title": "Explain Error",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.continueTask",
+        "title": "Continue Task",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.openTask",
+        "title": "Open Task History\u2026",
+        "category": "task-x",
+        "icon": "$(history)"
+      },
+      {
+        "command": "task-x.keepAll",
+        "title": "Keep All Agent Changes",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.undoAll",
+        "title": "Undo All Agent Changes",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.mcpStatus",
+        "title": "Show MCP Servers",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.listSkills",
+        "title": "List Skills",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.runInBackground",
+        "title": "Run Task in Background\u2026",
+        "category": "task-x",
+        "icon": "$(run-all)"
+      },
+      {
+        "command": "task-x.showTasks",
+        "title": "Show Running Tasks",
+        "category": "task-x",
+        "icon": "$(tasklist)"
+      },
+      {
+        "command": "task-x.bestOf",
+        "title": "Best of N: Compare Models on a Task\u2026",
+        "category": "task-x",
+        "icon": "$(versions)"
+      },
+      {
+        "command": "task-x.clearFindings",
+        "title": "Clear Review Findings",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.showGraph",
+        "title": "Show Project Graph",
+        "category": "task-x",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "task-x.showFileGraph",
+        "title": "Show in Project Graph",
+        "category": "task-x"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "task-x.cancel",
+          "when": "view == task-x.chat && task-x.busy",
+          "group": "navigation@1"
+        },
+        {
+          "command": "task-x.newChat",
+          "when": "view == task-x.chat",
+          "group": "navigation@2"
+        },
+        {
+          "command": "task-x.addProvider",
+          "when": "view == task-x.chat",
+          "group": "navigation@3"
+        },
+        {
+          "command": "task-x.clearChat",
+          "when": "view == task-x.chat",
+          "group": "overflow@1"
+        },
+        {
+          "command": "task-x.openTask",
+          "when": "view == task-x.chat",
+          "group": "navigation@4"
+        },
+        {
+          "command": "task-x.continueTask",
+          "when": "view == task-x.chat",
+          "group": "overflow@2"
+        },
+        {
+          "command": "task-x.undoLast",
+          "when": "view == task-x.chat",
+          "group": "overflow@3"
+        },
+        {
+          "command": "task-x.runInBackground",
+          "when": "view == task-x.chat",
+          "group": "overflow@4"
+        },
+        {
+          "command": "task-x.bestOf",
+          "when": "view == task-x.chat",
+          "group": "overflow@5"
+        },
+        {
+          "command": "task-x.showTasks",
+          "when": "view == task-x.chat",
+          "group": "overflow@6"
+        },
+        {
+          "command": "task-x.showGraph",
+          "when": "view == task-x.chat",
+          "group": "navigation@5"
+        }
+      ],
+      "webview/context": [
+        {
+          "command": "task-x.copySelection",
+          "when": "webviewId == 'task-x.chat'",
+          "group": "9_cutcopypaste"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "task-x.copySelection",
+          "when": "false"
+        }
+      ],
+      "editor/context": [
+        {
+          "submenu": "task-x.editor",
+          "group": "1_taskx@1"
+        }
+      ],
+      "task-x.editor": [
+        {
+          "command": "task-x.askAgent",
+          "group": "1@1"
+        },
+        {
+          "command": "task-x.explainSelection",
+          "when": "editorHasSelection",
+          "group": "1@2"
+        },
+        {
+          "command": "task-x.fixSelection",
+          "group": "2@1"
+        },
+        {
+          "command": "task-x.refactorSelection",
+          "when": "editorHasSelection",
+          "group": "2@2"
+        },
+        {
+          "command": "task-x.generateTests",
+          "group": "2@3"
+        },
+        {
+          "command": "task-x.explainError",
+          "group": "3@1"
+        },
+        {
+          "command": "task-x.reviewChanges",
+          "group": "3@2"
+        },
+        {
+          "command": "task-x.showFileGraph",
+          "group": "3@3"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "task-x.showFileGraph",
+          "group": "navigation@9"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "task-x",
+      "properties": {
+        "task-x.provider": {
+          "type": "string",
+          "pattern": "^(anthropic|openai|ollama|custom:[\\w-]{1,40})$",
+          "default": "ollama",
+          "markdownDescription": "Active model provider: `anthropic`, `openai`, `ollama`, or `custom:<id>` for an entry in `#task-x.customProviders#` (OpenAI-compatible servers are added there)."
+        },
+        "task-x.customProviders": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "Named endpoints added with \"task-x: Add LLM Provider…\", for example more than one OpenAI-compatible server. API keys are in SecretStorage, not here.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[\\w-]{1,40}$"
+              },
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "anthropic",
+                  "openai",
+                  "openaiCompatible",
+                  "ollama"
+                ]
+              },
+              "baseUrl": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "task-x.anthropic.model": {
+          "type": "string",
+          "default": "claude-sonnet-5-5",
+          "description": "Claude model id."
+        },
+        "task-x.anthropic.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Override the Anthropic API base URL. Empty uses https://api.anthropic.com."
+        },
+        "task-x.openai.model": {
+          "type": "string",
+          "default": "gpt-5",
+          "description": "OpenAI model id."
+        },
+        "task-x.openai.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Override the OpenAI API base URL. Empty uses https://api.openai.com/v1."
+        },
+        "task-x.ollama.model": {
+          "type": "string",
+          "default": "qwen3",
+          "description": "Ollama model name."
+        },
+        "task-x.ollama.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Override the Ollama base URL. Empty uses http://127.0.0.1:11434."
+        },
+        "task-x.requestTimeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 1000,
+          "maximum": 600000,
+          "description": "Timeout for response headers and for each idle gap in a streamed response."
+        },
+        "task-x.maxTokens": {
+          "type": "number",
+          "default": 4096,
+          "minimum": 1,
+          "description": "Maximum output tokens per response."
+        },
+        "task-x.systemPrompt": {
+          "type": "string",
+          "default": "You are task-x, a precise coding assistant inside VS Code.",
+          "editPresentation": "multilineText",
+          "description": "System prompt sent with each chat request."
+        },
+        "task-x.agent.approveAll": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow every tool call the agent (or Claude Code) asks about, with no approval prompt. The deny list still applies. Turn off to review deletes, installs, network, git writes, and unsandboxed commands one by one."
+        },
+        "task-x.agent.allowTools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Tools that never need approval. Edits and sandboxed commands in the workspace never ask; list tools here for deletes, installs, network, or git writes (for example \"delete_file\"). Cannot lift the deny list."
+        },
+        "task-x.agent.denyTools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Tools the agent may never use."
+        },
+        "task-x.agent.maxIterations": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Maximum model turns (one response plus its tool calls) per request. At the limit, the task continues automatically (task-x.agent.autoContinue times), then pauses with a Continue button."
+        },
+        "task-x.agent.autoContinue": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "maximum": 5,
+          "description": "How many times a task continues on its own when it reaches the turn limit. 0 pauses at the limit."
+        },
+        "task-x.index.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra glob patterns (relative to the workspace root) to leave out of the index, for example \"docs/generated/**\". .gitignore and .anvilignore are always respected, and secret files are always excluded."
+        },
+        "task-x.runtimePath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Absolute path to the task-x-runtime binary. Empty uses the bundled or locally built runtime."
+        },
+        "task-x.mcpServers": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "MCP servers to start, keyed by name: `{ \"github\": { \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"], \"env\": {} } }`. Their tools appear as `mcp__<server>__<tool>` and need approval unless listed in `task-x.agent.allowTools`. A trusted workspace can add servers in `.anvil/mcp.json`.",
+          "scope": "machine-overridable"
+        },
+        "task-x.hooks": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "Lifecycle hooks: `[{ \"event\": \"beforeTool\", \"command\": [\"./check.sh\"], \"matcher\": \"^run_\" }]`. Events: beforeTask, beforeTool, afterTool, beforeEdit, afterEdit, beforeValidation, afterTask. A failing `before*` hook blocks the action. A trusted workspace can add hooks in `.anvil/hooks.json`.",
+          "scope": "machine-overridable"
+        },
+        "task-x.routing": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "properties": {
+              "kinds": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "question",
+                    "bugInvestigation",
+                    "codeModification",
+                    "newFeature",
+                    "refactoring",
+                    "testing",
+                    "documentation",
+                    "repositoryWide",
+                    "architecture"
+                  ]
+                }
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "anthropic",
+                  "openai",
+                  "ollama"
+                ]
+              }
+            },
+            "required": [
+              "kinds",
+              "provider"
+            ]
+          },
+          "markdownDescription": "Send some task types to another configured provider, for example `[{ \"kinds\": [\"question\", \"documentation\"], \"provider\": \"ollama\" }]`. The provider's saved model and key are used. The chat shows when a route applies."
+        },
+        "task-x.fallbackProviders": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string",
+            "enum": [
+              "anthropic",
+              "openai",
+              "ollama"
+            ]
+          },
+          "markdownDescription": "Providers to switch to, in order, when the active one keeps failing (rate limits, outages, network errors). Only the providers listed here are used, and the chat reports every switch. Leave it empty to never send your code to a different provider."
+        },
+        "task-x.engine": {
+          "type": "string",
+          "enum": [
+            "task-x",
+            "claudeCode"
+          ],
+          "enumDescriptions": [
+            "task-x's built-in agent with the configured provider",
+            "The Claude Code CLI (claude -p), using your Anthropic account (task-x: Sign In with Anthropic)"
+          ],
+          "default": "task-x",
+          "description": "Which agent runs chat requests. You can also pick Claude Code CLI in the chat's model menu."
+        },
+        "task-x.claudeCode.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Absolute path to the claude executable. Empty searches PATH and the usual install folders (~/.local/bin, ~/.claude/local, /opt/homebrew/bin, /usr/local/bin)."
+        },
+        "task-x.claudeCode.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model for Claude Code (for example sonnet or opus). Empty uses Claude Code's default."
+        },
+        "task-x.claudeCode.maxBudgetUsd": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Maximum spend in US dollars for one Claude Code request (--max-budget-usd). 0 means no limit."
+        },
+        "task-x.team.maxParallel": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "In Team mode, the number of subagents that run at the same time."
+        },
+        "task-x.team.roleProviders": {
+          "type": "object",
+          "default": {},
+          "properties": {
+            "research": {
+              "type": "string",
+              "enum": [
+                "anthropic",
+                "openai",
+                "ollama"
+              ]
+            },
+            "implementation": {
+              "type": "string",
+              "enum": [
+                "anthropic",
+                "openai",
+                "ollama"
+              ]
+            },
+            "testing": {
+              "type": "string",
+              "enum": [
+                "anthropic",
+                "openai",
+                "ollama"
+              ]
+            },
+            "review": {
+              "type": "string",
+              "enum": [
+                "anthropic",
+                "openai",
+                "ollama"
+              ]
+            },
+            "documentation": {
+              "type": "string",
+              "enum": [
+                "anthropic",
+                "openai",
+                "ollama"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "markdownDescription": "A provider for subagents of one role, for example `{ \"research\": \"ollama\", \"review\": \"anthropic\" }`. The provider's saved model and key are used. Roles not listed use the chat's model."
+        },
+        "task-x.pricing": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "inputPerMtok": {
+                "type": "number",
+                "minimum": 0
+              },
+              "outputPerMtok": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "model",
+              "inputPerMtok",
+              "outputPerMtok"
+            ]
+          },
+          "markdownDescription": "Prices in US dollars per million tokens, matched by model id prefix, for example `[{ \"model\": \"gpt-5\", \"inputPerMtok\": 1.25, \"outputPerMtok\": 10 }]`. They override the built-in Anthropic prices. Local models cost nothing. Without a price, the summary shows the tokens as unpriced."
+        },
+        "task-x.notifications": {
+          "type": "string",
+          "enum": [
+            "whenHidden",
+            "always",
+            "off"
+          ],
+          "enumDescriptions": [
+            "When the chat is not on screen or VS Code is not focused",
+            "Always",
+            "Never"
+          ],
+          "default": "whenHidden",
+          "description": "Show a notification when a task finishes or when task-x needs your input (an approval, or a question in its answer)."
+        },
+        "task-x.context.windowTokens": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "The model's context window in tokens. 0 reads it from the provider's model API (OpenAI-compatible /models, Ollama /api/show, Anthropic /v1/models) and falls back to the known window for the model."
+        },
+        "task-x.context.compactAt": {
+          "type": "number",
+          "default": 85,
+          "minimum": 30,
+          "maximum": 95,
+          "description": "Compress the conversation when it uses this percent of the context window: old tool results are shortened first, then earlier turns are summarized."
+        },
+        "task-x.claudeCode.useTaskXTools": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "With Claude Code, read, search, and edit files through task-x's Rust tools (served over MCP) instead of Claude Code's own file tools. Shell commands that rewrite files (`python3 - <<EOF`, `python -c`, `sed -i`, `perl -i`, `cat >`, `tee`) are blocked; Bash stays available for builds, tests, and git. Edits keep task-x's checks: workspace-only paths, no secret files, and no edits to files that changed since they were read."
+        }
+      }
+    },
+    "submenus": [
+      {
+        "id": "task-x.editor",
+        "label": "task-x"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "task-x.askAgent",
+        "key": "ctrl+alt+i",
+        "mac": "cmd+alt+i"
+      }
+    ]
+  },
+  "scripts": {
+    "dev": "tsc -p . --watch",
+    "build": "npm run assets && tsc -p .",
+    "start": "code --extensionDevelopmentPath=.",
+    "typecheck": "tsc -p . --noEmit",
+    "test": "npm run build && node --test --test-timeout=30000 \"out/test/**/*.test.js\"",
+    "package": "npm run build && npx --yes @vscode/vsce@4 package --no-dependencies --allow-missing-repository --skip-license",
+    "assets": "node scripts/copy-assets.mjs"
+  },
+  "devDependencies": {
+    "@highlightjs/cdn-assets": "^11.11.1",
+    "@types/node": "^24.19.2",
+    "@types/vscode": "~1.100.0",
+    "@vscode/codicons": "^0.0.46-24",
+    "typescript": "^7.0.2"
+  }
+}

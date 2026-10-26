@@ -8,9 +8,9 @@ pub mod git;
 pub mod patch;
 pub mod search;
 pub mod validate;
+pub mod web;
 
 use crate::context::Workspace;
-use crate::context::index::is_secret;
 use crate::provider::ToolSpec;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,9 @@ pub enum Permission {
     Network,
     GitWrite,
     Install,
+    /// Reads a file from outside the workspace (copying one in). The workspace's own rules do not
+    /// cover it, so it asks in every mode that can write, and is refused in a read-only one.
+    External,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -49,7 +52,9 @@ impl From<Permission> for ToolRisk {
     fn from(permission: Permission) -> Self {
         match permission {
             Permission::Read => ToolRisk::ReadOnly,
-            Permission::Write | Permission::GitWrite | Permission::Execute | Permission::Network => ToolRisk::Mutating,
+            Permission::Write | Permission::GitWrite | Permission::Execute | Permission::Network | Permission::External => {
+                ToolRisk::Mutating
+            }
             Permission::Delete | Permission::Install => ToolRisk::Destructive,
         }
     }
@@ -371,6 +376,30 @@ pub fn fingerprint(s: &str) -> u64 {
     h.finish()
 }
 
+/// The path with `.` and `..` resolved, without touching the file system. A symlink is not followed,
+/// so a path that merely looks inside the workspace is still judged by where it points.
+pub fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether `raw` names a file outside the workspace: an absolute path elsewhere, or one that climbs
+/// out with `..`. Copying such a file in reads something the workspace rules do not cover.
+pub fn outside_source(root: &Path, raw: &str) -> bool {
+    let p = Path::new(raw.trim());
+    let joined = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
+    !lexical(&joined).starts_with(root)
+}
+
 pub struct ToolCtx {
     pub root: PathBuf,
     pub workspace: Arc<RwLock<Option<Workspace>>>,
@@ -383,18 +412,8 @@ pub struct ToolCtx {
 
 impl ToolCtx {
     /// Resolves a model-supplied path inside the workspace. Rejects traversal, absolute paths outside
-    /// the root, symlink escapes, `.git` internals, and secret files.
+    /// the root, and symlink escapes. `.git` internals are never accessible.
     pub fn resolve(&self, raw: &str) -> Result<(PathBuf, String), ToolError> {
-        self.resolve_with(raw, false)
-    }
-
-    /// Like `resolve`, but secret file names (`.env`, keys) are allowed. Used by write tools only:
-    /// the agent can change config files without reading or searching them.
-    pub fn resolve_write(&self, raw: &str) -> Result<(PathBuf, String), ToolError> {
-        self.resolve_with(raw, true)
-    }
-
-    fn resolve_with(&self, raw: &str, allow_secret: bool) -> Result<(PathBuf, String), ToolError> {
         let raw = raw.trim();
         if raw.is_empty() || raw.contains('\0') {
             return Err(ToolError::invalid("path must be a non-empty string"));
@@ -417,9 +436,6 @@ impl ToolCtx {
         if parts.first() == Some(&".git") {
             return Err(ToolError::new(ToolErrorKind::Forbidden, "the .git directory is not accessible to tools"));
         }
-        if !allow_secret && !rel.is_empty() && is_secret(&rel) {
-            return Err(ToolError::new(ToolErrorKind::Forbidden, format!("{rel} matches a protected secret-file pattern")));
-        }
         let abs = self.root.join(&rel);
         // Canonicalize the deepest existing ancestor so symlinks cannot point outside the root.
         let existing = abs.ancestors().find(|a| a.exists()).unwrap_or(&self.root);
@@ -433,16 +449,7 @@ impl ToolCtx {
     /// Like `resolve`, but a missing path that names exactly one indexed file by its trailing
     /// components (e.g. `Grid.vue` for `src/components/Grid.vue`) resolves to that file.
     pub fn resolve_existing(&self, raw: &str) -> Result<(PathBuf, String), ToolError> {
-        self.existing(raw, false)
-    }
-
-    /// `resolve_existing` for write tools, which may target secret file names.
-    pub fn resolve_existing_write(&self, raw: &str) -> Result<(PathBuf, String), ToolError> {
-        self.existing(raw, true)
-    }
-
-    fn existing(&self, raw: &str, allow_secret: bool) -> Result<(PathBuf, String), ToolError> {
-        let (abs, rel) = self.resolve_with(raw, allow_secret)?;
+        let (abs, rel) = self.resolve(raw)?;
         if abs.exists() {
             return Ok((abs, rel));
         }
@@ -450,10 +457,39 @@ impl ToolCtx {
         let hits: Vec<String> =
             self.with_workspace(|w| w.index.files().filter(|f| f.rel.ends_with(&suffix)).take(6).map(|f| f.rel.clone()).collect()).unwrap_or_default();
         match hits.as_slice() {
-            [one] => self.resolve_with(one, allow_secret),
+            [one] => self.resolve(one),
             [] => Ok((abs, rel)),
             many => Err(ToolError::new(ToolErrorKind::Ambiguous, format!("{rel} matches several files; use the full path: {}", many.join(", ")))),
         }
+    }
+
+    /// Like `resolve`, but for the source of a copy or a move: the file may also live outside the
+    /// workspace (an absolute path, or one that climbs out with `..`). Returns the real path, a
+    /// label for messages, and whether it is outside. Writes always go through `resolve`, so the
+    /// destination of every edit stays inside the workspace.
+    pub fn resolve_source(&self, raw: &str) -> Result<(PathBuf, String, bool), ToolError> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.contains('\0') {
+            return Err(ToolError::invalid("path must be a non-empty string"));
+        }
+        let given = Path::new(raw);
+        let joined = if given.is_absolute() { given.to_path_buf() } else { self.root.join(given) };
+        if lexical(&joined).starts_with(&self.root) {
+            // Inside: the workspace rules apply (including the `.git` refusal), on the normal form so
+            // `src/../a.txt` resolves while `..` out of the root stays forbidden.
+            let rel = lexical(&joined).strip_prefix(&self.root).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            let (abs, rel) = self.resolve(&rel)?;
+            if !abs.is_file() {
+                return Err(ToolError::new(ToolErrorKind::NotFound, format!("{rel} is not a file")));
+            }
+            return Ok((abs.canonicalize().unwrap_or(abs), rel, false));
+        }
+        // Outside: real path, existing file. The call needs the user's approval (`Permission::External`).
+        let abs = lexical(&joined).canonicalize().map_err(|e| ToolError::io(e, raw))?;
+        if !abs.is_file() {
+            return Err(ToolError::new(ToolErrorKind::NotFound, format!("{raw} is not a file")));
+        }
+        Ok((abs.clone(), abs.display().to_string(), true))
     }
 
     pub fn check_cancel(&self) -> Result<(), ToolError> {
@@ -513,7 +549,7 @@ pub const fn tool(
 
 pub fn registry() -> &'static [ToolDef] {
     static R: std::sync::OnceLock<Vec<ToolDef>> = std::sync::OnceLock::new();
-    R.get_or_init(|| [fs::tools(), search::tools(), edit::tools(), git::tools(), validate::tools()].into_iter().flatten().collect())
+    R.get_or_init(|| [fs::tools(), search::tools(), edit::tools(), git::tools(), validate::tools(), web::tools()].into_iter().flatten().collect())
 }
 
 pub fn find(name: &str) -> Option<&'static ToolDef> {
@@ -593,7 +629,7 @@ pub(crate) mod tests {
 
     pub fn ctx(files: &[(&str, &str)]) -> Arc<ToolCtx> {
         let root = temp_repo(files);
-        let ws = Workspace::open(&root, &[], None).unwrap();
+        let ws = Workspace::open(&root, &[]).unwrap();
         Arc::new(ToolCtx {
             root,
             workspace: Arc::new(RwLock::new(Some(ws))),
@@ -701,7 +737,8 @@ pub(crate) mod tests {
         let c = ctx(&[("a.txt", "x"), (".env", "S=1")]);
         assert_eq!(c.resolve("./a.txt").unwrap().1, "a.txt");
         assert_eq!(c.resolve(&c.root.join("a.txt").to_string_lossy()).unwrap().1, "a.txt");
-        for bad in ["../x", "/etc/passwd", ".env", ".git/config", "a/../../x", ""] {
+        assert_eq!(c.resolve(".env").unwrap().1, ".env");
+        for bad in ["../x", "/etc/passwd", ".git/config", "a/../../x", ""] {
             assert!(c.resolve(bad).is_err(), "{bad} should be rejected");
         }
         #[cfg(unix)]
@@ -712,15 +749,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn write_tools_handle_secret_names_but_reads_and_diffs_stay_blocked() {
+    fn secret_named_files_are_readable_writable_and_searchable() {
         let c = ctx(&[("a.txt", "x"), (".env", "KEY=old\n")]);
+        assert!(run(&c, "read_file", json!({ "path": ".env" })).unwrap()["content"].as_str().unwrap().contains("KEY=old"));
         run(&c, "create_file", json!({ "path": ".env.local", "content": "TOKEN=abc\n" })).unwrap();
         assert_eq!(std::fs::read_to_string(c.root.join(".env.local")).unwrap(), "TOKEN=abc\n");
-        c.seen.lock().unwrap().clear();
         let r = run(&c, "replace_text", json!({ "path": ".env", "oldText": "KEY=old", "newText": "KEY=new" })).unwrap();
         assert_eq!(std::fs::read_to_string(c.root.join(".env")).unwrap(), "KEY=new\n");
-        assert!(!r.to_string().contains("KEY="), "secret values stay out of tool output");
-        assert_eq!(c.resolve(".env").unwrap_err().kind, ToolErrorKind::Forbidden);
+        assert!(!r.to_string().contains("KEY="), "secret values stay out of diffs");
         assert!(run(&c, "create_file", json!({ "path": ".git/x", "content": "" })).is_err());
     }
 

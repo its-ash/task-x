@@ -2,25 +2,29 @@ import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
-import { activeRef, hasApiKey, isProviderRef, modelFor, providerConfig, providerRefs, refLabel, refNeedsKey, setProvider, settings, SECTION } from './config.js';
+import { activeRef, hasApiKey, isProviderRef, modelFor, nightModels, providerConfig, providerConfigWith, providerRefs, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
 import {
   type AgentEvent,
   type AgentEventParams,
   type AgentSummary,
   type ApprovalDecision,
-  type ApprovalMode,
   type ApprovalRequest,
+  type AskUserRequest,
+  type AskUserResult,
+  type Question,
   USER_MODES,
   type ChatMode,
+  type ContextWindowResult,
   type EditorContext,
   type ProviderErrorData,
+  type RefineResult,
   type ResolvedSkill,
   type SkillInfo,
 } from './protocol.js';
 import { CLAUDE_KIND, CLAUDE_LABEL, CLAUDE_MODELS, claudeAuth, claudeModel, claudePermissions, claudeSignIn, claudeSignOut, engine, findClaude, useClaude } from './claudeCode.js';
 import { type JsonRpcClient, RpcError } from './rpc.js';
 import { diffStats, formatOutput } from './output.js';
-import { APPROVAL_MODES, formatCost, runParams } from './runParams.js';
+import { formatCost, limits, routes, runParams } from './runParams.js';
 import { commitPaths, commitSubject } from './autoCommit.js';
 import { WorkspaceSync } from './workspace.js';
 
@@ -47,6 +51,8 @@ const MAX_PICKER_MODELS = 100;
 const MAX_OPEN_FILES = 10;
 const MAX_DIAGNOSTICS = 50;
 const MAX_QUEUE = 10;
+/** Permission classes of tool calls that run a process, which the user can stop alone. */
+const STOPPABLE = new Set(['execute', 'install', 'gitWrite', 'network']);
 const MAX_STEERS = 10;
 /** Output kept in the saved transcript per tool call; the full text stays in memory for the session. */
 const MAX_SAVED_OUTPUT = 8_000;
@@ -55,6 +61,34 @@ const MAX_CARD_DIFF = 6_000;
 const OUTPUT_TOOLS = new Set(['Bash', 'BashOutput', 'run_command', 'run_tests', 'check_build', 'run_linter', 'format_code', 'get_diagnostics', 'git_status', 'git_diff', 'git_log', 'git_show']);
 const SEVERITY = ['error', 'warning', 'info', 'hint'];
 const CONTINUE_PROMPT = 'Continue the task from where you stopped. Check what is already done, finish the remaining work, then run the build and tests.';
+/** Night mode: the last request runs again until it completes, for free models that drop requests or stall. */
+const NIGHT_KEY = 'task-x.nightMode';
+const NIGHT_REQUEST_KEY = 'task-x.nightRequest';
+const NIGHT_STALL_MS = 10 * 60_000;
+const NIGHT_CHECK_MS = 30_000;
+const NIGHT_RETRY_BASE_MS = 15_000;
+const NIGHT_RETRY_MAX_MS = 5 * 60_000;
+/** Night mode with a Think model: it splits the request into todo.md, and the Loop model works on one item per run. */
+const NIGHT_TODO_KEY = 'task-x.nightTodo';
+const NIGHT_ITEM_KEY = 'task-x.nightItem';
+const TODO_FILE = 'todo.md';
+const MAX_TODO_ITEMS = 50;
+const MAX_TODO_CHARS = 500;
+const TODO_ITEM = /^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$/;
+const TODO_PROMPT =
+  'Split the request below into a todo list that a smaller model can finish one item at a time. Look at the code first. Make each item one small change that can be checked: name the files to change and what to change in them. Put the items in order, so each item builds on the items before it. Make the last item run the build and tests. Do not make the changes yourself. Reply only with a Markdown checklist, one item per line, like "- [ ] item".';
+const todoPrompt = (request: string, item: string, n: number, total: number) =>
+  `Night mode works through ${TODO_FILE}, one item at a time. The original request was:\n\n${request}\n\nWork only on item ${n} of ${total}:\n\n${item}\n\nFirst check what is already done. Finish this item, then run the checks it needs. Do not start other items and do not edit ${TODO_FILE}; task-x checks the item off when you finish.`;
+
+/** The items of a checklist from the Think model. Plain bullets or a numbered list also count. */
+function parseTodo(text: string): string[] {
+  const lines = text.split('\n');
+  const checked = lines.flatMap((l) => TODO_ITEM.exec(l)?.[2] ?? []);
+  const items = checked.length ? checked : lines.flatMap((l) => /^\s*(?:[-*]|\d+[.)])\s+(.+?)\s*$/.exec(l)?.[1] ?? []);
+  return items.map((i) => i.replace(/\s+/g, ' ').slice(0, MAX_TODO_CHARS)).filter(Boolean).slice(0, MAX_TODO_ITEMS);
+}
+const nightPrompt = (request: string) =>
+  `Continue the task from where you stopped. The original request was:\n\n${request}\n\nCheck what is already done, finish the remaining work, then run the build and tests.`;
 const TASK_KIND_LABELS: Record<string, string> = {
   question: 'Question',
   bugInvestigation: 'Bug investigation',
@@ -66,6 +100,19 @@ const TASK_KIND_LABELS: Record<string, string> = {
   repositoryWide: 'Repository-wide change',
   architecture: 'Architecture',
 };
+
+/** Keeps only offered options, and one choice for radio questions. Null when the answers are not an object. */
+function sanitizeAnswers(questions: Question[], raw: unknown): Record<string, string[]> | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const src = raw as Record<string, unknown>;
+  const out: Record<string, string[]> = {};
+  for (const q of questions) {
+    const list = Array.isArray(src[q.id]) ? (src[q.id] as unknown[]) : [];
+    const picked = [...new Set(list.filter((x): x is string => typeof x === 'string' && q.options.includes(x)))];
+    out[q.id] = q.kind === 'radio' ? picked.slice(0, 1) : picked;
+  }
+  return out;
+}
 
 /** A short label for a context or instruction path: home-relative, or the last two path parts. */
 function shortPath(p: string): string {
@@ -81,7 +128,7 @@ const MAX_LANE_STEPS = 30;
 type Item =
   | { kind: 'user'; text: string; mode: ChatMode }
   | { kind: 'assistant'; text: string }
-  | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean }
+  | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string } }
   | { kind: 'file'; path: string; operation: number | null; diffKey: string; added: number; removed: number; diff: string; diffCut: boolean; undone?: boolean; kept?: boolean }
   | { kind: 'context'; text: string }
   | { kind: 'steer'; text: string }
@@ -89,6 +136,7 @@ type Item =
   | { kind: 'taskInfo'; taskKind: string; label: string; files: string[]; instructions: { label: string; path: string }[]; skills: string[] }
   | { kind: 'summary'; text: string; ok: boolean; canContinue?: boolean; title?: string; stats?: string[]; error?: string; signIn?: boolean; raiseLimit?: boolean }
   | { kind: 'error'; text: string; retryText?: string }
+  | { kind: 'questions'; questions: Question[]; answers: Record<string, string[]> | null }
   | Lane;
 
 /** One subagent: its role, model, live tool steps, and result. */
@@ -121,7 +169,6 @@ type Inbound =
   | { type: 'cancel' }
   | { type: 'clear' }
   | { type: 'selectModel'; kind: string; model: string }
-  | { type: 'selectMode'; mode: string }
   | { type: 'loadModels' }
   | { type: 'addProvider' }
   | { type: 'signIn' }
@@ -135,13 +182,16 @@ type Inbound =
   | { type: 'keep'; paths?: string[] }
   | { type: 'revert'; paths?: string[] }
   | { type: 'diffFile'; path: string }
-  | { type: 'selectApproval'; mode: string }
+  | { type: 'selectNight'; enabled: boolean }
+  | { type: 'selectNightModel'; role: string; kind: string; model: string }
   | { type: 'selectAutoCommit'; enabled: boolean }
   | { type: 'openSettings'; query: string }
   | { type: 'suggest'; text: string; mode: string }
   | { type: 'copyOutput'; id: string }
   | { type: 'openOutput'; id: string }
   | { type: 'stopLane'; taskId: string }
+  | { type: 'stopTool'; id: string }
+  | { type: 'refine'; text: string }
   | { type: 'applyWorktree'; name: string }
   | { type: 'discardWorktree'; name: string }
   | { type: 'openWorktree'; name: string }
@@ -152,7 +202,8 @@ type Inbound =
   | { type: 'listTasks' }
   | { type: 'openTask'; id: string }
   | { type: 'deleteTask'; id: string }
-  | { type: 'clearHistory' };
+  | { type: 'clearHistory' }
+  | { type: 'answerQuestions'; callId: string; answers: unknown };
 
 /** One saved task in the History tab. */
 interface TaskRow {
@@ -216,9 +267,13 @@ export function describeError(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-export function chatMode(): ChatMode {
-  const m = vscode.workspace.getConfiguration(SECTION).get<string>('chatMode');
-  return USER_MODES.includes(m as ChatMode) ? (m as ChatMode) : 'agent';
+
+function isBackgroundStart(output: string): boolean {
+  try {
+    return (JSON.parse(output) as { background?: unknown })?.background === true;
+  } catch {
+    return false;
+  }
 }
 
 function toolDetail(tool: string, input: Record<string, unknown>): string {
@@ -247,7 +302,7 @@ function summaryText(s: AgentSummary): { text: string; ok: boolean; canContinue:
     completed: 'Done',
     cancelled: 'Stopped',
     maxIterations: `Paused after ${s.iterations} turns (the turn limit)`,
-    budgetExceeded: 'Stopped: reached the tool or token budget',
+    budgetExceeded: 'Stopped: reached the token budget',
     deadlineExceeded: 'Stopped: reached the time limit',
     providerError: 'Stopped: model request failed',
     stuck: 'Stopped: tool calls kept failing',
@@ -267,9 +322,6 @@ function summaryText(s: AgentSummary): { text: string; ok: boolean; canContinue:
   if (u.inputTokens || u.outputTokens) parts.push(`${fmtTokens((u.inputTokens ?? 0) + (u.outputTokens ?? 0))} tokens (${fmtTokens(u.inputTokens ?? 0)} in · ${fmtTokens(u.outputTokens ?? 0)} out)`);
   const m = s.metrics;
   if (m?.subagents) parts.push(`${m.subagents} subagent${m.subagents > 1 ? 's' : ''}${m.subagentTokens ? ` · ${fmtTokens(m.subagentTokens)} tokens` : ''}`);
-  const cost = formatCost(m?.costUsd);
-  if (cost) parts.push(m?.subagentCostUsd ? `${cost} (subagents ${formatCost(m.subagentCostUsd) || '$0'})` : cost);
-  if (m?.unpricedTokens) parts.push(`cost unknown for ${fmtTokens(m.unpricedTokens)} tokens (set task-x.pricing)`);
   const error = s.error?.trim() || undefined;
   const signIn = !!error && AUTH_ERROR.test(error);
   const canContinue = ['maxIterations', 'budgetExceeded', 'deadlineExceeded', 'cancelled'].includes(s.status);
@@ -292,9 +344,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private items: Item[];
   private taskId: string | undefined;
   private readonly listed = new Map<string, string[]>();
+  // Context window per `kind:model`; 0 means unknown.
+  private readonly windows = new Map<string, number>();
   /** Messages sent while a request was running; each one runs after the one before it. */
   private readonly queue: { text: string; mode?: ChatMode }[] = [];
   private readonly approvals = new Map<string, (d: ApprovalDecision | 'always') => void>();
+  private readonly questions = new Map<string, { questions: Question[]; done: (answers: Record<string, string[]> | null) => void }>();
+  private night: boolean;
+  /** The last request the user sent; Night mode runs it again until a run completes. */
+  private nightRequest: string | undefined;
+  /** True when the night request is split into todo.md; `nightItem` is the item the current run works on. */
+  private nightTodo: boolean;
+  private nightItem: string | undefined;
+  private nightFailures = 0;
+  private nightTimer: NodeJS.Timeout | undefined;
+  private nightWatch: NodeJS.Timeout | undefined;
+  /** True when Night mode stopped a stalled run, so the stop is not taken as the user's. */
+  private stalled = false;
+  private lastActivity = 0;
   private readonly diffs = new Map<string, string>();
   private readonly outputs = new Map<string, string>();
   private readonly wired = new WeakSet<JsonRpcClient>();
@@ -325,6 +392,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.includeEditor = ctx.workspaceState.get<boolean>(INCLUDE_EDITOR_KEY, true);
     this.autoCommit = ctx.workspaceState.get<boolean>(AUTO_COMMIT_KEY, false);
     this.taskId = ctx.workspaceState.get<string>(TASK_KEY);
+    this.night = ctx.workspaceState.get<boolean>(NIGHT_KEY, false);
+    this.nightRequest = ctx.workspaceState.get<string>(NIGHT_REQUEST_KEY);
+    this.nightTodo = ctx.workspaceState.get<boolean>(NIGHT_TODO_KEY, false);
+    this.nightItem = ctx.workspaceState.get<string>(NIGHT_ITEM_KEY);
+    this.watchNight();
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
@@ -343,6 +415,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.abort?.abort();
     for (const resolve of this.approvals.values()) resolve('deny');
     this.approvals.clear();
+    for (const p of this.questions.values()) p.done(null);
+    this.questions.clear();
+    clearTimeout(this.nightTimer);
+    this.nightTimer = undefined;
     this.queue.length = 0;
     this.post({ type: 'queue', items: [] });
   }
@@ -352,6 +428,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     await this.archive();
     this.items = [];
     this.taskId = undefined;
+    await this.setNightRequest(undefined);
     this.diffs.clear();
     this.outputs.clear();
     await this.persist();
@@ -374,14 +451,202 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   refreshStatus(): void {
     const ref = activeRef();
-    const approval = vscode.workspace.getConfiguration(SECTION).get<string>('agent.approvalMode', 'askBeforeExecution');
     const claude = engine() === 'claudeCode';
-    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.busy, mode: chatMode(), approval, autoCommit: this.autoCommit });
+    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.busy, mode: 'agent', autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null });
     void this.postModels();
   }
 
   dispose(): void {
+    clearInterval(this.nightWatch);
     this.cancel();
+  }
+
+  private async setNightRequest(text: string | undefined): Promise<void> {
+    this.nightRequest = text;
+    await this.ctx.workspaceState.update(NIGHT_REQUEST_KEY, text);
+    if (!text) await this.setNightTodo(false);
+  }
+
+  private async setNightTodo(on: boolean, item?: string): Promise<void> {
+    this.nightTodo = on;
+    this.nightItem = on ? item : undefined;
+    await this.ctx.workspaceState.update(NIGHT_TODO_KEY, on);
+    await this.ctx.workspaceState.update(NIGHT_ITEM_KEY, this.nightItem);
+  }
+
+  private todoUri(): vscode.Uri | undefined {
+    const root = WorkspaceSync.root();
+    return root ? vscode.Uri.file(path.join(root, TODO_FILE)) : undefined;
+  }
+
+  private async readTodoLines(): Promise<string[]> {
+    const uri = this.todoUri();
+    if (!uri) return [];
+    try {
+      return new TextDecoder().decode(await vscode.workspace.fs.readFile(uri)).split('\n');
+    } catch {
+      return [];
+    }
+  }
+
+  private async readTodo(): Promise<{ text: string; done: boolean }[]> {
+    return (await this.readTodoLines()).flatMap((l) => {
+      const m = TODO_ITEM.exec(l);
+      return m ? [{ text: m[2], done: m[1] !== ' ' }] : [];
+    });
+  }
+
+  private async writeTodo(request: string, items: string[]): Promise<void> {
+    const uri = this.todoUri();
+    if (!uri) throw new Error('open a workspace folder first');
+    const title = request.trim().split('\n')[0].slice(0, 200);
+    const body = `# Todo\n\nNight mode works through this list one item at a time and checks each item off when it is done.\n\nRequest: ${title}\n\n${items.map((i) => `- [ ] ${i}`).join('\n')}\n`;
+    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(body));
+  }
+
+  /** Checks off the first open item with this text. The file is read again, so edits made during the run are kept. */
+  private async checkTodo(item: string): Promise<void> {
+    const uri = this.todoUri();
+    const lines = await this.readTodoLines();
+    const i = lines.findIndex((l) => {
+      const m = TODO_ITEM.exec(l);
+      return m?.[1] === ' ' && m[2] === item;
+    });
+    if (!uri || i < 0) return;
+    lines[i] = lines[i].replace('[ ]', '[x]');
+    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(lines.join('\n')));
+  }
+
+  /** Night mode: the prompt for this run. With a todo list, the Loop model gets the first open item only. */
+  private async nightTask(text: string, retry: boolean, signal: AbortSignal): Promise<string> {
+    this.taskId ??= `c${Date.now()}${randomBytes(3).toString('hex')}`;
+    if (!retry) {
+      const items = await this.planTodo(text, this.taskId, signal);
+      await this.setNightTodo(!!items?.length);
+    }
+    if (!this.nightTodo) return text;
+    const items = await this.readTodo();
+    const n = items.findIndex((i) => !i.done);
+    if (n < 0) return text;
+    await this.setNightTodo(true, items[n].text);
+    return todoPrompt(this.nightRequest ?? text, items[n].text, n + 1, items.length);
+  }
+
+  /** Night mode: after a completed run, checks its item off and starts the next one, until the list is done. */
+  private async nextTodo(): Promise<void> {
+    if (!this.nightTodo || !this.nightRequest) return;
+    if (this.nightItem) await this.checkTodo(this.nightItem);
+    const items = await this.readTodo();
+    const left = items.filter((i) => !i.done);
+    if (!left.length) {
+      await this.setNightTodo(false);
+      this.add({ kind: 'context', text: `Night mode: all ${items.length} items in ${TODO_FILE} are done.` });
+      return void this.persist();
+    }
+    await this.setNightTodo(true);
+    this.add({ kind: 'context', text: `Night mode: ${items.length - left.length} of ${items.length} items in ${TODO_FILE} done.` });
+    void this.persist();
+    this.scheduleNight(0);
+  }
+
+  /** Night mode: the Think model splits the request into todo.md, once per request. Undefined without a Think model or when it fails. */
+  private async planTodo(request: string, taskId: string, signal: AbortSignal): Promise<string[] | undefined> {
+    const planner = nightModels().planner;
+    if (!planner) return undefined;
+    this.add({ kind: 'context', text: `Night mode: ${planner.model} is writing the todo list.` });
+    const client = await this.getClient();
+    const planId = `${taskId}-plan${Date.now()}`;
+    const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
+    const off = client.onNotification('agent/event', (p) => {
+      const { taskId: id, event } = p as AgentEventParams;
+      if (id === planId) this.onEvent(event, state);
+    });
+    try {
+      const prompt = `${TODO_PROMPT}\n\n${request}`;
+      let summary: AgentSummary;
+      if (planner.kind === CLAUDE_KIND) {
+        const cliPath = findClaude();
+        if (!cliPath) throw new Error('Claude Code CLI not found');
+        const model = planner.model === 'default' ? undefined : planner.model;
+        summary = await client.request<AgentSummary>('claude/run', { prompt, taskId: planId, cliPath, chatMode: 'plan', model, ...claudePermissions('plan') }, { signal });
+      } else {
+        if (!isProviderRef(planner.kind)) throw new Error(`unknown provider ${planner.kind}`);
+        const provider = await providerConfigWith(this.ctx.secrets, planner.kind, planner.model);
+        const params = await runParams(this.ctx.secrets, { prompt, mode: 'plan', taskId: planId, editor: this.editorContext(request), provider });
+        summary = await client.request<AgentSummary>('agent/run', params, { signal });
+      }
+      if (summary.status !== 'completed') throw new Error(summary.error || `the Think model stopped (${summary.status})`);
+      const items = parseTodo(summary.text);
+      if (!items.length) throw new Error('the reply has no todo items');
+      await this.writeTodo(request, items);
+      this.add({ kind: 'context', text: `Night mode: wrote ${items.length} items to ${TODO_FILE}. The Loop model works on them one at a time.` });
+      return items;
+    } catch (e) {
+      if (signal.aborted) throw e;
+      this.add({ kind: 'context', text: `Night mode: the todo list failed (${describeError(e)}). The Loop model works on the whole request.` });
+      return undefined;
+    } finally {
+      off();
+    }
+  }
+
+  private lastSummary(): Extract<Item, { kind: 'summary' }> | undefined {
+    return this.items.findLast((i): i is Extract<Item, { kind: 'summary' }> => i.kind === 'summary');
+  }
+
+  /** Night mode: stops a run with no progress for NIGHT_STALL_MS so it starts again. Waiting for the user is not a stall. */
+  private watchNight(): void {
+    clearInterval(this.nightWatch);
+    this.nightWatch = undefined;
+    if (!this.night) return;
+    this.nightWatch = setInterval(() => {
+      if (!this.busy) return;
+      if (this.approvals.size || this.questions.size) return void (this.lastActivity = Date.now());
+      if (Date.now() - this.lastActivity < NIGHT_STALL_MS) return;
+      this.stalled = true;
+      this.lastActivity = Date.now();
+      this.add({ kind: 'context', text: `Night mode: no progress for ${NIGHT_STALL_MS / 60_000} minutes. Restarting the request.` });
+      this.abort?.abort();
+    }, NIGHT_CHECK_MS);
+  }
+
+  /** Night mode: after a run that did not complete, runs the last request again with a growing delay. A user Stop ends it. */
+  private afterRun(before: Item | undefined, signal: AbortSignal): void {
+    if (!this.night || !this.nightRequest || this.busy) return;
+    const last = this.lastSummary();
+    if (last && last !== before && last.ok) {
+      this.nightFailures = 0;
+      return void this.nextTodo();
+    }
+    if (signal.aborted && !this.stalled) return;
+    this.nightFailures++;
+    const wait = Math.min(NIGHT_RETRY_MAX_MS, NIGHT_RETRY_BASE_MS * 2 ** Math.min(this.nightFailures - 1, 10));
+    this.add({ kind: 'context', text: `Night mode: the request did not finish. Retry ${this.nightFailures} in ${Math.round(wait / 1000)} s.` });
+    void this.persist();
+    this.scheduleNight(wait);
+  }
+
+  private scheduleNight(wait: number): void {
+    clearTimeout(this.nightTimer);
+    this.nightTimer = setTimeout(async () => {
+      this.nightTimer = undefined;
+      if (!this.night || this.busy || !this.nightRequest) return;
+      // With a todo list, the transcript and the commit name the item.
+      const items = this.nightTodo ? await this.readTodo() : [];
+      const n = items.findIndex((i) => !i.done);
+      void this.send(n >= 0 ? `Todo ${n + 1}/${items.length}: ${items[n].text}` : nightPrompt(this.nightRequest), undefined, true);
+    }, wait);
+  }
+
+  /** Night mode: starts the last request again when this chat's last run did not complete. */
+  private resumeNight(): void {
+    if (!this.night || this.busy || this.nightTimer || !this.nightRequest) return;
+    const lastUser = this.items.findLastIndex((i) => i.kind === 'user');
+    const lastDone = this.items.findLastIndex((i) => i.kind === 'summary' && i.ok);
+    if (lastUser < 0) return;
+    if (lastDone > lastUser) return void this.nextTodo();
+    this.add({ kind: 'context', text: 'Night mode: the last request did not finish. Starting it again.' });
+    this.scheduleNight(0);
   }
 
   private post(msg: object): void {
@@ -479,8 +744,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     const auth = await claudeAuth();
     if (auth.loggedIn) groups.push({ kind: CLAUDE_KIND, label: auth.email ? `${CLAUDE_LABEL} · ${auth.email}` : CLAUDE_LABEL, models: [...new Set([claudeModel(), ...CLAUDE_MODELS])] });
-    const current = engine() === 'claudeCode' ? { kind: CLAUDE_KIND, model: claudeModel() } : { kind: active, model: modelFor(active) };
+    const current = engine() === 'claudeCode' ? { kind: CLAUDE_KIND, model: claudeModel() } : { kind: active, model: modelFor(active), window: this.windowFor(active, modelFor(active)) };
     this.post({ type: 'models', active: current, groups, auth });
+  }
+
+  /** The window for the chat model: the user setting, a cached answer, or undefined while the runtime is asked. */
+  private windowFor(kind: string, model: string | undefined): number | undefined {
+    const set = limits().contextWindowTokens;
+    if (set || !model || !isProviderRef(kind)) return set;
+    const key = `${kind}:${model}`;
+    if (!this.windows.has(key)) void this.loadWindow(kind, key);
+    return this.windows.get(key) || undefined;
+  }
+
+  private async loadWindow(kind: Parameters<typeof providerConfig>[1], key: string): Promise<void> {
+    this.windows.set(key, 0);
+    try {
+      const provider = await providerConfig(this.ctx.secrets, kind);
+      const client = await this.getClient();
+      const { tokens } = await client.request<ContextWindowResult>('provider/contextWindow', { provider }, { timeoutMs: settings().timeoutMs });
+      if (!Number.isFinite(tokens) || tokens <= 0) return;
+      this.windows.set(key, tokens);
+    } catch {
+      // The badge is best effort; the picker works without it.
+      return;
+    }
+    await this.postModels();
   }
 
   private async loadModels(): Promise<void> {
@@ -508,6 +797,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.postEditor();
         this.post({ type: 'index', index: this.indexState });
         void this.refreshChanges();
+        this.resumeNight();
         break;
       case 'listFiles':
         if (typeof m.query === 'string') await this.postFiles(m.query.slice(0, 300));
@@ -534,6 +824,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'clearHistory':
         await this.clearHistory();
         break;
+      case 'answerQuestions': {
+        const pending = typeof m.callId === 'string' ? this.questions.get(m.callId) : undefined;
+        pending?.done(sanitizeAnswers(pending.questions, m.answers));
+        break;
+      }
       case 'keep':
       case 'revert':
         await this.settle(m.type, Array.isArray(m.paths) ? m.paths.filter((p) => typeof p === 'string') : undefined);
@@ -546,6 +841,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         break;
       case 'cancel':
         this.cancel();
+        await this.setNightRequest(undefined);
         break;
       case 'clear':
         await this.newChat();
@@ -570,14 +866,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         break;
       case 'selectModel':
         if (this.busy || typeof m.model !== 'string' || !m.model.trim() || m.model.length > 256) this.refreshStatus();
-        else if (m.kind === CLAUDE_KIND) await useClaude(m.model.trim());
-        else if (isProviderRef(m.kind)) {
-          await vscode.workspace.getConfiguration(SECTION).update('engine', 'task-x', vscode.ConfigurationTarget.Global);
+        else if (m.kind === CLAUDE_KIND) {
+          await useClaude(m.model.trim());
+          this.refreshStatus();
+        } else if (isProviderRef(m.kind)) {
+          await setWindowChoice({ engine: 'task-x' });
           await setProvider(m.kind, m.model.trim());
+          this.refreshStatus();
         } else this.refreshStatus();
-        break;
-      case 'selectMode':
-        if (USER_MODES.includes(m.mode as ChatMode)) await vscode.workspace.getConfiguration(SECTION).update('chatMode', m.mode, vscode.ConfigurationTarget.Global);
         break;
       case 'approve': {
         const d = (['allow', 'allowSession', 'always', 'deny'] as const).find((x) => x === m.decision) ?? 'deny';
@@ -585,9 +881,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.approvals.delete(m.callId);
         break;
       }
-      case 'selectApproval':
-        if (APPROVAL_MODES.includes(m.mode as ApprovalMode)) await vscode.workspace.getConfiguration(SECTION).update('agent.approvalMode', m.mode, vscode.ConfigurationTarget.Global);
+      case 'selectNight':
+        this.night = m.enabled === true;
+        await this.ctx.workspaceState.update(NIGHT_KEY, this.night);
+        this.watchNight();
+        if (this.night) this.resumeNight();
+        else {
+          clearTimeout(this.nightTimer);
+          this.nightTimer = undefined;
+        }
+        this.refreshStatus();
         break;
+      case 'selectNightModel': {
+        const model = typeof m.model === 'string' ? m.model.trim() : '';
+        const kindOk = isProviderRef(m.kind) || (m.role === 'planner' && m.kind === CLAUDE_KIND);
+        if (model && model.length <= 256 && kindOk && (m.role === 'planner' || m.role === 'worker')) {
+          await setWindowChoice(m.role === 'planner' ? { nightPlanner: { kind: m.kind, model } } : { nightWorker: { kind: m.kind, model } });
+        }
+        this.refreshStatus();
+        break;
+      }
       case 'selectAutoCommit':
         this.autoCommit = m.enabled === true;
         await this.ctx.workspaceState.update(AUTO_COMMIT_KEY, this.autoCommit);
@@ -628,6 +941,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'showProblems':
         await vscode.commands.executeCommand('workbench.actions.view.problems');
         break;
+      case 'refine':
+        if (typeof m.text === 'string') await this.refine(m.text);
+        break;
+      case 'stopTool': {
+        const it = this.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === m.id);
+        if (it?.stop && it.ok === undefined && this.busy) await (await this.getClient()).request('agent/cancelTool', it.stop).catch((e) => this.log('warn', `cancelTool: ${describeError(e)}`));
+        break;
+      }
       case 'stopLane': {
         const lane = this.lane(m.taskId);
         if (lane?.status === 'running') await (await this.getClient()).request('agent/cancelSubagent', { taskId: lane.taskId }).catch((e) => this.log('warn', `cancelSubagent: ${describeError(e)}`));
@@ -761,7 +1082,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Auto-commit: commits the files this task changed, then keeps them in the edit log. */
   private async commitTask(summary: AgentSummary, prompt: string): Promise<void> {
     const root = WorkspaceSync.root();
-    if (!this.autoCommit || !root || !summary.changedFiles.length) return;
+    // Night mode always commits.
+    if (!(this.autoCommit || this.night) || !root || !summary.changedFiles.length) return;
     const paths = summary.changedFiles.filter((p) => !path.isAbsolute(p) && !p.split(/[\\/]/).includes('..'));
     try {
       const r = await commitPaths(root, paths, commitSubject(prompt));
@@ -851,7 +1173,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private wire(client: JsonRpcClient): void {
     if (this.wired.has(client)) return;
     this.wired.add(client);
-    client.onRequest('agent/requestApproval', (p) => this.requestApproval(p as ApprovalRequest));
+    client.onRequest('agent/requestApproval', (p) =>
+      vscode.workspace.getConfiguration(SECTION).get<boolean>('agent.approveAll', true) ? Promise.resolve({ decision: 'allowSession' as const }) : this.requestApproval(p as ApprovalRequest),
+    );
+    client.onRequest('agent/askUser', (p) => this.askUser(p as AskUserRequest));
+  }
+
+  /** Shows the agent's questions in the chat and resolves with the answers, or null when dismissed. */
+  private askUser(req: AskUserRequest): Promise<AskUserResult> {
+    if (!this.taskId || !req.taskId.startsWith(this.taskId) || !this.busy) return Promise.resolve({ answers: null });
+    this.view?.show?.(true);
+    this.notify('input', 'task-x has questions for you', 'Answer');
+    this.post({ type: 'questions', callId: req.callId, questions: req.questions });
+    return new Promise((resolve) => {
+      this.questions.set(req.callId, {
+        questions: req.questions,
+        done: (answers) => {
+          this.questions.delete(req.callId);
+          this.post({ type: 'questionsDone', callId: req.callId });
+          this.add({ kind: 'questions', questions: req.questions, answers });
+          resolve({ answers });
+        },
+      });
+    });
   }
 
   private requestApproval(req: ApprovalRequest): Promise<{ decision: ApprovalDecision }> {
@@ -938,6 +1282,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   private onEvent(e: AgentEvent, state: { assistant?: Extract<Item, { kind: 'assistant' }> }): void {
+    this.lastActivity = Date.now();
     this.trace(e);
     switch (e.type) {
       case 'started': {
@@ -970,10 +1315,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         break;
       case 'toolStarted':
         state.assistant = undefined;
-        this.add({ kind: 'tool', id: e.callId, tool: e.tool, detail: toolDetail(e.tool, e.input) });
+        this.add({ kind: 'tool', id: e.callId, tool: e.tool, detail: toolDetail(e.tool, e.input), stop: this.stoppable(e.permission, this.taskId, e.callId, e.tool) });
         break;
       case 'toolFinished': {
         state.assistant = undefined;
+        // A background command answers twice: at once ("runs in the background"), then with its output. The row stays running until then.
+        if (!e.background && isBackgroundStart(e.output)) break;
         const it = this.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === e.callId);
         const out = this.captureOutput(e.callId, e.tool, e.ok, e.output);
         if (it) {
@@ -985,6 +1332,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         break;
       }
+      case 'usage':
+        // Token counts per model turn, so the run shows its input and output as it goes. No price:
+        // the chat reports what was used, not what it cost.
+        this.post({ type: 'usage', input: e.usage.inputTokens ?? 0, output: e.usage.outputTokens ?? 0 });
+        break;
       case 'steered': {
         const i = this.steering.indexOf(e.text);
         if (i >= 0) this.steering.splice(i, 1);
@@ -1052,7 +1404,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           break;
         }
         if (inner.type === 'started') this.add({ kind: 'context', text: `Subagent ${e.name} started` });
-        else if (inner.type === 'toolStarted') this.add({ kind: 'tool', id: `${e.taskId}:${inner.callId}`, tool: tag + inner.tool, detail: toolDetail(inner.tool, inner.input) });
+        else if (inner.type === 'toolStarted') this.add({ kind: 'tool', id: `${e.taskId}:${inner.callId}`, tool: tag + inner.tool, detail: toolDetail(inner.tool, inner.input), stop: this.stoppable(inner.permission, e.taskId, inner.callId) });
         else if (inner.type === 'toolFinished') {
           const it = this.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === `${e.taskId}:${inner.callId}`);
           if (it) {
@@ -1081,6 +1433,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
   }
 
+  /**
+   * Rewrites the typed prompt with the routed model (`task-x.routing` for the prompt's task kind), else the
+   * active provider model. The webview puts the result in the input, where Ctrl+Z restores the original.
+   */
+  private async refine(raw: string): Promise<void> {
+    const text = raw.trim();
+    const fail = (error: string) => this.post({ type: 'refined', error });
+    if (!text) return fail('Type a prompt to refine.');
+    if (text.length > MAX_INPUT_CHARS) return fail(`The prompt is longer than ${MAX_INPUT_CHARS} characters.`);
+    try {
+      const client = await this.getClient();
+      const provider = await providerConfig(this.ctx.secrets).catch(() => undefined);
+      const ed = this.editorContext(text);
+      const focusPaths = [...(ed.mentions ?? []), ...(ed.activeFile ? [ed.activeFile] : [])];
+      const r = await client.request<RefineResult>('prompt/refine', { prompt: text, provider, routes: await routes(this.ctx.secrets), focusPaths });
+      this.log('info', `prompt refined by ${r.model}${r.routed ? ` (route for ${r.kind})` : ''}`);
+      this.post({ type: 'refined', text: r.text, model: r.model });
+    } catch (e) {
+      fail(describeError(e));
+      void vscode.window.showWarningMessage(`task-x: refine failed: ${describeError(e)}`);
+    }
+  }
+
+  /** Commands of the task-x engine, and Claude Code's `Bash` calls, can be stopped one by one (`agent/cancelTool`). */
+  private stoppable(permission: string, taskId: string | undefined, callId: string, tool = ''): { taskId: string; callId: string } | undefined {
+    return taskId && (STOPPABLE.has(permission) || (permission === 'claude' && tool === 'Bash')) ? { taskId, callId } : undefined;
+  }
+
   /** Sends a prompt from a command (context menu etc.), optionally in a specific mode. */
   async submit(text: string, mode?: ChatMode): Promise<void> {
     await vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
@@ -1095,6 +1475,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const saved = this.chats().find((c) => c.id === taskId);
     this.items = saved ? saved.items : await this.loadTask(taskId);
     this.taskId = taskId;
+    await this.setNightRequest(undefined);
     this.diffs.clear();
     this.outputs.clear();
     await this.persist(false);
@@ -1127,7 +1508,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return this.taskId;
   }
 
-  private async send(raw: string, modeOverride?: ChatMode): Promise<void> {
+  private async send(raw: string, modeOverride?: ChatMode, retry = false): Promise<void> {
     const text = raw.trim();
     if (!text) return;
     if (text.length > MAX_INPUT_CHARS) return void this.add({ kind: 'error', text: `Message is longer than ${MAX_INPUT_CHARS} characters.` });
@@ -1136,21 +1517,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.queue.push({ text, mode: modeOverride });
       return void this.postQueue();
     }
-    const mode = modeOverride ?? chatMode();
+    const mode: ChatMode = modeOverride ?? 'agent';
     const abort = new AbortController();
     this.setBusy(abort);
     this.add({ kind: 'user', text, mode });
+    const before = this.lastSummary();
+    this.stalled = false;
+    this.lastActivity = Date.now();
+    if (!retry) {
+      this.nightFailures = 0;
+      clearTimeout(this.nightTimer);
+      this.nightTimer = undefined;
+      void this.setNightRequest(text);
+    }
     let off = () => {};
-    if (engine() === 'claudeCode') {
+    // Night mode with a loop model runs through task-x with that model, whatever the chat engine is.
+    const worker = this.night ? nightModels().worker : undefined;
+    if (engine() === 'claudeCode' && !worker) {
       try {
-        await this.sendClaude(text, mode, abort.signal, (o) => (off = o));
+        const task = this.night ? await this.nightTask(text, retry, abort.signal) : text;
+        await this.sendClaude(text, mode, abort.signal, (o) => (off = o), task);
       } catch (e) {
         this.add({ kind: 'error', text: describeError(e), retryText: e instanceof RpcError && e.cancelled ? undefined : text });
       } finally {
         off();
+        this.queue.push(...this.steering.splice(0).map((text) => ({ text })));
         this.setBusy(undefined);
         await this.persist();
         this.drain();
+        this.afterRun(before, abort.signal);
       }
       return;
     }
@@ -1159,7 +1554,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.wire(client);
       this.taskId ??= `c${Date.now()}${randomBytes(3).toString('hex')}`;
       const taskId = this.taskId;
-      const params = await runParams(this.ctx.secrets, { prompt: text, mode, taskId, editor: this.editorContext(text) });
+      const prompt = this.night ? await this.nightTask(text, retry, abort.signal) : text;
+      const provider = worker && isProviderRef(worker.kind) ? await providerConfigWith(this.ctx.secrets, worker.kind, worker.model) : undefined;
+      const params = await runParams(this.ctx.secrets, { prompt, mode, taskId, editor: this.editorContext(text), provider });
       const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
       off = client.onNotification('agent/event', (p) => {
         const { taskId: id, event } = p as AgentEventParams;
@@ -1188,6 +1585,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.setBusy(undefined);
       await this.persist();
       this.drain();
+      this.afterRun(before, abort.signal);
     }
   }
 
@@ -1199,7 +1597,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** While a task runs, Enter steers it: the agent reads the message at its next step. Otherwise it is queued. */
   private async steer(text: string): Promise<void> {
     const t = text.trim();
-    if (!t || engine() === 'claudeCode' || !this.taskId || this.steering.length >= MAX_STEERS) return this.send(text);
+    if (!t || !this.taskId || this.steering.length >= MAX_STEERS) return this.send(text);
     let accepted = false;
     try {
       accepted = await (await this.getClient()).request<boolean>('agent/steer', { taskId: this.taskId, text: t });
@@ -1275,7 +1673,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /** Runs the request through the Claude Code CLI; follow-ups resume the same Claude session. */
-  private async sendClaude(text: string, mode: ChatMode, signal: AbortSignal, setOff: (off: () => void) => void): Promise<void> {
+  private async sendClaude(text: string, mode: ChatMode, signal: AbortSignal, setOff: (off: () => void) => void, task = text): Promise<void> {
     const cliPath = findClaude();
     if (!cliPath) throw new Error('Claude Code CLI not found. Install it (https://docs.anthropic.com/claude-code) or set task-x.claudeCode.path.');
     if (!(await claudeAuth()).loggedIn) {
@@ -1286,10 +1684,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.taskId ??= `c${Date.now()}${randomBytes(3).toString('hex')}`;
     const taskId = this.taskId;
     const c = vscode.workspace.getConfiguration(SECTION);
-    const approval = c.get<string>('agent.approvalMode', 'askBeforeExecution') as ApprovalMode;
     const sessions = this.ctx.workspaceState.get<Record<string, string>>(CLAUDE_SESSIONS_KEY, {});
     const ed = this.editorContext();
-    let prompt = text;
+    let prompt = task;
     if (ed.selection) prompt += `\n\nSelected code in ${ed.selection.path} (lines ${ed.selection.startLine}-${ed.selection.endLine}):\n\`\`\`\n${ed.selection.text}\n\`\`\``;
     else if (ed.activeFile) prompt += `\n\n(Active file: ${ed.activeFile})`;
     prompt = await this.withSkills(client, prompt, [ed.selection?.path, ed.activeFile].filter((p): p is string => !!p));
@@ -1313,7 +1710,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         sessionId: sessions[taskId],
         maxBudgetUsd: budget > 0 ? budget : undefined,
         useTaskTools: c.get<boolean>('claudeCode.useTaskXTools', true),
-        ...claudePermissions(mode, approval),
+        ...claudePermissions(mode),
       },
       { signal },
     );
@@ -1350,6 +1747,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <button type="button" id="newChat" class="action" title="New chat" aria-label="New chat"><span class="codicon codicon-add" aria-hidden="true"></span></button>
 </nav>
 <div id="progress" role="progressbar" aria-label="Working" aria-hidden="true"></div>
+<div id="runbar" class="runbar" role="status" hidden><span class="codicon codicon-loading codicon-modifier-spin" aria-hidden="true"></span><span class="runbar-text">Working</span><span id="runTimer" class="runbar-time">0:00</span><span class="spacer"></span><button type="button" id="runStop" class="btn small secondary"><span class="codicon codicon-debug-stop" aria-hidden="true"></span>Stop</button></div>
 <main id="log" role="log" aria-live="polite" aria-label="Chat"></main>
 <section id="history" aria-label="Task history" hidden></section>
 <section id="changes" hidden aria-label="Changed files">
@@ -1368,13 +1766,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <label for="input" class="sr-only">Message</label>
   <textarea id="input" rows="1"></textarea>
   <div class="toolbar" role="toolbar" aria-label="Chat options">
-    <div id="modes" class="tabs" role="tablist" aria-label="Mode"></div>
     <button type="button" id="modelBtn" class="pick"></button>
-    <button type="button" id="permBtn" class="pick"></button>
+    <label class="pick switch" title="Night Mode: the Think model splits the request into todo.md, and the Loop model works on one item at a time. A run that fails, stalls, or stops runs again until it finishes. Stop ends it."><input type="checkbox" role="switch" id="nightSwitch"><span class="text">Night Mode</span></label>
+    <button type="button" id="nightPlanBtn" class="pick" hidden></button>
+    <button type="button" id="nightLoopBtn" class="pick" hidden></button>
     <label class="pick auto-commit" title="Commit the files each task changes, when the task ends"><input type="checkbox" id="autoCommit"><span class="text">Auto-commit</span></label>
     <span class="spacer"></span>
     <span id="ctxMeter" class="meter" role="meter" aria-valuemin="0" aria-valuemax="100" hidden></span>
     <button type="button" id="indexBtn" class="pick index" hidden></button>
+    <button type="button" id="refineBtn" class="action" title="Refine: rewrite the prompt with the routed model (task-x.routing), else the active model. Ctrl+Z restores your text." aria-label="Refine prompt"><span class="codicon codicon-sparkle" aria-hidden="true"></span></button>
     <button type="button" id="send" class="action primary"></button>
   </div>
 </form>

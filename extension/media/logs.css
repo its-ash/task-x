@@ -1,0 +1,63 @@
+/* task-x logs. Colors are semantic tokens from tokens.css. */
+body {
+  --c-trace: var(--outline);
+  --c-debug: var(--debug);
+  --c-info: var(--info);
+  --c-warn: var(--warn);
+  --c-error: var(--bad);
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; display: flex; flex-direction: column; font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); background: var(--vscode-panel-background); }
+.codicon { flex: none; }
+:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: -1px; }
+
+.bar { flex: none; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 8px; border-bottom: 1px solid var(--vscode-panel-border, transparent); }
+.bar .spacer { flex: 1; }
+.field { display: flex; align-items: center; gap: 4px; min-width: 120px; flex: 0 1 260px; padding: 0 6px; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, transparent); border-radius: 7px; }
+.field:focus-within { border-color: var(--vscode-focusBorder); }
+.field .codicon { color: var(--vscode-descriptionForeground); }
+.field input { flex: 1; min-width: 0; height: 22px; padding: 0; font: inherit; font-size: 12px; color: var(--vscode-input-foreground); background: none; border: none; outline: none; }
+select { height: 24px; font: inherit; font-size: 12px; color: var(--vscode-dropdown-foreground); background: var(--vscode-dropdown-background); border: 1px solid var(--vscode-dropdown-border, transparent); border-radius: 7px; padding: 0 4px; }
+.count { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--fg); padding: 1px 8px; border-radius: 10px; background: color-mix(in oklab, var(--c-info) 16%, transparent); }
+button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+.action { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 5px; color: var(--vscode-icon-foreground); }
+.action:hover { background: var(--vscode-toolbar-hoverBackground); }
+.action.on { color: var(--c-info); background: color-mix(in oklab, var(--c-info) 18%, transparent); }
+
+#log { flex: 1; overflow: auto; padding: 2px 0; font-family: var(--mono); font-size: 12px; line-height: 18px; user-select: text; }
+.row { display: flex; gap: 8px; padding: 0 8px; white-space: pre; }
+.row:hover { background: var(--vscode-list-hoverBackground); }
+body.wrap .row { white-space: pre-wrap; }
+body.wrap .msg { word-break: break-word; }
+.time { flex: none; color: var(--vscode-descriptionForeground); }
+.lvl { flex: none; width: 5ch; font-weight: 600; }
+.src { flex: none; min-width: 7ch; color: var(--vscode-textLink-foreground); }
+.msg { min-width: 0; }
+.row { border-left: 2px solid transparent; }
+.trace .lvl { color: var(--c-trace); }
+.debug .lvl { color: var(--c-debug); }
+.info .lvl { color: var(--c-info); }
+.warn .lvl { color: var(--c-warn); }
+.warn { border-left-color: var(--c-warn); background: color-mix(in oklab, var(--c-warn) 7%, transparent); }
+.error .lvl, .error .msg { color: var(--c-error); }
+.error { border-left-color: var(--c-error); background: color-mix(in oklab, var(--c-error) 9%, transparent); }
+
+/* Level tabs: filled segmented control; the indicator slides and takes the level color. */
+.tabs { position: relative; display: grid; grid-template-columns: repeat(var(--n, 5), minmax(0, 1fr)); flex: 0 1 320px; min-width: 200px; padding: 2px; border-radius: 8px; background: color-mix(in oklab, var(--fg) 7%, transparent); }
+.tab-ind { position: absolute; top: 2px; bottom: 2px; left: 2px; width: calc((100% - 4px) / var(--n, 5)); border-radius: 6px; background: var(--ind, var(--c-info)); transform: translateX(calc(var(--sel, 2) * 100%)); transition: transform var(--md-duration-medium2) var(--md-motion-emphasized), background-color var(--md-duration-short4) ease; }
+.tabs[data-level=trace] { --ind: var(--c-trace); --ind-on: var(--md-sys-color-inverse-on-surface); }
+.tabs[data-level=debug] { --ind: var(--c-debug); --ind-on: var(--md-ext-on-teal); }
+.tabs[data-level=info] { --ind: var(--c-info); --ind-on: var(--md-sys-color-on-primary); }
+.tabs[data-level=warn] { --ind: var(--c-warn); --ind-on: var(--md-ext-on-amber); }
+.tabs[data-level=error] { --ind: var(--c-error); --ind-on: var(--md-sys-color-on-error); }
+.tab { position: relative; z-index: 1; height: 22px; padding: 0 4px; border-radius: 6px; font-size: 11px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); transition: color 150ms ease; }
+.tab[aria-selected=true] { color: var(--ind-on); font-weight: 600; }
+.tab:focus-visible { outline-offset: 1px; }
+@media (hover: hover) and (pointer: fine) { .tab[aria-selected=false]:hover { color: var(--fg); background: color-mix(in oklab, var(--fg) 8%, transparent); } }
+@media (prefers-reduced-motion: reduce) { .tab-ind { transition: background-color 150ms ease; } }
+@media (forced-colors: active) { .tab-ind { background: Highlight; } .tab[aria-selected=true] { color: HighlightText; } }
+.empty { padding: 12px; font-family: var(--vscode-font-family); color: var(--vscode-descriptionForeground); }
+
+/* Fira Code ligatures in code surfaces. */
+:where(code, pre, .term-body, .stat, .slash-name, .slash-params, .row .msg) { font-feature-settings: "calt" 1, "liga" 1; }

@@ -3,18 +3,13 @@
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
   const log = $('log'), input = $('input'), send = $('send'), progress = $('progress');
-  const modes = $('modes'), modelBtn = $('modelBtn'), permBtn = $('permBtn'), autoCommitBox = $('autoCommit');
+  const modelBtn = $('modelBtn'), autoCommitBox = $('autoCommit');
+  const runBar = $('runbar'), runTimer = $('runTimer'), nightSwitch = $('nightSwitch');
+  const nightPlanBtn = $('nightPlanBtn'), nightLoopBtn = $('nightLoopBtn');
+  const refineBtn = $('refineBtn');
 
-  const MODES = {
-    ask: { icon: 'comment-discussion', label: 'Ask', desc: 'Answer questions about your code. Read-only.', placeholder: 'Ask about your code' },
-    agent: { icon: 'robot', label: 'Agent', desc: 'Edit files and run commands to finish the task.', placeholder: 'Tell task-x what to change' },
-  };
+  const PLACEHOLDER = 'Tell task-x what to change';
   const ROLE_ICONS = { research: 'search', implementation: 'code', testing: 'beaker', review: 'eye', documentation: 'book' };
-  const APPROVALS = {
-    askBeforeEdit: { icon: 'shield', label: 'Ask first', title: 'Ask before edits', desc: 'Approve every edit, delete, and command.' },
-    askBeforeExecution: { icon: 'edit', label: 'Auto-edit', title: 'Edit automatically', desc: 'Apply edits directly. Ask before commands and deletes.' },
-    autonomous: { icon: 'rocket', label: 'Autonomous', title: 'Run autonomously', desc: 'Apply edits and run project commands. Ask before deletes.' },
-  };
   const TOOL_LABELS = {
     read_file: 'Read', read_range: 'Read', read_multiple_files: 'Read files', read_symbol: 'Read symbol', get_file_outline: 'Outlined',
     list_files: 'Listed', find_files: 'Found files', get_file_tree: 'Listed tree', get_file_metadata: 'Inspected', detect_language: 'Inspected',
@@ -23,7 +18,7 @@
     replace_all: 'Edited', insert_at_line: 'Edited', delete_range: 'Edited', apply_patch: 'Patched', create_file: 'Created', rename_file: 'Renamed',
     delete_file: 'Deleted', git_status: 'Git status', git_diff: 'Git diff', git_log: 'Git log', git_show: 'Git show', get_changed_files: 'Changed files',
     get_file_history: 'File history', format_code: 'Formatted', run_linter: 'Linted', run_tests: 'Ran tests', check_build: 'Built',
-    get_diagnostics: 'Checked problems', run_command: 'Ran', read_skill: 'Loaded skill',
+    get_diagnostics: 'Checked problems', run_command: 'Ran', read_skill: 'Loaded skill', web_fetch: 'Fetched',
     Read: 'Read', Write: 'Wrote', Edit: 'Edited', MultiEdit: 'Edited', NotebookEdit: 'Edited notebook', Bash: 'Ran', BashOutput: 'Read output',
     KillShell: 'Stopped shell', Grep: 'Searched', Glob: 'Found files', LS: 'Listed', TodoWrite: 'Updated todos', WebFetch: 'Fetched',
     WebSearch: 'Searched web', Task: 'Subagent', ExitPlanMode: 'Finished plan', run_subagent: 'Subagent', worktree_apply: 'Applied worktree', worktree_discard: 'Discarded worktree',
@@ -33,7 +28,7 @@
   const EDIT_TOOLS = new Set(['replace_text', 'replace_all', 'insert_at_line', 'delete_range', 'apply_patch', 'create_file', 'rename_file', 'delete_file', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
   let replaying = false; // true while the saved history is drawn: no enter animations
   const enter = (e, cls = 'enter') => { if (!replaying) e.classList.add(cls); return e; };
-  let state = { busy: false, mode: 'agent', approval: 'askBeforeExecution', autoCommit: false, modelGroups: [], active: null };
+  let state = { busy: false, autoCommit: false, modelGroups: [], active: null };
   let turn = null; // { response: Element|null }
   let current = null; // streaming assistant body
   let renderQueued = false;
@@ -128,29 +123,6 @@
   const menuHeader = (menu, text) => menu.append(el('div', 'menu-header', text));
   const menuSep = (menu) => menu.append(el('div', 'menu-sep'));
 
-  // Mode tabs: filled segmented control with roving focus (arrow keys, Home, End).
-  const modeIds = Object.keys(MODES);
-  const modeTabs = modeIds.map((id, i) => {
-    const m = MODES[id];
-    const t = button('tab', [icon(m.icon), el('span', 'text', m.label)], () => { if (state.mode !== id) vscode.postMessage({ type: 'selectMode', mode: id }); }, `${m.label}: ${m.desc}`);
-    t.setAttribute('role', 'tab');
-    t.setAttribute('aria-controls', 'input');
-    t.dataset.mode = id;
-    t.style.setProperty('--i', String(i));
-    return t;
-  });
-  modes.style.setProperty('--n', String(modeIds.length));
-  modes.append(el('span', 'tab-ind'), ...modeTabs);
-  modes.addEventListener('keydown', (e) => {
-    const i = modeTabs.indexOf(document.activeElement);
-    if (i < 0) return;
-    const n = modeTabs.length;
-    const j = { ArrowRight: (i + 1) % n, ArrowLeft: (i - 1 + n) % n, Home: 0, End: n - 1 }[e.key];
-    if (j == null) return;
-    e.preventDefault();
-    modeTabs[j].focus();
-    modeTabs[j].click();
-  });
   // Models picked before, listed first in the model menu.
   const MAX_RECENT = 5;
   const recentModels = () => vscode.getState()?.recent ?? [];
@@ -161,10 +133,14 @@
   const providerName = (kind) => state.modelGroups.find((g) => g.kind === kind)?.label.split(' · ')[0] ?? kind;
   // Model list with search; refilled when the model list or the query changes.
   let modelMenu = null;
+  // The model menu sets the chat model, or a Night mode model: 'planner' (Think) or 'worker' (Loop, provider models only).
+  const menuTarget = () => modelMenu?.target ?? 'main';
+  const targetModel = (t) => (t === 'planner' ? state.nightPlanner : t === 'worker' ? state.nightWorker : state.active);
+  const menuGroups = () => (menuTarget() === 'worker' ? state.modelGroups.filter((g) => g.kind !== 'claudeCode') : state.modelGroups);
   // One tab per provider (built-in or named), plus All. The tab narrows the list below the search box.
   function renderModelTabs() {
     const { tabs } = modelMenu;
-    const all = [{ kind: 'all', label: 'All' }, ...state.modelGroups];
+    const all = [{ kind: 'all', label: 'All' }, ...menuGroups()];
     if (!all.some((g) => g.kind === modelMenu.tab)) modelMenu.tab = 'all';
     tabs.replaceChildren(...all.map((g) => {
       const label = g.label.split(' · ')[0];
@@ -181,14 +157,19 @@
     const query = q.value.trim().toLowerCase();
     const focused = document.activeElement === q;
     list.replaceChildren();
-    const pick = (kind, model) => { rememberModel(kind, model); vscode.postMessage({ type: 'selectModel', kind, model }); };
+    const target = menuTarget();
+    const current = targetModel(target);
+    const pick = (kind, model) => {
+      rememberModel(kind, model);
+      vscode.postMessage(target === 'main' ? { type: 'selectModel', kind, model } : { type: 'selectNightModel', role: target, kind, model });
+    };
     let shown = 0;
-    const recent = query ? [] : recentModels().filter((r) => (modelMenu.tab === 'all' || modelMenu.tab === r.kind) && state.modelGroups.some((g) => g.kind === r.kind && g.models.includes(r.model)));
+    const recent = query ? [] : recentModels().filter((r) => (modelMenu.tab === 'all' || modelMenu.tab === r.kind) && menuGroups().some((g) => g.kind === r.kind && g.models.includes(r.model)));
     if (recent.length) {
       menuHeader(list, 'Recent');
-      for (const r of recent) menuItem(list, { title: r.model, desc: providerName(r.kind), checked: state.active?.kind === r.kind && state.active?.model === r.model, onSelect: () => pick(r.kind, r.model) });
+      for (const r of recent) menuItem(list, { title: r.model, desc: providerName(r.kind), checked: current?.kind === r.kind && current?.model === r.model, onSelect: () => pick(r.kind, r.model) });
     }
-    const groups = modelMenu.tab === 'all' ? state.modelGroups : state.modelGroups.filter((g) => g.kind === modelMenu.tab);
+    const groups = modelMenu.tab === 'all' ? menuGroups() : menuGroups().filter((g) => g.kind === modelMenu.tab);
     for (const g of groups) {
       const groupHit = query && g.label.toLowerCase().includes(query);
       const models = g.models.filter((n) => !query || groupHit || n.toLowerCase().includes(query));
@@ -196,22 +177,23 @@
       menuHeader(list, g.label);
       if (!g.models.length) list.append(el('div', 'menu-header muted', 'No model set'));
       for (const name of models) {
-        const checked = state.active && state.active.kind === g.kind && state.active.model === name;
+        const checked = current?.kind === g.kind && current?.model === name;
         menuItem(list, { title: name, checked, onSelect: () => pick(g.kind, name) });
         shown++;
       }
     }
     if (query && !shown) list.append(el('div', 'menu-empty', 'No models match.'));
     const raw = q.value.trim();
-    if (raw && state.active && !state.modelGroups.some((g) => g.kind === state.active.kind && g.models.includes(raw))) {
-      menuItem(list, { icon: 'add', title: `Use "${raw}"`, desc: 'Set this model id for the current provider.', onSelect: () => pick(state.active.kind, raw) });
+    const base = current ?? state.active;
+    if (raw && base && !(target === 'worker' && base.kind === 'claudeCode') && !menuGroups().some((g) => g.kind === base.kind && g.models.includes(raw))) {
+      menuItem(list, { icon: 'add', title: `Use "${raw}"`, desc: 'Set this model id for the current provider.', onSelect: () => pick(base.kind, raw) });
     }
     if (focused) q.focus();
     modelMenu.menu.place?.();
   }
-  modelBtn.addEventListener('click', () => {
+  function openModelMenu(anchor, target) {
     vscode.postMessage({ type: 'loadModels' });
-    openMenu(modelBtn, (menu) => {
+    openMenu(anchor, (menu) => {
       const box = el('div', 'menu-search');
       const q = el('input');
       q.type = 'search';
@@ -232,21 +214,19 @@
       menu.classList.add('searchable');
       menu.addEventListener('toggle', (e) => { if (e.newState === 'closed' && modelMenu?.menu === menu) modelMenu = null; });
       menu.append(box, tabs, list);
-      modelMenu = { menu, list, input: q, tabs, tab: state.active?.kind ?? 'all' };
+      modelMenu = { menu, list, input: q, tabs, target, tab: targetModel(target)?.kind ?? state.active?.kind ?? 'all' };
       fillModels();
       menuSep(menu);
       menuItem(menu, { icon: 'add', title: 'Add provider…', onSelect: () => vscode.postMessage({ type: 'addProvider' }) });
       if (state.auth?.loggedIn) menuItem(menu, { icon: 'sign-out', title: 'Sign out of Anthropic', desc: state.auth.email, onSelect: () => vscode.postMessage({ type: 'signOut' }) });
       else menuItem(menu, { icon: 'account', title: 'Sign in with Anthropic…', desc: 'Use your Claude account through Claude Code.', onSelect: () => vscode.postMessage({ type: 'signIn' }) });
     });
-  });
-  permBtn.addEventListener('click', () => openMenu(permBtn, (menu) => {
-    menuHeader(menu, 'Edits and commands');
-    for (const [id, a] of Object.entries(APPROVALS)) menuItem(menu, { icon: a.icon, title: a.title, desc: a.desc, checked: state.approval === id, onSelect: () => vscode.postMessage({ type: 'selectApproval', mode: id }) });
-    menuSep(menu);
-    menuItem(menu, { icon: 'settings-gear', title: 'Configure allowed tools…', onSelect: () => vscode.postMessage({ type: 'openSettings', query: 'task-x.agent' }) });
-  }));
-
+  }
+  modelBtn.addEventListener('click', () => openModelMenu(modelBtn, 'main'));
+  nightPlanBtn.addEventListener('click', () => openModelMenu(nightPlanBtn, 'planner'));
+  nightLoopBtn.addEventListener('click', () => openModelMenu(nightLoopBtn, 'worker'));
+  // Night Mode: failed or stalled requests run again until they finish.
+  nightSwitch.addEventListener('change', () => vscode.postMessage({ type: 'selectNight', enabled: nightSwitch.checked }));
   autoCommitBox.addEventListener('change', () => vscode.postMessage({ type: 'selectAutoCommit', enabled: autoCommitBox.checked }));
 
   // ---------- Markdown (fenced code, inline code, bold, headings, lists) ----------
@@ -335,13 +315,7 @@
   // Empty chat: only the animated logo (orbiting rings), no text or buttons.
   function welcome() {
     if (log.children.length) return;
-    const w = el('div', 'welcome');
-    w.setAttribute('role', 'img');
-    w.setAttribute('aria-label', 'New chat');
-    const orb = el('div', 'orb');
-    orb.append(el('span', 'glow'), el('span', 'ring r1'), el('span', 'ring r2'), el('span', 'ring r3'), el('span', 'logo'));
-    w.append(orb);
-    log.append(w);
+    log.append(el('div', 'welcome', 'Hi !'));
   }
   function response() {
     if (!turn) { turn = { el: el('div', 'turn'), response: null }; log.append(turn.el); }
@@ -359,6 +333,16 @@
     row.prepend(el('span', 'dot'));
     tl.append(enter(row));
   }
+  // The dot of a running call is its Stop control: a stop button sits inside the dot, so the state
+  // colour and the rail stay as they are. `toolDone` removes the button and leaves the dot behind.
+  function stopDot(row) {
+    const dot = row.querySelector(':scope > .dot');
+    if (!dot) return;
+    const id = row.dataset.id;
+    const btn = button('tool-stop dot-stop', icon('debug-stop'), () => vscode.postMessage({ type: 'stopTool', id }), 'Stop this command. The agent goes on.');
+    dot.append(btn);
+  }
+
   // One edit as it happened: its own counts and diff, with Keep and Undo (Undo reverts only this edit).
   function editCard(it) {
     const card = el('div', 'edit' + (it.undone ? ' undone' : ''));
@@ -393,11 +377,47 @@
     card.append(body);
     return card;
   }
+  // Auto-commit off: one card per turn lists the files written, with line counts that update on each edit.
+  let turnFiles = null; // { body, files: Map<path, { added, removed }> }
+  function filesCard(it) {
+    if (!turnFiles) {
+      const card = el('div', 'files-card');
+      const body = el('div', 'files-body');
+      card.append(body);
+      step(card);
+      turnFiles = { body, files: new Map() };
+    }
+    const { body, files } = turnFiles;
+    const f = files.get(it.path) ?? { added: 0, removed: 0 };
+    f.added += it.added ?? 0;
+    f.removed += it.removed ?? 0;
+    files.set(it.path, f);
+    const total = [...files.values()].reduce((s, v) => ({ added: s.added + v.added, removed: s.removed + v.removed }), { added: 0, removed: 0 });
+    const head = el('div', 'files-head');
+    const totalStat = el('span', 'stat');
+    totalStat.append(el('span', 'add', `+${total.added}`), el('span', 'del', `-${total.removed}`));
+    head.append(icon('files'), el('span', 'files-title', `${files.size} file${files.size === 1 ? '' : 's'} written`), el('span', 'spacer'), totalStat);
+    const list = el('ul', 'files-list');
+    for (const [path, v] of files) {
+      const slash = path.lastIndexOf('/');
+      const name = [el('span', 'edit-name', path.slice(slash + 1))];
+      if (slash >= 0) name.push(el('span', 'edit-dir', path.slice(0, slash)));
+      const open = button('file-btn', name, () => vscode.postMessage({ type: 'diffFile', path }), `Show changes in ${path}`);
+      const stat = el('span', 'stat');
+      stat.append(el('span', 'add', `+${v.added}`), el('span', 'del', `-${v.removed}`));
+      const row = el('li');
+      row.append(open, stat);
+      list.append(row);
+    }
+    body.replaceChildren(head, list);
+    scroll();
+  }
   function renderItem(it) {
     log.querySelector('.welcome')?.remove();
     switch (it.kind) {
       case 'user': {
         turn = { el: el('div', 'turn'), response: null };
+        turnFiles = null;
         const req = enter(el('div', 'request'));
         req.append(el('div', 'request-text', it.text), button('action copy-msg', icon('copy'), () => copyText(it.text), 'Copy message'));
         turn.el.append(req);
@@ -428,12 +448,15 @@
         lab.dataset.tool = it.tool;
         row.append(lab, el('span', 'detail', it.detail || ''));
         step(row);
-        attachOutput(row, it.id, it.tool, it.ok !== false, it.output, it.outputCut);
+        // The dot itself is the stop control while the call runs; `toolDone` clears it.
+        if (it.stop && it.ok === undefined && state.busy) stopDot(row);
+        attachOutput(row, it.id, it.tool, it.ok !== false, it.output, it.outputCut, it.ok === undefined && state.busy);
         current = null;
         break;
       }
       case 'file':
-        step(editCard(it));
+        if (state.autoCommit || state.night) step(editCard(it));
+        else filesCard(it);
         current = null;
         break;
       case 'compressed': {
@@ -498,6 +521,11 @@
         current = null;
         break;
       }
+      case 'questions': {
+        response().append(questionCard(it.questions, it.answers, null));
+        current = null;
+        break;
+      }
       case 'error': {
         const e = enter(el('div', 'error'));
         e.setAttribute('role', 'alert');
@@ -557,7 +585,7 @@
     const role = el('span', 'lane-role');
     role.append(icon(ROLE_ICONS[it.role] || 'person'), el('span', null, it.step || it.role));
     head.append(role, el('span', 'lane-model', it.model), el('span', 'spacer'), el('span', 'lane-status', LANE_STATUS[it.status] || it.status));
-    if (it.status === 'running') head.append(button('action', icon('debug-stop'), () => vscode.postMessage({ type: 'stopLane', taskId: it.taskId }), 'Stop this subagent'));
+    if (it.status === 'running') head.append(button('action stop-btn', icon('debug-stop'), () => vscode.postMessage({ type: 'stopLane', taskId: it.taskId }), 'Stop this subagent'));
     card.append(head, el('div', 'lane-goal', it.objective));
     const body = el('details', 'lane-body');
     body.open = it.status === 'running';
@@ -612,10 +640,21 @@
     if (cut) box.append(el('div', 'term-note', 'Showing the start of the output. Open in editor to see all of it.'));
     return box;
   }
-  function attachOutput(row, id, tool, ok, output, cut) {
-    if (!output || row.nextElementSibling?.classList.contains('term')) return;
-    const base = tool.split(' › ').pop();
-    const box = outputBlock(id, output, cut, EXPANDED.has(base) || !ok);
+  // Shell commands always get a block: "Running…" until the result comes, then the output (or a note that it printed nothing).
+  function attachOutput(row, id, tool, ok, output, cut, running = false) {
+    const shell = EXPANDED.has(tool.split(' › ').pop());
+    const text = output || (shell ? (running ? 'Running…' : '(no output)') : '');
+    if (!text) return;
+    const prev = row.nextElementSibling?.classList.contains('term') ? row.nextElementSibling : null;
+    if (prev) {
+      prev.querySelector('.term-body').textContent = text;
+      prev.classList.toggle('running', running);
+      if (cut && !prev.querySelector('.term-note')) prev.append(el('div', 'term-note', 'Showing the start of the output. Open in editor to see all of it.'));
+      if (!ok) prev.hidden = false;
+      return;
+    }
+    const box = outputBlock(id, text, cut, shell || !ok);
+    box.classList.toggle('running', running);
     const toggle = button('action', icon(box.hidden ? 'chevron-right' : 'chevron-down'), () => {
       box.hidden = !box.hidden;
       toggle.replaceChildren(icon(box.hidden ? 'chevron-right' : 'chevron-down'));
@@ -624,6 +663,63 @@
     toggle.setAttribute('aria-expanded', String(!box.hidden));
     row.append(el('span', 'spacer'), toggle);
     row.after(box);
+  }
+
+  // Questions from the agent. A live card (callId set) sends the answers; a saved one only shows them.
+  function questionCard(questions, answers, callId) {
+    const card = el('div', 'questions');
+    if (callId) card.dataset.callId = callId;
+    card.classList.toggle('resolved', !callId);
+    const name = (qi) => `${callId ?? 'saved'}-${qi}`;
+    const head = el('div', 'approval-head');
+    head.append(icon('question'), el('span', null, questions.length > 1 ? 'Questions' : 'Question'));
+    card.append(head);
+    questions.forEach((q, qi) => {
+      const fs = el('fieldset', 'question');
+      fs.append(el('legend', null, q.text));
+      const picked = answers?.[q.id] ?? [];
+      for (const opt of q.options) {
+        const label = el('label', 'option');
+        const input = el('input');
+        input.type = q.kind === 'radio' ? 'radio' : 'checkbox';
+        input.name = name(qi);
+        input.value = opt;
+        input.checked = picked.includes(opt);
+        input.disabled = !callId;
+        label.append(input, el('span', null, opt));
+        fs.append(label);
+      }
+      card.append(fs);
+    });
+    if (!callId && !answers) card.append(el('div', 'detail', 'Skipped'));
+    if (callId) {
+      const selected = (qi) => [...card.querySelectorAll(`input[name="${CSS.escape(name(qi))}"]:checked`)].map((i) => i.value);
+      const ready = () => { send.disabled = questions.some((q, qi) => q.kind === 'radio' && !selected(qi).length); };
+      const send = button('btn', 'Send answers', () => {
+        const out = {};
+        questions.forEach((q, qi) => { out[q.id] = selected(qi); });
+        vscode.postMessage({ type: 'answerQuestions', callId, answers: out });
+        send.disabled = skip.disabled = true;
+      });
+      const skip = button('btn secondary', 'Skip', () => {
+        vscode.postMessage({ type: 'answerQuestions', callId, answers: null });
+        send.disabled = skip.disabled = true;
+      });
+      card.addEventListener('change', ready);
+      ready();
+      const actions = el('div', 'actions');
+      actions.append(send, skip);
+      card.append(actions);
+    }
+    return card;
+  }
+  function renderQuestions(m) {
+    log.querySelector('.welcome')?.remove();
+    current = null;
+    const card = enter(questionCard(m.questions, null, m.callId));
+    response().append(card);
+    scroll(true);
+    card.querySelector('input')?.focus();
   }
 
   function renderApproval(m) {
@@ -692,20 +788,39 @@
   }
 
   // ---------- Toolbar state ----------
+  // Top bar while a task runs: elapsed time and Stop.
+  let runStart = 0, runTick = 0, lastBusy = false;
+  const fmtTime = (s) => {
+    const pad = (n) => String(n).padStart(2, '0');
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    return h ? `${h}:${pad(m)}:${pad(s % 60)}` : `${m}:${pad(s % 60)}`;
+  };
+  const tickRun = () => { runTimer.textContent = fmtTime(Math.floor((Date.now() - runStart) / 1000)); };
+  function syncRunBar() {
+    clearInterval(runTick);
+    runBar.hidden = !state.busy;
+    if (!state.busy) return;
+    runStart = Date.now();
+    tickRun();
+    runTick = setInterval(tickRun, 1000);
+  }
+  $('runStop').addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
+  const fmtWindow = (n) => (n >= 1e6 ? `${+(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1000)}k`);
   function renderToolbar() {
-    const m = MODES[state.mode] || MODES.agent;
-    const mi = Math.max(0, modeIds.indexOf(state.mode));
-    document.body.dataset.mode = modeIds[mi];
-    modes.style.setProperty('--sel', String(mi));
-    modeTabs.forEach((t, i) => { t.setAttribute('aria-selected', String(i === mi)); t.tabIndex = i === mi ? 0 : -1; t.disabled = state.busy; });
+    if (state.busy !== lastBusy) { lastBusy = state.busy; syncRunBar(); if (!state.busy) log.querySelectorAll('.tool-stop').forEach((b) => b.remove()); }
     const model = state.active?.model || 'Pick a model';
-    modelBtn.replaceChildren(el('span', 'text', model), icon('chevron-down'));
-    modelBtn.title = `Model: ${model}`;
-    const readOnly = state.mode !== 'agent';
-    const a = APPROVALS[state.approval] || APPROVALS.askBeforeExecution;
-    permBtn.replaceChildren(icon(readOnly ? 'lock' : a.icon), el('span', 'text', readOnly ? 'Read-only' : a.label), ...(readOnly ? [] : [icon('chevron-down')]));
-    permBtn.disabled = readOnly || state.busy;
-    permBtn.title = readOnly ? `${m.label} mode is read-only` : `Approvals: ${a.title}. ${a.desc}`;
+    const win = state.active?.window;
+    modelBtn.replaceChildren(el('span', 'text', model), ...(win ? [el('span', 'model-window', fmtWindow(win))] : []), icon('chevron-down'));
+    modelBtn.title = win ? `Model: ${model}. Context window: ${win.toLocaleString()} tokens.` : `Model: ${model}`;
+    nightSwitch.checked = !!state.night;
+    // Night mode shows only its Think and Loop models; edits and auto-commit are always on, so their controls hide.
+    nightPlanBtn.hidden = nightLoopBtn.hidden = !state.night;
+    modelBtn.hidden = autoCommitBox.parentElement.hidden = !!state.night;
+    nightPlanBtn.replaceChildren(icon('lightbulb'), el('span', 'text', `Think: ${state.nightPlanner?.model || 'none'}`), icon('chevron-down'));
+    nightPlanBtn.title = `Night Mode Think model: splits each request into a todo list in todo.md. None: the Loop model works on the whole request.`;
+    nightLoopBtn.replaceChildren(icon('sync'), el('span', 'text', `Loop: ${state.nightWorker?.model || 'chat model'}`), icon('chevron-down'));
+    nightLoopBtn.title = 'Night Mode Loop model: works on one todo.md item per run, checks it off, and retries until each item is done. Unset: the chat model.';
+    nightPlanBtn.disabled = nightLoopBtn.disabled = state.busy;
     autoCommitBox.checked = state.autoCommit;
     modelBtn.disabled = state.busy;
     if (send.dataset.busy !== String(state.busy)) {
@@ -714,7 +829,7 @@
       void send.offsetWidth; // restart the icon transition
       send.classList.add('morph');
     }
-    send.replaceChildren(icon(state.busy ? 'debug-stop' : 'send'));
+    send.replaceChildren(state.busy ? icon('robot', 'busy-robot') : icon('send'));
     send.title = state.busy ? 'Stop' : 'Send (Enter)';
     send.setAttribute('aria-label', send.title);
     send.classList.toggle('primary', !state.busy);
@@ -723,9 +838,9 @@
     const form = $('form');
     form.classList.toggle('busy', state.busy);
     form.setAttribute('aria-busy', String(state.busy));
-    input.placeholder = state.busy ? 'Enter steers the running task. Ctrl+Enter queues the next message. Stop ends the task.' : `${m.placeholder} (Enter to send, Shift+Enter for a new line)`;
+    input.placeholder = state.busy ? 'Enter steers the running task. Ctrl+Enter queues the next message. Stop ends the task.' : `${PLACEHOLDER} (Enter to send, Shift+Enter for a new line)`;
   }
-  for (const b of [modelBtn, permBtn]) { b.setAttribute('aria-haspopup', 'menu'); b.setAttribute('aria-expanded', 'false'); }
+  for (const b of [modelBtn, nightPlanBtn, nightLoopBtn]) { b.setAttribute('aria-haspopup', 'menu'); b.setAttribute('aria-expanded', 'false'); }
 
   // ---------- Context chips: the active file and selection that go with the message ----------
   const ctxRow = $('ctx'), indexBtn = $('indexBtn');
@@ -753,7 +868,7 @@
     const toggle = button('ctx-toggle', icon(m.include ? 'eye' : 'eye-closed'), () => vscode.postMessage({ type: 'toggleEditor', include: !m.include }), m.include ? 'Do not send the current file' : 'Send the current file');
     toggle.setAttribute('aria-pressed', String(m.include));
     chip.append(toggle);
-    ctxRow.append(chip, el('span', 'ctx-hint', 'Type @ to add files'));
+    ctxRow.append(chip, el('span', 'ctx-hint', 'Type @ to add files or folders'));
   }
   const fmtCount = (n) => (n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
   function renderIndex() {
@@ -879,7 +994,7 @@
       item.append(row, del);
       const time = new Date(t.updatedMs);
       const when = g === 'Today' || g === 'Yesterday' ? time.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : time.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-      const meta = [t.mode === 'ask' ? 'Ask' : 'Agent', t.files ? `${t.files} file${t.files > 1 ? 's' : ''}` : '', when].filter(Boolean).join(' · ');
+      const meta = [t.files ? `${t.files} file${t.files > 1 ? 's' : ''}` : '', when].filter(Boolean).join(' · ');
       const text = el('span', 'history-text');
       text.append(el('span', 'history-title', t.title), el('span', 'history-meta', meta));
       row.append(icon(name, ['status', t.status, ...mods].join(' ')), text);
@@ -914,6 +1029,36 @@
     scroll(true);
   });
   send.addEventListener('click', () => (state.busy ? vscode.postMessage({ type: 'cancel' }) : $('form').requestSubmit()));
+  // Refine: the host rewrites the prompt with the routed model; the input stays locked until the answer comes.
+  let refining = false;
+  function setRefining(on) {
+    refining = on;
+    input.readOnly = on;
+    refineBtn.disabled = on;
+    refineBtn.setAttribute('aria-busy', String(on));
+    refineBtn.replaceChildren(on ? icon('loading', 'codicon-modifier-spin') : icon('sparkle'));
+  }
+  refineBtn.addEventListener('click', () => {
+    if (refining || !input.value.trim()) return input.focus();
+    setRefining(true);
+    vscode.postMessage({ type: 'refine', text: input.value });
+  });
+  function applyRefined(m) {
+    setRefining(false);
+    input.focus();
+    if (!m.text) {
+      refineBtn.title = `Refine failed: ${m.error || 'no answer'}`;
+      refineBtn.classList.add('refine-failed');
+      setTimeout(() => { refineBtn.classList.remove('refine-failed'); refineBtn.title = REFINE_TITLE; }, 4000);
+      return;
+    }
+    // insertText keeps the change in the undo stack, so Ctrl+Z brings back the original prompt.
+    input.select();
+    if (!document.execCommand('insertText', false, m.text)) input.value = m.text;
+    refineBtn.title = `${REFINE_TITLE} Last refined by ${m.model}.`;
+    autosize();
+  }
+  const REFINE_TITLE = refineBtn.title;
 
   // ---------- Prompt history: Up and Down recall sent messages, like a shell ----------
   const MAX_PROMPTS = 100;
@@ -969,12 +1114,13 @@
       const m = atMatch();
       const at = m ? input.selectionStart - m[2].length : input.selectionStart;
       const after = input.value.slice(input.selectionStart);
-      const text = s.path + (s.path.endsWith('/') ? '' : ' ');
+      // A folder keeps the menu open to pick a file inside it, or the folder itself (first row).
+      const browse = s.path.endsWith('/') && !s.self;
+      const text = s.path + (browse ? '' : ' ');
       input.value = input.value.slice(0, at) + text + after;
       const end = at + text.length;
       input.setSelectionRange(end, end);
-      // A folder keeps the menu open to pick a file inside it.
-      if (s.path.endsWith('/')) { renderSlash(); } else closeSlash();
+      if (browse) { slashActive = 0; renderSlash(); } else closeSlash();
       autosize();
       input.focus();
       return;
@@ -994,13 +1140,14 @@
   }
   function renderFiles(q) {
     menuKind = 'file';
-    slash.setAttribute('aria-label', 'Files');
+    slash.setAttribute('aria-label', 'Files and folders');
     if (fileQuery !== q) { fileQuery = q; vscode.postMessage({ type: 'listFiles', query: q }); }
-    slashItems = (fileItems || []).map((p) => ({ path: p }));
+    const files = (fileItems || []).filter((p) => p !== q).map((p) => ({ path: p }));
+    slashItems = q.endsWith('/') && fileItems ? [{ path: q, self: true }, ...files] : files;
     slashActive = Math.min(slashActive, Math.max(0, slashItems.length - 1));
     slash.replaceChildren();
     if (!fileItems) slash.append(el('div', 'slash-empty', 'Loading files…'));
-    else if (!slashItems.length) slash.append(el('div', 'slash-empty', `No file matches "@${q}".`));
+    else if (!slashItems.length) slash.append(el('div', 'slash-empty', `No file or folder matches "@${q}".`));
     slashItems.forEach((s, i) => {
       const o = el('div', 'slash-item file-item');
       o.id = `slash-${i}`;
@@ -1009,8 +1156,9 @@
       const name = dir ? s.path.slice(0, -1).split('/').pop() + '/' : s.path.split('/').pop();
       const parent = s.path.slice(0, s.path.length - name.length).replace(/\/$/, '');
       const head = el('div', 'slash-head');
-      head.append(icon(dir ? 'folder' : 'file'), el('span', 'slash-name', name));
-      if (parent) head.append(el('span', 'slash-params', parent));
+      head.append(icon(s.self ? 'folder-opened' : dir ? 'folder' : 'file'), el('span', 'slash-name', name));
+      if (s.self) head.append(el('span', 'slash-params', 'Add this folder'));
+      else if (parent) head.append(el('span', 'slash-params', parent));
       o.append(head);
       o.addEventListener('mousedown', (e) => { e.preventDefault(); acceptSlash(i); });
       o.addEventListener('mousemove', () => { if (slashActive !== i) { slashActive = i; markActive(); } });
@@ -1072,15 +1220,35 @@
     e.stopImmediatePropagation();
   });
 
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); queueNext = e.ctrlKey || e.metaKey; $('form').requestSubmit(); } });
+  // A code block in the prompt: typing ``` at a line start adds the closing fence and puts the caret inside.
+  // Enter inside an open block adds a line; Ctrl/Cmd+Enter still sends.
+  const FENCE = '```';
+  const fenceOpen = (text) => (text.split(FENCE).length - 1) % 2 === 1;
+  input.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
+    if (!(e.ctrlKey || e.metaKey) && fenceOpen(input.value.slice(0, input.selectionStart))) return;
+    e.preventDefault();
+    queueNext = e.ctrlKey || e.metaKey;
+    $('form').requestSubmit();
+  });
   input.addEventListener('input', autosize);
+  input.addEventListener('input', (e) => {
+    if (e.inputType !== 'insertText') return;
+    const caret = input.selectionStart;
+    const head = input.value.slice(0, caret - FENCE.length);
+    if (!input.value.slice(0, caret).endsWith(FENCE) || fenceOpen(head) || (head && !head.endsWith('\n'))) return;
+    const caretAt = head.length + FENCE.length + 1;
+    input.value = `${head}${FENCE}\n\n${FENCE}${input.value.slice(caret)}`;
+    input.setSelectionRange(caretAt, caretAt);
+    autosize();
+  });
 
   // ---------- Messages from the extension ----------
   window.addEventListener('message', ({ data: m }) => {
     switch (m.type) {
       case 'history':
         log.replaceChildren();
-        turn = null; current = null;
+        turn = null; current = null; turnFiles = null;
         replaying = true;
         m.items.forEach(renderItem);
         replaying = false;
@@ -1089,7 +1257,7 @@
         scroll(true);
         break;
       case 'status':
-        state = { ...state, busy: m.busy, mode: m.mode || state.mode, approval: m.approval || state.approval, autoCommit: m.autoCommit ?? state.autoCommit };
+        state = { ...state, busy: m.busy, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker };
         renderToolbar();
         break;
       case 'models':
@@ -1106,6 +1274,7 @@
         const row = log.querySelector(`.row.tool[data-id="${CSS.escape(m.id)}"]`);
         if (row) {
           row.dataset.state = m.ok ? 'ok' : 'fail';
+          row.querySelector('.tool-stop')?.remove();
           row.classList.toggle('quiet', Boolean(row.dataset.edit) && m.ok);
           if (row.dataset.edit && !m.ok) row.querySelector('.label').textContent = 'Edit failed';
           attachOutput(row, m.id, row.querySelector('.label')?.dataset.tool || '', m.ok, m.output, m.outputCut);
@@ -1114,6 +1283,11 @@
         break;
       }
       case 'approval': renderApproval(m); break;
+      case 'refined': applyRefined(m); break;
+      case 'questions': renderQuestions(m); break;
+      case 'questionsDone':
+        log.querySelector(`.questions[data-call-id="${CSS.escape(m.callId)}"]`)?.remove();
+        break;
       case 'laneUpdate': {
         const old = log.querySelector(`.lane[data-task-id="${CSS.escape(m.item.taskId)}"]`);
         if (old) {
@@ -1136,6 +1310,13 @@
       case 'editor': renderContext(m); break;
       case 'index': state.index = m.index; renderIndex(); break;
       case 'contextUsage': renderMeter(m.used, m.window); break;
+      case 'usage': {
+        // The running total for the task, from the runtime: input and output tokens, never a price.
+        const t = `↑${fmtCount(m.input)} ↓${fmtCount(m.output)} tokens`;
+        response().append(el('div', 'usage-note', t));
+        scroll();
+        break;
+      }
       case 'queue': renderQueue(m.items, m.steering); break;
       case 'tasks': renderTasks(m); break;
       case 'view': showView(m.view); break;

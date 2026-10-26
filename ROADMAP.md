@@ -3,8 +3,8 @@
 This file records the state of the work between sessions. Mark an item done only after a test or a manual check proves it.
 
 **Last verified:**
-- Runtime: `cargo test` passes 106 tests (101 unit, 5 protocol); `cargo clippy --all-targets` reports no warnings in the changed files (9 pre-existing dead-code warnings remain). The unit tests include a Team-mode run (plan → research and implementation subagents → merge into the edit log), best-of-N with two candidates, plan validation, cost estimates, checkpoint reload, a 70 KB skill file, forced summaries at the iteration and tool-call limits, destructive-tool opt-in, error classes, and retry backoff.
-- Extension: `npm test` passes 30 tests, including end-to-end runs through the built runtime with mock providers, a checkpoint reload across a runtime restart, and the review-findings parser.
+- Runtime: `cargo test` passes 158 tests (150 unit, 8 protocol); `cargo clippy --all-targets` reports no warnings. The unit tests include a Team-mode run (plan → research and implementation subagents → merge into the edit log), best-of-N with two candidates, plan validation, cost estimates, checkpoint reload, a 70 KB skill file, forced summaries at the iteration and tool-call limits, destructive-tool opt-in, error classes, retry backoff, a fallback that rebuilds the request for the new model's window, a blocking hook that runs before the approval prompt, `web_fetch` refusing local and private targets, approval previews for every editing tool, streamed tool calls that share one index or repeat their arguments, subagent roles written in any capitalisation or as an alias, hidden folders pruned from the index while hidden files stay, `edit_files` accepting the batch shapes models send and a loose top level, `copy_file`/`move_file` bringing a file in from outside the workspace, a worktree the agent created being discarded without an opt-in, policy denials not counting as being stuck, a command whose pipe a child holds open no longer hanging, a slow command handed to the background while a quick one returns its output, a resumed task keeping its tool results, and interrupted (`running`) records marked failed at start.
+- Extension: `npm test` passes 31 tests, including end-to-end runs through the built runtime with mock providers, a checkpoint reload across a runtime restart, and the review-findings parser.
 - Manual checks:
   - `provider/test` against a local Ollama server
   - skill and instruction discovery on this machine (87 skills from `~/.copilot/skills`)
@@ -90,6 +90,7 @@ This file records the state of the work between sessions. Mark an item done only
 
 ## Known gaps (next work)
 
+0. Fixed after a review (verified by the tests above): the fallback model now gets a request rebuilt for its own window; `web_fetch` refuses local, private, and metadata targets (including through redirects); a blocking hook runs before the approval prompt; runs that share a task id wait for each other instead of overwriting the record; records left `running` by a killed runtime are marked failed at start; the sandbox is probed and skipped where it cannot be applied, so commands no longer fail with exit 71 in containers and nested sandboxes.
 1. Run the extension in a real Extension Development Host. Add an `@vscode/test-electron` smoke test.
 2. Platform-specific VSIX builds (`vsce package --target …`) with a runtime binary for each target. Today `make build` bundles only the host's binary.
 3. Inline diff decorations in the editor. Diffs now open in VS Code's diff editor from the changed-files panel.

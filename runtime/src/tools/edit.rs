@@ -88,7 +88,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool(
             "create_file",
-            "Create a new file. Fails if it exists unless overwrite is true.",
+            "Create a file, or replace a whole file whose current text you know (you read or wrote it in this task). An unread existing file needs overwrite true; the error shows its text, so the same call works next time.",
             Write,
             || {
                 object(
@@ -104,6 +104,38 @@ pub fn tools() -> Vec<ToolDef> {
             Write,
             || object(json!({ "from": path("Existing path"), "to": path("New path") }), &["from", "to"]),
             rename_file,
+        ),
+        tool(
+            "copy_file",
+            "Copy a file into the workspace. `from` is a path inside the workspace, or anywhere outside it (an absolute path such as ~/Downloads/logo.png); `to` is always inside the workspace. Binary files are copied byte for byte. Reading a file from outside the workspace needs the user's approval.",
+            Write,
+            || {
+                object(
+                    json!({
+                        "from": path("Source file: inside the workspace, or an absolute path outside it"),
+                        "to": path("Destination inside the workspace"),
+                        "overwrite": { "type": "boolean", "description": "Replace the destination if it exists" },
+                    }),
+                    &["from", "to"],
+                )
+            },
+            copy_file,
+        ),
+        tool(
+            "move_file",
+            "Move a file into the workspace, keeping nothing at the source. `from` is a path inside the workspace, or anywhere outside it; `to` is always inside the workspace. Reading or deleting a file outside the workspace needs the user's approval.",
+            Write,
+            || {
+                object(
+                    json!({
+                        "from": path("Source file: inside the workspace, or an absolute path outside it"),
+                        "to": path("Destination inside the workspace"),
+                        "overwrite": { "type": "boolean", "description": "Replace the destination if it exists" },
+                    }),
+                    &["from", "to"],
+                )
+            },
+            move_file,
         ),
         tool("delete_file", "Delete a file.", Delete, || object(json!({ "path": path("File path") }), &["path"]), delete_file),
     ]
@@ -129,7 +161,7 @@ pub fn diff(rel: &str, before: Option<&str>, after: Option<&str>) -> String {
 }
 
 fn load(c: &ToolCtx, raw: &str) -> Result<(PathBuf, String, String), ToolError> {
-    let (abs, rel) = c.resolve_existing_write(raw)?;
+    let (abs, rel) = c.resolve_existing(raw)?;
     let text = read_existing(&abs, &rel)?;
     Ok((abs, rel, text))
 }
@@ -237,13 +269,141 @@ pub fn record(c: &ToolCtx, op: &str, changes: &[Change]) -> Value {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct ReplaceIn {
+    #[serde(alias = "file_path")]
     path: String,
+    #[serde(alias = "old_text", alias = "old_string")]
     old_text: String,
+    #[serde(alias = "new_text", alias = "new_string")]
     new_text: String,
-    #[serde(default)]
+    #[serde(default, alias = "expected_count")]
     expected_count: Option<usize>,
+}
+
+/// Fields a model may add to an edit; anything else is reported back as ignored.
+const EDIT_FIELDS: &[&str] = &["path", "file_path", "oldText", "old_text", "old_string", "newText", "new_text", "new_string", "expectedCount", "expected_count", "all"];
+
+fn looks_like_edit(v: &Value) -> bool {
+    v.as_object().is_some_and(|o| o.contains_key("path") || o.contains_key("oldText") || o.contains_key("old_text"))
+}
+
+/// The batch of edits a model sent, in the shapes models actually produce: an array (the schema),
+/// an object keyed by step or line (`{"1": {...}, "5": {...}}`), an edit object wrapped in a
+/// one-key map (`{"5": {...}}`), or a single edit on its own. A strict array-only reader turned each
+/// of those into a failed call.
+fn normalize_edits(raw: Value) -> Result<Vec<Value>, ToolError> {
+    fn unwrap_one(v: Value) -> Value {
+        match v {
+            Value::Object(o) if !looks_like_edit(&Value::Object(o.clone())) && o.len() == 1 => {
+                let only = o.into_iter().next().map(|(_, v)| v).unwrap_or(Value::Null);
+                if only.is_object() { unwrap_one(only) } else { Value::Object(Default::default()) }
+            }
+            other => other,
+        }
+    }
+
+    let list: Vec<Value> = match raw {
+        Value::Array(items) => items,
+        // A single edit, without the array around it.
+        Value::Object(o) if looks_like_edit(&Value::Object(o.clone())) => vec![Value::Object(o)],
+        // A map of key → edit. Numeric keys are read in numeric order so the edits keep the order
+        // the model meant (a plain JSON object sorts them as text: "10" before "2").
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            let numeric = entries.iter().all(|(k, _)| k.trim().parse::<u64>().is_ok());
+            if numeric {
+                entries.sort_by_key(|(k, _)| k.trim().parse::<u64>().unwrap_or(0));
+            }
+            entries.into_iter().map(|(_, v)| v).collect()
+        }
+        other => {
+            return Err(ToolError::invalid(format!(
+                "edits must be a list of {{path, oldText, newText}} objects, not {}",
+                match other {
+                    Value::Null => "null".to_owned(),
+                    Value::Bool(_) => "a boolean".to_owned(),
+                    Value::Number(_) => "a number".to_owned(),
+                    Value::String(_) => "a string".to_owned(),
+                    _ => "another type".to_owned(),
+                }
+            )));
+        }
+    };
+    Ok(list.into_iter().map(unwrap_one).filter(|v| !v.as_object().is_some_and(|o| o.is_empty() && !looks_like_edit(v))).collect())
+}
+
+/// The edits of one `edit_files` call, read tolerantly. The schema asks for `{"edits": [...]}`, but a
+/// model may write a single edit's fields directly (`{path, oldText, newText}`) or add a stray key
+/// such as a step number. A strict `{edits}`-only reader answered all of those with
+/// "unknown field `path`, expected `edits`", which never says what to send instead.
+/// Returns the raw edits value and the top-level keys nothing reads.
+fn take_edits(input: Value) -> Result<(Value, Vec<String>), ToolError> {
+    let Value::Object(mut map) = input else {
+        return Err(ToolError::invalid(
+            "edit_files takes an object: {\"edits\": [{\"path\": ..., \"oldText\": ..., \"newText\": ...}]}",
+        ));
+    };
+    if let Some(edits) = map.remove("edits") {
+        return Ok((edits, map.keys().cloned().collect()));
+    }
+    let object = Value::Object(map.clone());
+    // One edit written without the wrapper: the fields of an edit, directly.
+    if looks_like_edit(&object) {
+        return Ok((object, Vec::new()));
+    }
+    // A map of key → edit (`{"1": {...}}`), which `normalize_edits` reads in numeric order.
+    if !map.is_empty() && map.values().all(Value::is_object) {
+        return Ok((Value::Object(map), Vec::new()));
+    }
+    Err(ToolError::invalid(
+        "edit_files needs edits: {\"edits\": [{\"path\": ..., \"oldText\": ..., \"newText\": ...}]}; a single edit may also be sent directly",
+    ))
+}
+
+fn edit_files(c: &ToolCtx, input: Value) -> ToolResult {
+    let (raw, mut ignored) = take_edits(input)?;
+    let edits = normalize_edits(raw)?;
+    if edits.is_empty() || edits.len() > MAX_BATCH_EDITS {
+        return Err(ToolError::invalid(format!("edits must have 1..={MAX_BATCH_EDITS} items")));
+    }
+    let mut changes: Vec<Change> = Vec::new();
+    let mut total = 0;
+    for (k, raw) in edits.into_iter().enumerate() {
+        let mut v = raw;
+        let all = v.as_object_mut().and_then(|o| o.remove("all")).is_some_and(|a| a.as_bool() == Some(true));
+        if let Some(o) = v.as_object() {
+            for key in o.keys().filter(|key| !EDIT_FIELDS.contains(&key.as_str())) {
+                let key = key.clone();
+                if !ignored.contains(&key) {
+                    ignored.push(key);
+                }
+            }
+        }
+        let e: ReplaceIn = parse(v).map_err(|err| ToolError::invalid(format!("edits[{k}]: {}", err.message)))?;
+        let (abs, rel) = c.resolve_existing(&e.path)?;
+        let idx = match changes.iter().position(|ch| ch.rel == rel) {
+            Some(x) => x,
+            None => {
+                let text = read_existing(&abs, &rel)?;
+                changes.push(Change { abs, rel, before: Some(text.clone()), after: Some(text) });
+                changes.len() - 1
+            }
+        };
+        let ch = &mut changes[idx];
+        let (after, n) = replace_in(ch.after.as_deref().unwrap_or_default(), &ch.rel, &e, all)
+            .map_err(|err| ToolError::new(err.kind, format!("edits[{k}]: {}", err.message)))?;
+        ch.after = Some(after);
+        total += n;
+    }
+    changes.retain(|ch| ch.before != ch.after);
+    let mut r = commit(c, "edit_files", changes)?;
+    r["replacements"] = json!(total);
+    if !ignored.is_empty() {
+        // Tell the model which keys nothing reads, without failing work that is otherwise correct.
+        r["ignoredFields"] = json!(ignored);
+    }
+    Ok(r)
 }
 
 /// Replaces `old` in `text`; `all` skips the expected-count check. Returns the new text and match count.
@@ -276,43 +436,6 @@ fn replace(c: &ToolCtx, input: Value, all: bool) -> ToolResult {
     let mut r =
         commit(c, if all { "replace_all" } else { "replace_text" }, vec![Change { abs, rel, before: Some(text), after: Some(after) }])?;
     r["replacements"] = json!(n);
-    Ok(r)
-}
-
-fn edit_files(c: &ToolCtx, input: Value) -> ToolResult {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct In {
-        edits: Vec<Value>,
-    }
-    let i: In = parse(input)?;
-    if i.edits.is_empty() || i.edits.len() > MAX_BATCH_EDITS {
-        return Err(ToolError::invalid(format!("edits must have 1..={MAX_BATCH_EDITS} items")));
-    }
-    let mut changes: Vec<Change> = Vec::new();
-    let mut total = 0;
-    for (k, raw) in i.edits.into_iter().enumerate() {
-        let mut v = raw;
-        let all = v.as_object_mut().and_then(|o| o.remove("all")).is_some_and(|a| a.as_bool() == Some(true));
-        let e: ReplaceIn = parse(v).map_err(|err| ToolError::invalid(format!("edits[{k}]: {}", err.message)))?;
-        let (abs, rel) = c.resolve_existing_write(&e.path)?;
-        let idx = match changes.iter().position(|ch| ch.rel == rel) {
-            Some(x) => x,
-            None => {
-                let text = read_existing(&abs, &rel)?;
-                changes.push(Change { abs, rel, before: Some(text.clone()), after: Some(text) });
-                changes.len() - 1
-            }
-        };
-        let ch = &mut changes[idx];
-        let (after, n) = replace_in(ch.after.as_deref().unwrap_or_default(), &ch.rel, &e, all)
-            .map_err(|err| ToolError::new(err.kind, format!("edits[{k}]: {}", err.message)))?;
-        ch.after = Some(after);
-        total += n;
-    }
-    changes.retain(|ch| ch.before != ch.after);
-    let mut r = commit(c, "edit_files", changes)?;
-    r["replacements"] = json!(total);
     Ok(r)
 }
 
@@ -374,6 +497,20 @@ fn delete_range(c: &ToolCtx, input: Value) -> ToolResult {
     commit(c, "delete_range", vec![Change { abs, rel, before: Some(text), after: Some(out) }])
 }
 
+/// Text of an existing file shown in a create_file conflict.
+const MAX_CONFLICT_CHARS: usize = 20_000;
+
+fn clip_text(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut cut = max;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\n… [{} more bytes]", &s[..cut], s.len() - cut)
+}
+
 fn create_file(c: &ToolCtx, input: Value) -> ToolResult {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -384,18 +521,30 @@ fn create_file(c: &ToolCtx, input: Value) -> ToolResult {
         overwrite: bool,
     }
     let i: In = parse(input)?;
-    let (abs, rel) = c.resolve_write(&i.path)?;
+    let (abs, rel) = c.resolve(&i.path)?;
     if abs.is_dir() {
         return Err(ToolError::invalid(format!("{rel} is a directory")));
     }
     let before = if abs.exists() {
-        if !i.overwrite {
+        let current = read_existing(&abs, &rel)?;
+        if current == i.content {
+            return Ok(json!({ "changed": [], "operation": null, "unchanged": rel }));
+        }
+        // Replacing a file is safe once the agent knows its current text: it read or wrote it, so
+        // nothing it has not seen is lost. The change is undoable through the edit log either way.
+        let known = c.seen.lock().expect("seen lock").get(&rel) == Some(&fingerprint(&current));
+        if !i.overwrite && !known {
+            // The error shows the file and counts as a read, so the same call succeeds next time.
+            c.mark_seen(&rel, &current);
             return Err(ToolError::new(
                 ToolErrorKind::Conflict,
-                format!("{rel} already exists; set overwrite to replace it or use an edit tool"),
+                format!(
+                    "{rel} already exists and was not read in this task. Its current text is below. To replace it, call create_file again (it now succeeds); for a small change, use replace_text or edit_files.\n<current path=\"{rel}\">\n{}\n</current>",
+                    clip_text(&current, MAX_CONFLICT_CHARS)
+                ),
             ));
         }
-        Some(read_existing(&abs, &rel)?)
+        Some(current)
     } else {
         None
     };
@@ -406,12 +555,14 @@ fn rename_file(c: &ToolCtx, input: Value) -> ToolResult {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct In {
+        #[serde(alias = "old_path", alias = "old_name", alias = "source")]
         from: String,
+        #[serde(alias = "new_path", alias = "new_name", alias = "destination")]
         to: String,
     }
     let i: In = parse(input)?;
     let (from_abs, from_rel, text) = load(c, &i.from)?;
-    let (to_abs, to_rel) = c.resolve_write(&i.to)?;
+    let (to_abs, to_rel) = c.resolve(&i.to)?;
     if to_abs.exists() {
         return Err(ToolError::new(ToolErrorKind::Conflict, format!("{to_rel} already exists")));
     }
@@ -423,6 +574,91 @@ fn rename_file(c: &ToolCtx, input: Value) -> ToolResult {
             Change { abs: from_abs, rel: from_rel, before: Some(text), after: None },
         ],
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransferIn {
+    from: String,
+    to: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// The file as text, when it is small enough and valid UTF-8; `None` for a binary or huge file.
+fn text_of(abs: &Path) -> Option<String> {
+    let meta = std::fs::metadata(abs).ok()?;
+    if meta.len() > MAX_WRITE_BYTES as u64 {
+        return None;
+    }
+    read_existing(abs, &abs.display().to_string()).ok()
+}
+
+/// Copies or moves one file into the workspace. A text file goes through `commit`, so it gets a
+/// diff, the stale check, review and undo like any edit; a binary file is copied byte for byte and
+/// recorded without text (the review list holds text, and undo can only remove a new file).
+fn transfer(c: &ToolCtx, input: Value, moving: bool) -> ToolResult {
+    let op = if moving { "move_file" } else { "copy_file" };
+    let i: TransferIn = parse(input)?;
+    c.check_cancel()?;
+    let (from_abs, from_label, outside) = c.resolve_source(&i.from)?;
+    let (to_abs, to_rel) = c.resolve(&i.to)?;
+    if to_abs == from_abs {
+        return Err(ToolError::invalid(format!("{to_rel} is the same file as {from_label}; nothing to do")));
+    }
+    if to_abs.is_dir() || from_abs.is_dir() {
+        return Err(ToolError::invalid("copy_file and move_file work on one file; name the file itself, not a folder"));
+    }
+    let existing = std::fs::symlink_metadata(&to_abs).ok();
+    if existing.is_some() && !i.overwrite {
+        return Err(ToolError::new(
+            ToolErrorKind::Conflict,
+            format!("{to_rel} already exists; pass overwrite: true to replace it"),
+        ));
+    }
+    let result = match text_of(&from_abs) {
+        Some(text) => {
+            // Text: the diff, the stale check, review and undo all work as for any other edit.
+            let before = if existing.is_some() {
+                let current = read_existing(&to_abs, &to_rel)?;
+                if current == text {
+                    return Ok(json!({ "changed": [], "operation": null, "unchanged": to_rel }));
+                }
+                Some(current)
+            } else {
+                None
+            };
+            let mut changes = vec![Change { abs: to_abs.clone(), rel: to_rel.clone(), before, after: Some(text.clone()) }];
+            if moving && !outside {
+                // One operation, so undo puts the source back as well.
+                changes.push(Change { abs: from_abs.clone(), rel: from_label.clone(), before: Some(text), after: None });
+            }
+            commit(c, op, changes)?
+        }
+        None => {
+            std::fs::copy(&from_abs, &to_abs).map_err(|e| ToolError::io(e, &format!("copying {from_label} to {to_rel}")))?;
+            if moving {
+                std::fs::remove_file(&from_abs).map_err(|e| ToolError::io(e, &format!("removing {from_label}")))?;
+            }
+            // Binary content has no diff to show; the operation still records the file.
+            record(c, op, &[Change { abs: to_abs.clone(), rel: to_rel.clone(), before: None, after: None }])
+        }
+    };
+    let mut out = result;
+    out["from"] = json!(from_label);
+    out["to"] = json!(to_rel);
+    if outside {
+        out["outsideWorkspace"] = json!(true);
+    }
+    Ok(out)
+}
+
+fn copy_file(c: &ToolCtx, input: Value) -> ToolResult {
+    transfer(c, input, false)
+}
+
+fn move_file(c: &ToolCtx, input: Value) -> ToolResult {
+    transfer(c, input, true)
 }
 
 fn delete_file(c: &ToolCtx, input: Value) -> ToolResult {
@@ -447,7 +683,7 @@ fn apply_patch(c: &ToolCtx, input: Value) -> ToolResult {
     let mut changes = Vec::new();
     for fp in &files {
         let target = fp.new_path.as_ref().or(fp.old_path.as_ref()).ok_or_else(|| ToolError::invalid("patch has no file path"))?;
-        let (abs, rel) = c.resolve_write(target)?;
+        let (abs, rel) = c.resolve(target)?;
         if changes.iter().any(|ch: &Change| ch.rel == rel) {
             return Err(ToolError::invalid(format!("{rel} appears twice in the patch")));
         }
@@ -465,7 +701,7 @@ fn apply_patch(c: &ToolCtx, input: Value) -> ToolResult {
         };
         if let (Some(old), Some(new)) = (&fp.old_path, &fp.new_path) {
             if old != new {
-                let (old_abs, old_rel) = c.resolve_write(old)?;
+                let (old_abs, old_rel) = c.resolve(old)?;
                 changes.push(Change { abs: old_abs, rel: old_rel, before: before.clone(), after: None });
                 changes.push(Change { abs, rel, before: None, after });
                 continue;
@@ -479,7 +715,56 @@ fn apply_patch(c: &ToolCtx, input: Value) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{ctx, run};
+    use super::super::{outside_source, undo};
     use super::*;
+
+    #[test]
+    fn edit_files_takes_the_shapes_models_send() {
+        let c = ctx(&[("a.txt", "one\ntwo\n"), ("b.txt", "three\n"), ("c.txt", "four\n")]);
+        // The schema's array, with a stray key (the model added a step number) and a nested one-key
+        // map — the two shapes that failed with "unknown field `5`".
+        let r = run(
+            &c,
+            "edit_files",
+            json!({ "edits": [
+                { "path": "a.txt", "oldText": "one", "newText": "1", "5": "stray" },
+                { "5": { "path": "b.txt", "oldText": "three", "newText": "3" } },
+            ] }),
+        )
+        .unwrap();
+        assert_eq!(r["replacements"], 2, "{r}");
+        assert_eq!(r["ignoredFields"], json!(["5"]), "the model is told which keys nothing read");
+        assert_eq!(std::fs::read_to_string(c.root.join("a.txt")).unwrap(), "1\ntwo\n");
+        assert_eq!(std::fs::read_to_string(c.root.join("b.txt")).unwrap(), "3\n");
+
+        // An object keyed by step, read in numeric order (not "10" before "2").
+        let c2 = ctx(&[("c.txt", "a b c\n")]);
+        run(
+            &c2,
+            "edit_files",
+            json!({ "edits": {
+                "2": { "path": "c.txt", "oldText": " b", "newText": " B" },
+                "10": { "path": "c.txt", "oldText": " c", "newText": " C" },
+            } }),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(c2.root.join("c.txt")).unwrap(), "a B C\n");
+
+        // A single edit without the array around it.
+        let c3 = ctx(&[("d.txt", "x\n")]);
+        let r = run(&c3, "edit_files", json!({ "edits": { "path": "d.txt", "oldText": "x", "newText": "y" } })).unwrap();
+        assert_eq!(r["replacements"], 1);
+
+        // Unusable values still fail with a message that shows the shape.
+        let bad = run(&c, "edit_files", json!({ "edits": "a.txt one->1" })).unwrap_err();
+        assert_eq!(bad.kind, ToolErrorKind::InvalidInput);
+        assert!(bad.message.contains("edits must be a list of {path, oldText, newText} objects"), "{}", bad.message);
+        assert_eq!(
+            run(&c, "edit_files", json!({ "edits": [{ "path": "a.txt", "oldText": "1" }] })).unwrap_err().kind,
+            ToolErrorKind::InvalidInput,
+            "a missing newText is still an error"
+        );
+    }
 
     #[test]
     fn edit_files_is_ordered_and_atomic() {
@@ -499,6 +784,79 @@ mod tests {
         assert_eq!(c.edits.lock().unwrap().operations.len(), 1);
     }
 
+    /// A call whose top level is one edit, or has a stray key beside `edits`, must still work: this is
+    /// the shape that answered "unknown field `path`, expected `edits`".
+    #[test]
+    fn edit_files_accepts_a_loose_top_level() {
+        let c = ctx(&[("a.txt", "one\n"), ("b.txt", "two\n")]);
+        // The edit's own fields at the top level, with no `edits` wrapper.
+        let r = run(&c, "edit_files", json!({ "path": "a.txt", "oldText": "one", "newText": "1" })).unwrap();
+        assert_eq!((r["replacements"].as_u64(), r["changed"].as_array().unwrap().len()), (Some(1), 1), "{r}");
+        assert_eq!(std::fs::read_to_string(c.root.join("a.txt")).unwrap(), "1\n");
+
+        // `edits` beside a stray key: the edit runs and the key is reported back.
+        let r = run(
+            &c,
+            "edit_files",
+            json!({ "edits": [{ "path": "b.txt", "oldText": "two", "newText": "2" }], "plan": "step 2" }),
+        )
+        .unwrap();
+        assert_eq!(r["replacements"], 1, "{r}");
+        assert_eq!(r["ignoredFields"], json!(["plan"]), "the stray top-level key is named");
+        assert_eq!(std::fs::read_to_string(c.root.join("b.txt")).unwrap(), "2\n");
+
+        // No edits at all: the message says what to send, instead of naming a serde field.
+        let bad = run(&c, "edit_files", json!({ "5": "nope" })).unwrap_err();
+        assert_eq!(bad.kind, ToolErrorKind::InvalidInput);
+        assert!(bad.message.contains("edit_files needs edits"), "{}", bad.message);
+        assert!(!bad.message.contains("unknown field"), "{}", bad.message);
+    }
+
+    #[test]
+    fn copy_and_move_bring_a_file_in_from_outside() {
+        let c = ctx(&[("src/a.txt", "one\n"), ("src/b.txt", "two\n")]);
+        // Inside the workspace: an ordinary edit, with a diff and an undo entry.
+        let r = run(&c, "copy_file", json!({ "from": "src/a.txt", "to": "src/copied.txt" })).unwrap();
+        assert!(r["changed"][0]["diff"].as_str().unwrap().contains("+one"), "{r}");
+        assert_eq!(std::fs::read_to_string(c.root.join("src/copied.txt")).unwrap(), "one\n");
+        assert_eq!(std::fs::read_to_string(c.root.join("src/a.txt")).unwrap(), "one\n", "a copy keeps the source");
+
+        // A duplicate destination needs `overwrite`, and the message says so.
+        let err = run(&c, "copy_file", json!({ "from": "src/b.txt", "to": "src/copied.txt" })).unwrap_err();
+        assert_eq!(err.kind, ToolErrorKind::Conflict);
+        assert!(err.message.contains("overwrite: true"), "{}", err.message);
+        run(&c, "copy_file", json!({ "from": "src/b.txt", "to": "src/copied.txt", "overwrite": true })).unwrap();
+        assert_eq!(std::fs::read_to_string(c.root.join("src/copied.txt")).unwrap(), "two\n");
+
+        // A move inside the workspace is one operation, so one undo puts the source back.
+        let r = run(&c, "move_file", json!({ "from": "src/a.txt", "to": "src/moved.txt" })).unwrap();
+        assert!(!c.root.join("src/a.txt").exists() && c.root.join("src/moved.txt").exists());
+        let op = r["operation"].as_u64().unwrap() as usize;
+        undo(&c, op).unwrap();
+        assert_eq!(std::fs::read_to_string(c.root.join("src/a.txt")).unwrap(), "one\n", "undo restores the source");
+        assert!(!c.root.join("src/moved.txt").exists(), "and removes the destination");
+    }
+
+    #[test]
+    fn copy_file_takes_an_absolute_source_outside_the_workspace() {
+        let c = ctx(&[("a.txt", "x\n")]);
+        let outside = std::env::temp_dir().join(format!("taskx-outside-{}.txt", std::process::id()));
+        std::fs::write(&outside, "from outside\n").unwrap();
+        let raw = outside.to_string_lossy().to_string();
+        assert!(outside_source(&c.root, &raw), "an absolute path elsewhere is outside");
+        assert!(!outside_source(&c.root, "a.txt") && !outside_source(&c.root, "src/../a.txt"), "an inside path is not");
+
+        let r = run(&c, "copy_file", json!({ "from": raw, "to": "vendor/out.txt" })).unwrap();
+        assert_eq!(r["outsideWorkspace"], true, "{r}");
+        assert_eq!(std::fs::read_to_string(c.root.join("vendor/out.txt")).unwrap(), "from outside\n");
+        assert!(outside.exists(), "a copy leaves the source alone");
+
+        // The destination is still held to the workspace rules.
+        let bad = run(&c, "copy_file", json!({ "from": raw, "to": "../escape.txt" })).unwrap_err();
+        assert_eq!(bad.kind, ToolErrorKind::Forbidden, "{}", bad.message);
+        std::fs::remove_file(&outside).ok();
+    }
+
     #[test]
     fn replace_validates_matches_and_records_diff() {
         let c = ctx(&[("a.txt", "one\ntwo\ntwo\n")]);
@@ -512,10 +870,13 @@ mod tests {
         );
         let r = run(&c, "replace_text", json!({ "path": "a.txt", "oldText": "one\n", "newText": "1\n" })).unwrap();
         assert!(r["changed"][0]["diff"].as_str().unwrap().contains("-one\n+1\n"));
+        let r = run(&c, "replace_text", json!({ "file_path": "a.txt", "old_string": "1\n", "new_string": "one\n" })).unwrap();
+        assert_eq!(r["replacements"], 1);
+        assert!(run(&c, "replace_text", json!({ "file_path": "a.txt", "old_string": "one\n", "new_string": "1\n", "expected_count": 1 })).is_ok());
         let r = run(&c, "replace_all", json!({ "path": "a.txt", "oldText": "two", "newText": "2" })).unwrap();
         assert_eq!(r["replacements"], 2);
         assert_eq!(std::fs::read_to_string(c.root.join("a.txt")).unwrap(), "1\n2\n2\n");
-        assert_eq!(c.edits.lock().unwrap().operations.len(), 2);
+        assert_eq!(c.edits.lock().unwrap().operations.len(), 4);
     }
 
     #[test]
@@ -532,6 +893,22 @@ mod tests {
     }
 
     #[test]
+    fn create_file_on_an_existing_file() {
+        let c = ctx(&[("old.ts", "export const a = 1;\n")]);
+        let same = run(&c, "create_file", json!({ "path": "old.ts", "content": "export const a = 1;\n" })).unwrap();
+        assert_eq!(same["unchanged"], "old.ts", "the same content is not an error");
+        let err = run(&c, "create_file", json!({ "path": "old.ts", "content": "new\n" })).unwrap_err();
+        assert_eq!(err.kind, ToolErrorKind::Conflict, "an unread file is not replaced blindly");
+        assert!(err.message.contains("export const a = 1;"), "the error shows the current text");
+        run(&c, "create_file", json!({ "path": "old.ts", "content": "new\n" })).unwrap();
+        assert_eq!(std::fs::read_to_string(c.root.join("old.ts")).unwrap(), "new\n", "the same call works after the conflict");
+        std::fs::write(c.root.join("old.ts"), "user edit\n").unwrap();
+        assert_eq!(run(&c, "create_file", json!({ "path": "old.ts", "content": "x\n" })).unwrap_err().kind, ToolErrorKind::Conflict, "a change by someone else needs a new look");
+        run(&c, "create_file", json!({ "path": "old.ts", "content": "x\n" })).unwrap();
+        assert_eq!(std::fs::read_to_string(c.root.join("old.ts")).unwrap(), "x\n");
+    }
+
+    #[test]
     fn line_edits_create_rename_delete() {
         let c = ctx(&[("a.txt", "1\n2\n3")]);
         run(&c, "insert_at_line", json!({ "path": "a.txt", "line": 2, "text": "1.5" })).unwrap();
@@ -539,10 +916,14 @@ mod tests {
         assert_eq!(std::fs::read_to_string(c.root.join("a.txt")).unwrap(), "1\n1.5\n2\n3\n4\n");
         run(&c, "delete_range", json!({ "path": "a.txt", "start": 2, "end": 3 })).unwrap();
         assert_eq!(std::fs::read_to_string(c.root.join("a.txt")).unwrap(), "1\n3\n4\n");
-        assert_eq!(run(&c, "create_file", json!({ "path": "a.txt", "content": "" })).unwrap_err().kind, ToolErrorKind::Conflict);
+        run(&c, "create_file", json!({ "path": "a.txt", "content": "whole\n" })).unwrap();
+        assert_eq!(std::fs::read_to_string(c.root.join("a.txt")).unwrap(), "whole\n", "a file the agent wrote can be replaced");
         run(&c, "create_file", json!({ "path": "dir/new.txt", "content": "n" })).unwrap();
         run(&c, "rename_file", json!({ "from": "dir/new.txt", "to": "moved.txt" })).unwrap();
         assert!(!c.root.join("dir/new.txt").exists() && c.root.join("moved.txt").exists());
+        run(&c, "rename_file", json!({ "old_path": "moved.txt", "new_path": "dir/new.txt" })).unwrap();
+        assert!(c.root.join("dir/new.txt").exists() && !c.root.join("moved.txt").exists());
+        run(&c, "rename_file", json!({ "from": "dir/new.txt", "to": "moved.txt" })).unwrap();
         run(&c, "delete_file", json!({ "path": "moved.txt" })).unwrap();
         assert!(!c.root.join("moved.txt").exists());
         assert!(run(&c, "create_file", json!({ "path": "../escape.txt", "content": "" })).is_err());

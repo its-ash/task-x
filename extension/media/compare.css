@@ -1,0 +1,52 @@
+/* task-x compare panel. Colors are semantic tokens from tokens.css. */
+body {
+  --accent: var(--vscode-button-background, var(--vscode-focusBorder, #0078d4));
+  --on-accent: var(--vscode-button-foreground, #ffffff);
+  --accent-container: var(--vscode-list-activeSelectionBackground, color-mix(in srgb, var(--accent) 22%, var(--bg)));
+  --on-accent-container: var(--vscode-list-activeSelectionForeground, var(--fg-theme));
+  --add: var(--vscode-gitDecoration-addedResourceForeground, var(--ok));
+  --del: var(--vscode-gitDecoration-deletedResourceForeground, var(--bad));
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 20px 24px; font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--fg); background: var(--vscode-editor-background); }
+:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+.top .brand { display: flex; align-items: center; gap: 12px; }
+.logo { flex: none; width: 36px; height: 36px; border-radius: 12px; background: var(--accent-container); color: var(--on-accent-container); display: grid; place-items: center; }
+.logo::before { content: ""; width: 20px; height: 20px; background: currentColor; mask: url("logo.svg") center / contain no-repeat; }
+.top h1 { margin: 0; font-size: 1.35em; font-weight: 600; letter-spacing: -.01em; }
+.top p { margin: 4px 0 0; color: var(--muted); max-width: 80ch; line-height: 1.5; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 14px; }
+.card { display: flex; flex-direction: column; gap: 12px; padding: 16px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); box-shadow: 0 1px 2px var(--shadow); animation: md-enter var(--md-duration-medium4) var(--md-motion-emphasized-decelerate) both; animation-delay: calc(var(--i, 0) * 60ms); }
+.card.bad { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
+.card.kept { border-color: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); animation: md-pop var(--md-duration-medium2) var(--md-motion-emphasized); }
+.head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.model h2 { margin: 0; font-size: 1.05em; font-family: var(--mono); font-weight: 600; word-break: break-all; }
+.kind { font-size: 11px; color: var(--muted); }
+.badge { flex: none; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.badge.ok { color: var(--md-ext-on-green-container); background: var(--md-ext-green-container); }
+.badge.warn { color: var(--md-ext-on-amber-container); background: var(--md-ext-amber-container); }
+.stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+.stat { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 10px; background: var(--surface-high); }
+.stat .v { font-family: var(--mono); font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat .l { font-size: 11px; color: var(--muted); }
+.add { color: var(--add); }
+.del { color: var(--del); }
+.muted { color: var(--muted); }
+.report { margin: 0; line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: var(--fg); }
+.error { margin: 0; color: var(--bad); word-break: break-word; }
+.files { margin: 0; padding: 0; list-style: none; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.files li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acts { display: flex; gap: 6px; align-items: center; margin-top: auto; }
+.kept-label { font-weight: 600; color: var(--ok); }
+.foot { margin-top: 18px; font-size: 12px; color: var(--muted); }
+button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+.btn { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 4px 16px; border-radius: 15px; font-weight: 500; color: var(--on-accent); background: var(--accent); border: 1px solid transparent; transition: background-color 150ms ease, transform 160ms var(--ease); }
+.btn:hover:not(:disabled) { background: color-mix(in srgb, var(--on-accent) var(--md-state-hover), var(--accent)); box-shadow: 0 1px 3px var(--shadow); }
+.btn:active:not(:disabled) { transform: scale(.97); }
+.btn.secondary { color: var(--on-chip); background: var(--chip); }
+.btn.secondary:hover:not(:disabled) { background: color-mix(in srgb, var(--on-chip) var(--md-state-hover), var(--chip)); }
+.action { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 6px; color: var(--vscode-icon-foreground, var(--fg)); }
+.action:hover { background: var(--vscode-toolbar-hoverBackground); }
+@media (prefers-reduced-motion: reduce) { .card { animation: none; } .btn:active:not(:disabled) { transform: none; } }
