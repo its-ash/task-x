@@ -13,7 +13,7 @@ ASSET := task-x.vsix
 # lines, and passes the CLI's own exit code through (a pipe would report grep's status instead).
 CODE_FILTER = grep -vE '^\(node:[0-9]+\) \[DEP0169\]|^\(Use `Code --trace-deprecation'
 
-.PHONY: run build deploy install add
+.PHONY: run build deploy install add bump
 
 run:
 	cargo build --manifest-path $(RUNTIME)/Cargo.toml
@@ -39,9 +39,17 @@ install: build
 	@mk_cdp=$$(mktemp); $(CODE) --install-extension $(VSIX) --force > "$$mk_cdp" 2>&1; status=$$?; $(CODE_FILTER) "$$mk_cdp" >&2 || true; rm -f "$$mk_cdp"; [ $$status -eq 0 ] || exit $$status
 	@echo "Installed $(VSIX). Reload VS Code windows to use it."
 
-# Builds the .vsix, pushes main, and publishes the .vsix on the GitHub release v<version>
-# (package.json "version"). A release that exists already gets the new files.
-deploy: build
+# Raises the patch version when v<version> is released already, so each deploy is a new release.
+# A deploy that failed before its release keeps its version, so no number is skipped.
+bump:
+	@if gh release view v$(VERSION) --repo $(REPO) >/dev/null 2>&1; then \
+		npm --prefix $(EXT) version patch --no-git-tag-version >/dev/null; \
+		echo "Version $(VERSION) is released; now $$(node -p "require('./$(EXT)/package.json').version")"; \
+	fi
+
+# Raises the version (bump), builds the .vsix, pushes main, and publishes the .vsix on a new
+# GitHub release v<version>. `bump` runs first, so the build and the release see the new version.
+deploy: bump build
 	rm -f $(EXT)/*.vsix
 	npm --prefix $(EXT) run package
 	cp $(VSIX) $(EXT)/$(ASSET)
@@ -49,12 +57,8 @@ deploy: build
 	git add -A
 	git diff --cached --quiet || git commit -m "$$(copilot -sp 'Analyze the staged git changes and generate a concise commit message. Output ONLY the commit message. Do not execute any commands. Do not include quotes, markdown, explanation, or bullet points.')"
 	git push origin main
-	@if gh release view v$(VERSION) --repo $(REPO) >/dev/null 2>&1; then \
-		gh release upload v$(VERSION) $(VSIX) $(EXT)/$(ASSET) --repo $(REPO) --clobber; \
-	else \
-		gh release create v$(VERSION) $(VSIX) $(EXT)/$(ASSET) --repo $(REPO) --target main --title "task-x $(VERSION)" \
-			--notes "Download $(ASSET), then run: code --install-extension $(ASSET)"; \
-	fi
+	gh release create v$(VERSION) $(VSIX) $(EXT)/$(ASSET) --repo $(REPO) --target main --title "task-x $(VERSION)" --latest \
+		--notes "Download $(ASSET), then run: code --install-extension $(ASSET)"
 	@echo "Published https://github.com/$(REPO)/releases/tag/v$(VERSION)"
 
 # Downloads the .vsix from the latest GitHub release and installs it into VS Code.

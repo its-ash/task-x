@@ -2,7 +2,7 @@
   "name": "task-x",
   "displayName": "task-x",
   "description": "Model-agnostic AI coding agent with a Rust runtime. Works with Claude, OpenAI, Ollama, and OpenAI-compatible endpoints.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "its-ash",
   "license": "MIT",
   "private": true,
@@ -61,7 +61,7 @@
       },
       {
         "command": "task-x.addProvider",
-        "title": "Add LLM Provider\u2026",
+        "title": "Add LLM Provider…",
         "category": "task-x",
         "icon": "$(plug)"
       },
@@ -142,7 +142,7 @@
       },
       {
         "command": "task-x.previewContext",
-        "title": "Preview Context for a Request\u2026",
+        "title": "Preview Context for a Request…",
         "category": "task-x"
       },
       {
@@ -163,7 +163,7 @@
       },
       {
         "command": "task-x.askAgent",
-        "title": "Ask Agent\u2026",
+        "title": "Ask Agent…",
         "category": "task-x"
       },
       {
@@ -178,7 +178,7 @@
       },
       {
         "command": "task-x.refactorSelection",
-        "title": "Refactor Selection\u2026",
+        "title": "Refactor Selection…",
         "category": "task-x"
       },
       {
@@ -203,7 +203,7 @@
       },
       {
         "command": "task-x.openTask",
-        "title": "Open Task History\u2026",
+        "title": "Open Task History…",
         "category": "task-x",
         "icon": "$(history)"
       },
@@ -229,7 +229,7 @@
       },
       {
         "command": "task-x.runInBackground",
-        "title": "Run Task in Background\u2026",
+        "title": "Run Task in Background…",
         "category": "task-x",
         "icon": "$(run-all)"
       },
@@ -241,7 +241,7 @@
       },
       {
         "command": "task-x.bestOf",
-        "title": "Best of N: Compare Models on a Task\u2026",
+        "title": "Best of N: Compare Models on a Task…",
         "category": "task-x",
         "icon": "$(versions)"
       },
@@ -540,9 +540,20 @@
         },
         "task-x.mcp.import": {
           "type": "array",
-          "items": { "type": "string", "enum": ["claude", "vscode", "copilotCli"] },
+          "items": {
+            "type": "string",
+            "enum": [
+              "claude",
+              "vscode",
+              "copilotCli"
+            ]
+          },
           "uniqueItems": true,
-          "default": ["claude", "vscode", "copilotCli"],
+          "default": [
+            "claude",
+            "vscode",
+            "copilotCli"
+          ],
           "markdownDescription": "Use the MCP servers you already set up in other tools. `claude`: Claude Desktop, Claude Code (`~/.claude.json`), and the workspace `.mcp.json`. `vscode`: GitHub Copilot in VS Code (the user `mcp.json`, the `mcp.servers` setting, and the workspace `.vscode/mcp.json`). `copilotCli`: `~/.copilot/mcp-config.json`. Workspace files are read only in a trusted workspace. With the Claude Code engine, Claude loads its own servers, so task-x adds only the others.",
           "scope": "machine-overridable"
         },
