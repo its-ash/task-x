@@ -140,6 +140,9 @@ impl Default for Limits {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunParams {
     pub prompt: String,
+    /// Images the user attached to the prompt (pasted or dropped into the chat).
+    #[serde(default)]
+    pub images: Vec<crate::provider::types::ImageInput>,
     pub provider: ProviderConfig,
     #[serde(default)]
     pub chat_mode: ChatMode,
@@ -1111,6 +1114,7 @@ impl Run {
             policy.mode = Mode::AskBeforeExecution; // Writes land in the isolated worktree, reviewed later.
         }
         let params = RunParams {
+            images: Vec::new(),
             prompt: format!(
                 "{}\n\nObjective:\n{objective}\n\nContext from the lead agent:\n{}",
                 role.brief(),
@@ -1997,7 +2001,9 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
             return Err(format!("blocked by a beforeTask hook ({}): {}", o.command, o.message()));
         }
     }
-    let user_msg = Message { role: Role::User, content: vec![ContentPart::Text { text: enriched.user.clone() }] };
+    let mut user_content = vec![ContentPart::Text { text: enriched.user.clone() }];
+    user_content.extend(crate::provider::types::image_parts(&p.images)?);
+    let user_msg = Message { role: Role::User, content: user_content };
 
     let mut rec = match p.task_id.as_deref().and_then(|id| host.store.load(id)) {
         Some(mut r) => {
@@ -2119,6 +2125,7 @@ pub async fn best_of(host: Host, p: BestOfParams, cancel: CancellationToken) -> 
     }
     let params = RunParams {
         prompt: p.prompt.clone(),
+        images: Vec::new(),
         provider: p.providers[0].clone(),
         chat_mode: ChatMode::Agent,
         policy: p.policy,
@@ -2247,6 +2254,7 @@ mod tests {
     fn params(base: &str, mode: ChatMode, policy: Mode) -> RunParams {
         RunParams {
             prompt: "Change the greeting to hello".into(),
+            images: Vec::new(),
             provider: ProviderConfig {
                 kind: ProviderKind::OpenAiCompatible,
                 model: "m".into(),
@@ -2750,10 +2758,8 @@ mod tests {
             mcp::ServerConfig {
                 command: "sh".into(),
                 args: vec!["-c".into(), mcp::tests::SERVER.into()],
-                env: Default::default(),
-                cwd: None,
                 timeout_ms: Some(5_000),
-                disabled: false,
+                ..Default::default()
             },
         );
         h.mcp.write().await.configure(cfgs, None).await;

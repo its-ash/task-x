@@ -8,6 +8,10 @@ pub const MIN_TIMEOUT_MS: u64 = 1_000;
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 pub const DEFAULT_MAX_TOKENS: u32 = 4_096;
 const MAX_MODEL_LEN: usize = 256;
+/// Images one prompt may carry, and the base64 size of each (about 5 MB of image data).
+pub const MAX_IMAGES: usize = 8;
+const MAX_IMAGE_B64: usize = 7_000_000;
+const IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -186,6 +190,43 @@ pub enum ContentPart {
         #[serde(default)]
         is_error: bool,
     },
+    /// A base64 image the user attached (`image/png`, `image/jpeg`, `image/gif`, or `image/webp`).
+    #[serde(rename_all = "camelCase")]
+    Image {
+        media_type: String,
+        data: String,
+    },
+}
+
+/// An image attached to a prompt: `{ mediaType, data }`, where `data` is base64 without a `data:` prefix.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageInput {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// Checks attached images and turns them into content parts.
+pub fn image_parts(images: &[ImageInput]) -> Result<Vec<ContentPart>, String> {
+    if images.len() > MAX_IMAGES {
+        return Err(format!("at most {MAX_IMAGES} images per prompt"));
+    }
+    images
+        .iter()
+        .enumerate()
+        .map(|(i, im)| {
+            if !IMAGE_TYPES.contains(&im.media_type.as_str()) {
+                return Err(format!("images[{i}]: mediaType must be one of {IMAGE_TYPES:?}"));
+            }
+            let ok = !im.data.is_empty()
+                && im.data.len() <= MAX_IMAGE_B64
+                && im.data.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b));
+            if !ok {
+                return Err(format!("images[{i}]: data must be base64, 1..={MAX_IMAGE_B64} characters"));
+            }
+            Ok(ContentPart::Image { media_type: im.media_type.clone(), data: im.data.clone() })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -579,6 +620,16 @@ mod tests {
         assert_eq!(repair_history(&mut m), 1);
         assert!(ids(&m[1]).is_empty());
         assert_eq!(m[1].content, vec![ContentPart::Text { text: "gone returned: x".into() }]);
+    }
+
+    #[test]
+    fn images_are_checked() {
+        let im = |t: &str, d: &str| ImageInput { media_type: t.into(), data: d.into() };
+        assert_eq!(image_parts(&[im("image/png", "iVBORw0KGgo=")]).unwrap().len(), 1);
+        assert!(image_parts(&[im("image/svg+xml", "PHN2Zz4=")]).is_err(), "svg is not an image the models read");
+        assert!(image_parts(&[im("image/png", "data:image/png;base64,xx")]).is_err(), "no data: prefix");
+        assert!(image_parts(&[im("image/png", "")]).is_err());
+        assert!(image_parts(&vec![im("image/png", "AA=="); MAX_IMAGES + 1]).is_err());
     }
 
     #[test]

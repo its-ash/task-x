@@ -215,6 +215,25 @@ export const USER_MODES: readonly ChatMode[] = ['agent'];
 export type ApprovalMode = 'readOnly' | 'askBeforeEdit' | 'askBeforeExecution' | 'autonomous';
 export type ApprovalDecision = 'allow' | 'allowSession' | 'deny';
 
+/** An image attached to a prompt: base64 `data` without a `data:` prefix. */
+export interface ImageInput {
+  mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
+  data: string;
+}
+export const IMAGE_TYPES: readonly ImageInput['mediaType'][] = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+/** At most this many images per prompt, each at most `MAX_IMAGE_B64` base64 characters (about 5 MB). */
+export const MAX_IMAGES = 8;
+export const MAX_IMAGE_B64 = 7_000_000;
+
+/** The valid images of a webview message; anything else is dropped. */
+export function imagesFrom(v: unknown): ImageInput[] {
+  if (!Array.isArray(v)) return [];
+  return v
+    .filter((i): i is ImageInput => !!i && IMAGE_TYPES.includes(i.mediaType) && typeof i.data === 'string' && i.data.length > 0 && i.data.length <= MAX_IMAGE_B64 && /^[A-Za-z0-9+/=]+$/.test(i.data))
+    .slice(0, MAX_IMAGES)
+    .map((i) => ({ mediaType: i.mediaType, data: i.data }));
+}
+
 export interface EditorContext {
   activeFile?: string;
   selection?: { path: string; startLine: number; endLine: number; text: string };

@@ -155,7 +155,7 @@ The prompt is 1..=100 000 characters. With no route and no `provider`, the reque
 
 | Method | Kind | Params → result |
 |---|---|---|
-| `agent/run` | request (streams `agent/event`) | `{ prompt, provider, chatMode: "ask"\|"plan"\|"agent"\|"team", taskId?, editor?, policy?, limits?, routes?, fallbacks?, roleProviders?, prices? }` → summary `{ taskId, status, text, changedFiles, operations, validations, validationRan, skippedChecks, usage, metrics, model, iterations, toolCalls, error }` |
+| `agent/run` | request (streams `agent/event`) | `{ prompt, images?, provider, chatMode: "ask"\|"plan"\|"agent"\|"team", taskId?, editor?, policy?, limits?, routes?, fallbacks?, roleProviders?, prices? }`. `images` is `ImageInput[]` (see [Images](#images)) → summary `{ taskId, status, text, changedFiles, operations, validations, validationRan, skippedChecks, usage, metrics, model, iterations, toolCalls, error }` |
 | `agent/event` | notification (runtime → client) | `{ taskId, event }`. Event types: `started`, `model`, `iteration`, `textDelta`, `assistantMessage`, `retry`, `modelSwitched`, `compacted`, `toolStarted`, `toolFinished`, `approvalRequested`, `approvalResolved`, `fileChanged`, `steered`, `hook`, `subagent`, `subagentStarted`, `subagentFinished`, `planStarted`, `stepSkipped`, `merged`, `bestOfDone`, `usage`, `warning`, `error`, `done`. See [Team mode](#team-mode). A `run_command` call with `background: true` gets two `toolFinished` events: one at once, with the result `{ background: true, command, message }`, then one with `background: true` and the real output when the command ends. The model gets that output as a user message before its next step, and the task does not end while background commands run. `agent/cancelTool` stops a background command too. |
 | `agent/cancelTool` | request | `{ taskId, callId }` (from `toolStarted`; a subagent's own task id for its calls) → `true` when a running built-in tool call (or a Claude Code `Bash` call) was stopped. Only that call stops: its process is ended, the model gets "Task has been stopped by user. Continue with the next step…" (for Claude Code, as a user message after the failed result), and the task goes on. |
 | `agent/cancelSubagent` | request | `{ taskId }` (a subagent's task id from `subagentStarted`) → `true` when a running subagent was stopped |
@@ -170,7 +170,7 @@ The prompt is 1..=100 000 characters. With no route and no `provider`, the reque
 | `edits/keep` / `edits/revert` | request | `{ paths? }` → `{ kept }` / `{ reverted, conflicts }`. A file that changed after the agent's edit is never reverted. |
 | `edits/undo` | request | `{ operation }` → `{ restored, conflicts }` |
 | `config/hooks` | request | `{ hooks, workspaceTrusted }` → `{ hooks, workspaceHooks }` |
-| `mcp/configure` / `mcp/status` | request | `{ servers, workspaceTrusted }` → server status / server status |
+| `mcp/configure` / `mcp/status` | request | `{ servers, workspaceTrusted }` → server status / server status. A server is `{ type?: "stdio"\|"http"\|"sse", command?, args?, env?, cwd?, url?, headers?, timeoutMs?, disabled? }`; unknown fields (from Claude or VS Code files) are ignored. Status entries are `{ name, command, disabled, running, tools, error }`, where `command` is the URL for a remote server. |
 | `skills/list` / `worktrees/list` | request | the skills found / the task-x worktree names |
 | `skills/resolve` | request | `{ prompt, paths? }` → `{ active: [{ name, reason, source, text }] }`: the skills that apply (a leading `/name`, a trigger word, or a file pattern), with `{{param}}` values filled in. Clients use it to give skills to another agent, such as the Claude Code CLI. |
 
@@ -213,10 +213,15 @@ Compressed content starts with `[context compressed]`. Events: `compacted` `{ fo
 
 ### Claude Code engine and the task-x tools
 
+`claude/run` also takes `images` (`ImageInput[]`, sent with the prompt as image content blocks) and `mcpServers` (more servers in Claude Code's `mcpServers` format, added to `--mcp-config`; the name `task-x` is reserved).
+
+Claude Code always runs with `sandbox.allowUnsandboxedCommands: false`, so a command cannot leave the sandbox. A `Bash` call with `dangerouslyDisableSandbox: true` is denied at once, without asking the user.
+
 `claude/run` takes `useTaskTools` (default true). The runtime then starts Claude Code with:
 
 - `--mcp-config` that launches the runtime itself as an MCP server: `task-x-runtime --mcp-server --root <workspace>`. It serves the same tool registry (`tools/list`, `tools/call`) over stdio, so Claude's tools are `mcp__task-x__read_file`, `mcp__task-x__replace_text`, and so on, with the same workspace, stale-edit, and sandbox checks.
-- `--disallowedTools` for Claude Code's own file tools (Read, Edit, MultiEdit, Write, NotebookEdit, Grep, Glob, LS) and for shell commands that rewrite files (`python3 - <<`, `python -c`, `node -e`, `sed -i`, `perl -i`, `cat >`, `cat <<`, `tee`).
+- `--disallowedTools` for Claude Code's own file tools (Read, Edit, MultiEdit, Write, NotebookEdit, Grep, Glob, LS) and for shell commands that rewrite files (`sed -i`, `perl -i`, `cat >`, `cat <<`, `tee`).
+- A `PreToolUse` hook (`task-x-runtime --hook-shell-edit`) that blocks the same rewrites anywhere in a command (after `&&`, in a pipe, in `$(…)`). Inline scripts (`node -e`, `python3 -c`, `python3 - <<EOF`, and the like) are blocked only when they call a file-write API (`writeFile`, `open(…, "w")`, `write_text`, `shutil.*`, `os.remove`, …), so read-only checks run.
 - `--allowedTools` for the task-x read tools; the write tools too when the permission mode is `acceptEdits`; the command tools too when Bash is allowed.
 - `--append-system-prompt` telling Claude to work on files only through these tools.
 - `--permission-prompt-tool mcp__task-x__approve`. When a tool call needs permission, Claude Code calls this MCP tool. The MCP server sends the request to the runtime over a loopback TCP connection (address and a random token in the server's `TASK_X_APPROVAL` environment variable). The runtime asks the client with `agent/requestApproval` (`permission` is the task-x class of the tool) and reports `approvalRequested` and `approvalResolved` events. `allowSession` covers later calls of the same tool in the run. No answer, an error, or a wrong token counts as deny. With `useTaskTools: false`, the MCP server starts with `--no-tools` and serves only this tool.
@@ -274,6 +279,11 @@ Unknown fields are rejected.
 - `{ "type": "text", "text": "..." }`
 - `{ "type": "toolUse", "id": "...", "name": "...", "input": { ... } }`
 - `{ "type": "toolResult", "toolUseId": "...", "toolName": "...", "content": "...", "isError": false }`
+- `{ "type": "image", "mediaType": "image/png", "data": "<base64>" }`
+
+### Images
+
+`ImageInput` is `{ mediaType, data }`. `mediaType` is `image/png`, `image/jpeg`, `image/gif`, or `image/webp`; `data` is base64 without a `data:` prefix, at most 7 000 000 characters. A prompt takes at most 8 images; anything else fails with `-32602`. The images join the user message as `image` content parts. Anthropic gets `image` blocks, OpenAI-compatible endpoints get `image_url` data URLs, and Ollama gets the message's `images` list. For context compression an image counts as about 1600 tokens.
 
 ## Errors
 

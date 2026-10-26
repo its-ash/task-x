@@ -420,6 +420,11 @@
         turnFiles = null;
         const req = enter(el('div', 'request'));
         req.append(el('div', 'request-text', it.text), button('action copy-msg', icon('copy'), () => copyText(it.text), 'Copy message'));
+        if (it.images) {
+          const n = el('div', 'request-images');
+          n.append(icon('file-media'), document.createTextNode(`${it.images} image${it.images > 1 ? 's' : ''} attached`));
+          req.append(n);
+        }
         turn.el.append(req);
         log.append(turn.el);
         current = null;
@@ -1021,13 +1026,71 @@
     const queue = queueNext;
     queueNext = false;
     const text = input.value.trim();
-    if (!text) return;
+    if (!text && !attachments.length) return;
     input.value = '';
     autosize();
-    rememberPrompt(text);
-    vscode.postMessage({ type: 'send', text, queue });
+    if (text) rememberPrompt(text);
+    const images = attachments.map(({ mediaType, data }) => ({ mediaType, data }));
+    attachments = [];
+    renderAttachments();
+    vscode.postMessage({ type: 'send', text, queue, images });
     scroll(true);
   });
+
+  // ---------- Images: paste, drop, or pick them; they go with the next message ----------
+  const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+  const MAX_IMAGES = 8, MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+  const attachList = $('attachments'), attachFile = $('attachFile');
+  let attachments = []; // { mediaType, data, name }
+  let attachHint = null;
+  function renderAttachments() {
+    attachList.hidden = !attachments.length && !attachHint;
+    const chips = attachments.map((a, i) => {
+      const chip = el('div', 'attachment');
+      const img = el('img');
+      img.src = `data:${a.mediaType};base64,${a.data}`;
+      img.alt = a.name;
+      chip.title = a.name;
+      chip.append(img, button('action remove', icon('close'), () => { attachments.splice(i, 1); renderAttachments(); input.focus(); }, `Remove ${a.name}`));
+      return chip;
+    });
+    attachList.replaceChildren(...chips, ...(attachHint ? [el('span', 'attach-hint', attachHint)] : []));
+  }
+  function hint(text) {
+    attachHint = text;
+    renderAttachments();
+    setTimeout(() => { if (attachHint === text) { attachHint = null; renderAttachments(); } }, 4000);
+  }
+  function attachFiles(files) {
+    for (const f of files) {
+      if (!IMAGE_TYPES.includes(f.type)) { hint(`${f.name || 'This file'} is not a PNG, JPEG, GIF, or WebP image.`); continue; }
+      if (attachments.length >= MAX_IMAGES) return hint(`At most ${MAX_IMAGES} images per message.`);
+      if (f.size > MAX_IMAGE_BYTES) { hint(`${f.name || 'The image'} is larger than 5 MB.`); continue; }
+      const r = new FileReader();
+      r.onload = () => {
+        const data = String(r.result).split(',')[1];
+        if (!data || attachments.length >= MAX_IMAGES) return;
+        attachments.push({ mediaType: f.type, data, name: f.name || 'Pasted image' });
+        renderAttachments();
+      };
+      r.readAsDataURL(f);
+    }
+  }
+  input.addEventListener('paste', (e) => {
+    const files = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith('image/'));
+    if (!files.length) return;
+    e.preventDefault();
+    attachFiles(files);
+  });
+  $('form').addEventListener('dragover', (e) => { if ([...(e.dataTransfer?.types ?? [])].includes('Files')) e.preventDefault(); });
+  $('form').addEventListener('drop', (e) => {
+    const files = [...(e.dataTransfer?.files ?? [])];
+    if (!files.length) return;
+    e.preventDefault();
+    attachFiles(files);
+  });
+  $('attachBtn').addEventListener('click', () => attachFile.click());
+  attachFile.addEventListener('change', () => { attachFiles([...attachFile.files]); attachFile.value = ''; });
   send.addEventListener('click', () => (state.busy ? vscode.postMessage({ type: 'cancel' }) : $('form').requestSubmit()));
   // Refine: the host rewrites the prompt with the routed model; the input stays locked until the answer comes.
   let refining = false;

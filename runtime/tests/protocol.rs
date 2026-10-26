@@ -155,7 +155,17 @@ async fn streams_chat_events_then_returns_aggregated_result() {
 async fn refine_rewrites_the_prompt_with_the_routed_model() {
     let reply = json!({ "choices": [{ "index": 0, "delta": { "content": "<think>plan</think>```text\nAdd a test for parse() in src/lib.rs.\n```" }, "finish_reason": "stop" }] });
     let (base, mut seen) = mock(200, "text/event-stream", vec![format!("data: {reply}\n\n"), "data: [DONE]\n\n".into()], false).await;
-    let kinds = ["question", "bugInvestigation", "codeModification", "newFeature", "refactoring", "testing", "documentation", "repositoryWide", "architecture"];
+    let kinds = [
+        "question",
+        "bugInvestigation",
+        "codeModification",
+        "newFeature",
+        "refactoring",
+        "testing",
+        "documentation",
+        "repositoryWide",
+        "architecture",
+    ];
     let mut rt = Runtime::init().await;
     rt.send(json!({"jsonrpc":"2.0","id":1,"method":"prompt/refine","params":{
         "prompt": "test parse",
@@ -265,7 +275,10 @@ async fn interrupted_tasks_are_marked_failed_on_start() {
     std::fs::write(dir.join("tasks/stale1.json"), serde_json::to_vec(&stale).unwrap()).unwrap();
 
     let mut rt = Runtime::start().await;
-    rt.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"test"},"dataDir":dir}})).await;
+    rt.send(
+        json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"test"},"dataDir":dir}}),
+    )
+    .await;
     assert_eq!(rt.recv().await["result"]["protocolVersion"], 1);
     rt.send(json!({"jsonrpc":"2.0","id":1,"method":"agent/tasks"})).await;
     let (res, _) = rt.until_response(1).await;

@@ -66,7 +66,39 @@ Configure hooks in the `task-x.hooks` setting, or in `.task-x/hooks.json`. task-
 
 A trusted workspace can also add servers in `.task-x/mcp.json` (`{ "servers": { … } }`).
 
-- task-x starts each server over stdio and lists its tools, following pagination.
+A server is local or remote:
+
+```json
+"task-x.mcpServers": {
+  "chrome-devtools": { "command": "npx", "args": ["-y", "chrome-devtools-mcp@latest"] },
+  "figma": { "type": "http", "url": "http://127.0.0.1:3845/mcp" },
+  "remote": { "type": "http", "url": "https://mcp.example.com/mcp", "headers": { "Authorization": "Bearer …" } }
+}
+```
+
+- `type` is `stdio` (default with a `command`), `http` (streamable HTTP; default with only a `url`), or `sse` (the older HTTP+SSE transport).
+- `headers` go with every request. They are never logged, and never sent over plain `http` to a host that is not loopback.
+- A server that answers 401 or 403 needs sign-in. task-x does not run OAuth sign-in flows; put a token in `headers`.
+
+### Servers from Claude and Copilot
+
+task-x also reads the MCP servers you already set up in other tools (`task-x.mcp.import`, default all three):
+
+| Source | Files |
+|---|---|
+| `claude` | Claude Desktop `claude_desktop_config.json`; Claude Code `~/.claude.json` (user servers and this project's servers); the workspace `.mcp.json` |
+| `vscode` | GitHub Copilot in VS Code: the user `mcp.json`, the `mcp.servers` setting, and the workspace `.vscode/mcp.json` |
+| `copilotCli` | `~/.copilot/mcp-config.json` |
+
+- Later rows of the list override earlier ones with the same server name, workspace files override user files, and `task-x.mcpServers` overrides all of them.
+- Workspace files are read only when VS Code trusts the workspace.
+- `${workspaceFolder}`, `${userHome}`, `${env:NAME}`, and Claude's `${NAME}` and `${NAME:-default}` are filled in. A server that uses a VS Code `${input:…}` prompt is skipped; copy it into `task-x.mcpServers` with the value filled in.
+- The task-x Output channel lists what was imported and what was skipped, and why.
+- With the Claude Code engine, Claude Code starts its own configured servers. task-x adds the Copilot servers and `task-x.mcpServers` to the run.
+
+### How tools are called
+
+- task-x starts each server and lists its tools, following pagination.
 - Tools appear to the model as `mcp__<server>__<tool>`, separate from the built-in tools.
 - Every call needs approval (permission class `network`), unless the tool is in `task-x.agent.allowTools`.
 - Ask and Plan modes do not offer MCP tools.

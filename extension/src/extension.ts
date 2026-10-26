@@ -6,6 +6,7 @@ import { parseFindings } from './findings.js';
 import { GraphPanel } from './graphView.js';
 import { claudeSignIn, claudeSignOut } from './claudeCode.js';
 import { LogView, levelOf } from './logView.js';
+import { runtimeMcpServers } from './mcpSources.js';
 import { registerEditorCommands } from './editorCommands.js';
 import { SECTION, type ProviderRef, activeRef, deleteApiKey, hasApiKey, initChoice, isProviderRef, migrateSettings, modelFor, providerConfig, providerRefs, refLabel, refNeedsKey, setProvider, settings, storeApiKey } from './config.js';
 import { ProviderDialog } from './providerDialog.js';
@@ -49,7 +50,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
       vscode.window.showErrorMessage(`task-x hooks: ${describeError(e)}`);
     }
     try {
-      const m = await rt.client.request<{ servers: { name: string; running: boolean; tools: string[]; error?: string }[] }>('mcp/configure', { servers: c.get('mcpServers', {}), workspaceTrusted });
+      const { servers, notes } = runtimeMcpServers(ctx);
+      for (const n of notes) out.info(`MCP import: ${n}`);
+      const m = await rt.client.request<{ servers: { name: string; running: boolean; tools: string[]; error?: string }[] }>('mcp/configure', { servers, workspaceTrusted });
       for (const sv of m.servers) sv.error ? out.warn(`MCP ${sv.name}: ${sv.error}`) : out.info(`MCP ${sv.name}: ${sv.tools.length} tools`);
     } catch (e) {
       vscode.window.showErrorMessage(`task-x MCP: ${describeError(e)}`);
@@ -307,7 +310,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeWorkspaceFolders(() => runtime && void openWorkspace(runtime)),
     vscode.workspace.onDidGrantWorkspaceTrust(() => runtime && void configureExtensions(runtime)),
     (() => {
-      const w = vscode.workspace.createFileSystemWatcher('**/{.task-x,.anvil}/{hooks,mcp}.json');
+      const w = vscode.workspace.createFileSystemWatcher('**/{.task-x/hooks.json,.task-x/mcp.json,.anvil/hooks.json,.anvil/mcp.json,.mcp.json,.vscode/mcp.json}');
       const again = () => runtime && void configureExtensions(runtime);
       w.onDidChange(again);
       w.onDidCreate(again);
@@ -318,7 +321,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       try {
         const rt = await ensureRuntime();
         const st = await rt.client.request<{ servers: { name: string; running: boolean; tools: string[]; error?: string; command: string }[] }>('mcp/status');
-        if (!st.servers.length) return void vscode.window.showInformationMessage('task-x: no MCP servers configured (setting task-x.mcpServers or .anvil/mcp.json).');
+        if (!st.servers.length) return void vscode.window.showInformationMessage('task-x: no MCP servers found. Add them in Claude, VS Code (mcp.json), the setting task-x.mcpServers, or .task-x/mcp.json.');
         await vscode.window.showQuickPick(
           st.servers.map((sv) => ({ label: `${sv.running ? '$(pass-filled)' : '$(error)'} ${sv.name}`, description: sv.command, detail: sv.error ?? (sv.tools.join(', ') || 'no tools') })),
           { title: 'task-x: MCP Servers' },
@@ -385,7 +388,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
       if (e.affectsConfiguration('task-x.runtimePath') && runtime) void restartRuntime();
       else if (e.affectsConfiguration('task-x.index.exclude') && runtime) void openWorkspace(runtime);
-      else if ((e.affectsConfiguration('task-x.mcpServers') || e.affectsConfiguration('task-x.hooks')) && runtime) void configureExtensions(runtime);
+      else if (['task-x.mcpServers', 'task-x.mcp.import', 'task-x.hooks', 'mcp.servers'].some((k) => e.affectsConfiguration(k)) && runtime) void configureExtensions(runtime);
     }),
     ctx.secrets.onDidChange(() => {
       chat.invalidateModels();

@@ -1,7 +1,10 @@
-//! Model Context Protocol client (stdio transport). Server tools are exposed to the agent as
-//! `mcp__<server>__<tool>`, kept separate from the built-in registry, and always go through the
-//! permission policy (permission class `network`, so they need approval unless allow-listed).
+//! Model Context Protocol client (stdio, streamable HTTP, and the older HTTP+SSE transport). Server
+//! tools are exposed to the agent as `mcp__<server>__<tool>`, kept separate from the built-in
+//! registry, and always go through the permission policy (permission class `network`, so they need
+//! approval unless allow-listed).
 
+use futures_util::StreamExt;
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -21,9 +24,15 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_TOOLS: usize = 200;
 const MAX_STDERR: usize = 8 * 1024;
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// One server, in the shape Claude Code (`mcpServers`) and VS Code (`servers`) use. Unknown fields
+/// from those files (`envFile`, `gallery`, ...) are ignored.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerConfig {
+    /// `stdio`, `http` (streamable HTTP), or `sse`. Default: `http` with a `url` and no `command`, else `stdio`.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -35,6 +44,143 @@ pub struct ServerConfig {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub disabled: bool,
+    /// Server address for the `http` and `sse` transports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// HTTP headers for the `http` and `sse` transports (for example `Authorization`). Never logged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Stdio,
+    Http,
+    Sse,
+}
+
+impl ServerConfig {
+    fn kind(&self) -> Result<Kind, String> {
+        match self.transport.as_deref() {
+            Some("stdio") => Ok(Kind::Stdio),
+            Some("http" | "streamable-http" | "streamableHttp") => Ok(Kind::Http),
+            Some("sse") => Ok(Kind::Sse),
+            Some(t) => Err(format!("unknown transport type '{t}' (use stdio, http, or sse)")),
+            None if self.url.is_some() && self.command.trim().is_empty() => Ok(Kind::Http),
+            None => Ok(Kind::Stdio),
+        }
+    }
+
+    /// The command line or URL, for status displays.
+    fn target(&self) -> &str {
+        if self.command.trim().is_empty() { self.url.as_deref().unwrap_or_default() } else { &self.command }
+    }
+}
+
+/// Checks the URL and headers of a remote server. Headers (which often hold tokens) never go over
+/// plain http to another machine.
+fn remote(cfg: &ServerConfig) -> Result<(url::Url, HeaderMap), String> {
+    let raw = cfg.url.as_deref().map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required for http and sse servers")?;
+    let u = url::Url::parse(raw).map_err(|e| format!("invalid url: {e}"))?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return Err("url must use http or https".into());
+    }
+    let loopback = match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if u.scheme() == "http" && !loopback && !cfg.headers.is_empty() {
+        return Err("refusing to send headers over plain http to a non-loopback host".into());
+    }
+    let mut h = HeaderMap::new();
+    for (k, v) in &cfg.headers {
+        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|_| format!("invalid header name '{k}'"))?;
+        let mut val = HeaderValue::from_str(v).map_err(|_| format!("invalid value for header '{k}'"))?;
+        val.set_sensitive(true);
+        h.insert(name, val);
+    }
+    Ok((u, h))
+}
+
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().map_err(|e| format!("http client: {e}"))
+}
+
+/// Splits a `text/event-stream` body into `(event, data)` pairs.
+#[derive(Default)]
+struct SseReader {
+    buf: Vec<u8>,
+}
+
+impl SseReader {
+    fn push(&mut self, chunk: &[u8]) -> Vec<(String, String)> {
+        self.buf.extend(chunk.iter().filter(|&&b| b != b'\r'));
+        let mut out = Vec::new();
+        while let Some(end) = self.buf.windows(2).position(|w| w == b"\n\n") {
+            let block: Vec<u8> = self.buf.drain(..end + 2).collect();
+            let block = String::from_utf8_lossy(&block);
+            let mut event = "message".to_owned();
+            let mut data = Vec::new();
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("event:") {
+                    event = v.trim().to_owned();
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    data.push(v.strip_prefix(' ').unwrap_or(v).to_owned());
+                }
+            }
+            if !data.is_empty() {
+                out.push((event, data.join("\n")));
+            }
+        }
+        out
+    }
+}
+
+/// The answer to request `id` in a message (or a batch of messages), if it holds one.
+fn answer(v: &Value, id: i64) -> Option<Result<Value, String>> {
+    if let Some(list) = v.as_array() {
+        return list.iter().find_map(|m| answer(m, id));
+    }
+    if v.get("id").and_then(Value::as_i64) != Some(id) || v.get("method").is_some() {
+        return None;
+    }
+    Some(match v.get("error") {
+        Some(e) => Err(e["message"].as_str().unwrap_or("server error").to_owned()),
+        None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
+    })
+}
+
+/// Routes one message from a stdio or SSE server: a response completes its request; a server
+/// request gets the reply returned here (`ping` is answered, anything else declined).
+fn dispatch(msg: &Value, pending: &Pending) -> Option<Value> {
+    match (msg.get("id").and_then(Value::as_i64), msg.get("method").and_then(Value::as_str)) {
+        (Some(id), None) => {
+            if let Some(tx) = pending.lock().expect("pending lock").remove(&id) {
+                let _ = tx.send(match msg.get("error") {
+                    Some(e) => Err(e.clone()),
+                    None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
+                });
+            }
+            None
+        }
+        (_, Some(method)) if msg.get("id").is_some() => {
+            let id = msg["id"].clone();
+            Some(if method == "ping" {
+                json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+            } else {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "not supported by this client" } })
+            })
+        }
+        _ => None,
+    }
+}
+
+fn fail_all(pending: &Pending) {
+    for (_, tx) in pending.lock().expect("pending lock").drain() {
+        let _ = tx.send(Err(json!({ "message": "server exited" })));
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,16 +195,90 @@ pub struct McpTool {
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, Value>>>>>;
 
+/// A streamable-HTTP server: each request is one POST; the answer is JSON or an event stream.
+struct HttpConn {
+    http: reqwest::Client,
+    url: url::Url,
+    headers: HeaderMap,
+    session: Mutex<Option<String>>,
+}
+
+impl HttpConn {
+    async fn post(&self, msg: &Value) -> Result<reqwest::Response, String> {
+        let mut req =
+            self.http.post(self.url.clone()).headers(self.headers.clone()).header(ACCEPT, "application/json, text/event-stream").json(msg);
+        if msg["method"] != "initialize" {
+            req = req.header("MCP-Protocol-Version", PROTOCOL_VERSION);
+        }
+        if let Some(s) = self.session.lock().expect("session lock").clone() {
+            req = req.header("Mcp-Session-Id", s);
+        }
+        let r = req.send().await.map_err(|e| format!("could not reach {}: {e}", self.url))?;
+        if let Some(s) = r.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+            *self.session.lock().expect("session lock") = Some(s.to_owned());
+        }
+        match r.status() {
+            s if s.is_success() => Ok(r),
+            s if matches!(s.as_u16(), 401 | 403) => {
+                Err(format!("{} answered HTTP {s}: the server needs sign-in; set an Authorization header for it", self.url))
+            }
+            s => Err(format!("{} answered HTTP {s}", self.url)),
+        }
+    }
+
+    async fn request(&self, msg: &Value, id: i64) -> Result<Value, String> {
+        let r = self.post(msg).await?;
+        let stream = r.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.starts_with("text/event-stream"));
+        if !stream {
+            let v: Value = r.json().await.map_err(|e| format!("bad response from {}: {e}", self.url))?;
+            return answer(&v, id).unwrap_or_else(|| Err("the server sent no response".into()));
+        }
+        let mut events = SseReader::default();
+        let mut body = r.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| format!("reading from {}: {e}", self.url))?;
+            for (_, data) in events.push(&chunk) {
+                if let Some(a) = serde_json::from_str::<Value>(&data).ok().and_then(|v| answer(&v, id)) {
+                    return a;
+                }
+            }
+        }
+        Err("the server closed the stream without a response".into())
+    }
+}
+
+enum Transport {
+    Stdio {
+        stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+        _child: Child,
+    },
+    Http(HttpConn),
+    /// The older transport: one long GET event stream for answers, POSTs to the endpoint it names.
+    Sse {
+        http: reqwest::Client,
+        headers: HeaderMap,
+        endpoint: tokio::sync::watch::Receiver<Option<url::Url>>,
+        reader: tokio::task::JoinHandle<()>,
+    },
+}
+
 pub struct Client {
     name: String,
-    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    transport: Transport,
     pending: Pending,
     next: AtomicI64,
     alive: Arc<AtomicBool>,
     stderr: Arc<Mutex<String>>,
     timeout: Duration,
     pub tools: Vec<McpTool>,
-    _child: Child,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Transport::Sse { reader, .. } = &self.transport {
+            reader.abort();
+        }
+    }
 }
 
 pub fn qualify(server: &str, tool: &str) -> String {
@@ -104,6 +324,31 @@ pub fn check_input(schema: &Value, input: &Value) -> Result<(), String> {
 
 impl Client {
     pub async fn start(name: &str, cfg: &ServerConfig, root: Option<&Path>) -> Result<Self, String> {
+        let pending: Pending = Arc::default();
+        let alive = Arc::new(AtomicBool::new(true));
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let transport = match cfg.kind()? {
+            Kind::Stdio => Self::spawn_stdio(cfg, root, &pending, &alive, &stderr)?,
+            Kind::Http => {
+                let (url, headers) = remote(cfg)?;
+                Transport::Http(HttpConn { http: http_client()?, url, headers, session: Mutex::new(None) })
+            }
+            Kind::Sse => {
+                let (url, headers) = remote(cfg)?;
+                Self::open_sse(url, headers, &pending, &alive).await?
+            }
+        };
+        let timeout = Duration::from_millis(cfg.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1_000, 600_000));
+        Ok(Self { name: name.into(), transport, pending, next: AtomicI64::new(1), alive, stderr, timeout, tools: Vec::new() })
+    }
+
+    fn spawn_stdio(
+        cfg: &ServerConfig,
+        root: Option<&Path>,
+        pending: &Pending,
+        alive: &Arc<AtomicBool>,
+        stderr: &Arc<Mutex<String>>,
+    ) -> Result<Transport, String> {
         if cfg.command.trim().is_empty() || cfg.args.iter().any(|a| a.contains('\0')) {
             return Err("command must be non-empty".into());
         }
@@ -116,9 +361,6 @@ impl Client {
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let mut stderr_pipe = child.stderr.take().ok_or("no stderr")?;
-        let pending: Pending = Arc::default();
-        let alive = Arc::new(AtomicBool::new(true));
-        let stderr = Arc::new(Mutex::new(String::new()));
         {
             let stderr = stderr.clone();
             tokio::spawn(async move {
@@ -137,58 +379,82 @@ impl Client {
                 }
             });
         }
-        let client = Self {
-            name: name.into(),
-            stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
-            pending: pending.clone(),
-            next: AtomicI64::new(1),
-            alive: alive.clone(),
-            stderr,
-            timeout: Duration::from_millis(cfg.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1_000, 600_000)),
-            tools: Vec::new(),
-            _child: child,
-        };
-        let reply_to = client.stdin.clone();
+        let stdin = Arc::new(tokio::sync::Mutex::new(stdin));
+        let (reply_to, pending, alive) = (stdin.clone(), pending.clone(), alive.clone());
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-                match (msg.get("id").and_then(Value::as_i64), msg.get("method").and_then(Value::as_str)) {
-                    (Some(id), None) => {
-                        if let Some(tx) = pending.lock().expect("pending lock").remove(&id) {
-                            let _ = tx.send(match msg.get("error") {
-                                Some(e) => Err(e.clone()),
-                                None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
-                            });
-                        }
-                    }
-                    (_, Some(method)) if msg.get("id").is_some() => {
-                        // Server → client requests: answer ping; decline everything else.
-                        let id = msg["id"].clone();
-                        let resp = if method == "ping" {
-                            json!({ "jsonrpc": "2.0", "id": id, "result": {} })
-                        } else {
-                            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "not supported by this client" } })
-                        };
-                        let mut w = reply_to.lock().await;
-                        let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
-                        let _ = w.flush().await;
-                    }
-                    _ => {}
+                if let Some(resp) = dispatch(&msg, &pending) {
+                    let mut w = reply_to.lock().await;
+                    let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
+                    let _ = w.flush().await;
                 }
             }
             alive.store(false, Ordering::SeqCst);
-            for (_, tx) in pending.lock().expect("pending lock").drain() {
-                let _ = tx.send(Err(json!({ "message": "server exited" })));
-            }
+            fail_all(&pending);
         });
-        Ok(client)
+        Ok(Transport::Stdio { stdin, _child: child })
     }
 
-    async fn write(&self, msg: Value) -> Result<(), String> {
-        let mut w = self.stdin.lock().await;
-        w.write_all(format!("{msg}\n").as_bytes()).await.map_err(|e| format!("write to {}: {e}", self.name))?;
-        w.flush().await.map_err(|e| e.to_string())
+    async fn open_sse(url: url::Url, headers: HeaderMap, pending: &Pending, alive: &Arc<AtomicBool>) -> Result<Transport, String> {
+        let http = http_client()?;
+        let resp = http
+            .get(url.clone())
+            .headers(headers.clone())
+            .header(ACCEPT, "text/event-stream")
+            .send()
+            .await
+            .map_err(|e| format!("could not reach {url}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("{url} answered HTTP {}", resp.status()));
+        }
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let (pending, alive, post, post_headers) = (pending.clone(), alive.clone(), http.clone(), headers.clone());
+        let reader = tokio::spawn(async move {
+            let mut events = SseReader::default();
+            let mut body = resp.bytes_stream();
+            let mut endpoint: Option<url::Url> = None;
+            while let Some(Ok(chunk)) = body.next().await {
+                for (event, data) in events.push(&chunk) {
+                    if event == "endpoint" {
+                        // Requests (with their headers) only go back to the server's own origin.
+                        endpoint = url.join(data.trim()).ok().filter(|e| e.origin() == url.origin());
+                        let _ = tx.send(endpoint.clone());
+                    } else if let Ok(msg) = serde_json::from_str::<Value>(&data) {
+                        if let (Some(resp), Some(ep)) = (dispatch(&msg, &pending), endpoint.clone()) {
+                            let _ = post.post(ep).headers(post_headers.clone()).json(&resp).send().await;
+                        }
+                    }
+                }
+            }
+            alive.store(false, Ordering::SeqCst);
+            fail_all(&pending);
+        });
+        Ok(Transport::Sse { http, headers, endpoint: rx, reader })
+    }
+
+    /// Sends one message without waiting for an answer (a request on stdio or SSE, or a notification).
+    async fn send(&self, msg: &Value) -> Result<(), String> {
+        match &self.transport {
+            Transport::Stdio { stdin, .. } => {
+                let mut w = stdin.lock().await;
+                w.write_all(format!("{msg}\n").as_bytes()).await.map_err(|e| format!("write to {}: {e}", self.name))?;
+                w.flush().await.map_err(|e| e.to_string())
+            }
+            Transport::Http(h) => h.post(msg).await.map(drop),
+            Transport::Sse { http, headers, endpoint, .. } => {
+                let mut rx = endpoint.clone();
+                let ep = match tokio::time::timeout(INIT_TIMEOUT, rx.wait_for(Option::is_some)).await {
+                    Ok(Ok(r)) => r.clone(),
+                    Ok(Err(_)) => None,
+                    Err(_) => return Err(format!("{} sent no endpoint on its event stream", self.name)),
+                };
+                let ep = ep.ok_or_else(|| format!("the event stream of {} closed", self.name))?;
+                let r = http.post(ep).headers(headers.clone()).json(msg).send().await.map_err(|e| format!("post to {}: {e}", self.name))?;
+                if r.status().is_success() { Ok(()) } else { Err(format!("{} answered HTTP {}", self.name, r.status())) }
+            }
+        }
     }
 
     pub async fn request(&self, method: &str, params: Value, timeout: Duration, cancel: &CancellationToken) -> Result<Value, String> {
@@ -196,12 +462,29 @@ impl Client {
             return Err(format!("MCP server '{}' is not running. {}", self.name, self.stderr_tail()));
         }
         let id = self.next.fetch_add(1, Ordering::SeqCst);
+        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        let cancelled =
+            json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": id, "reason": "cancelled" } });
+        if let Transport::Http(h) = &self.transport {
+            return tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = self.send(&cancelled).await;
+                    Err("cancelled".to_owned())
+                }
+                r = tokio::time::timeout(timeout, h.request(&msg, id)) => {
+                    r.unwrap_or_else(|_| Err(format!("{method} timed out after {}s", timeout.as_secs())))
+                }
+            };
+        }
         let (tx, rx) = oneshot::channel();
         self.pending.lock().expect("pending lock").insert(id, tx);
-        self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })).await?;
+        if let Err(e) = self.send(&msg).await {
+            self.pending.lock().expect("pending lock").remove(&id);
+            return Err(e);
+        }
         let res = tokio::select! {
             _ = cancel.cancelled() => {
-                let _ = self.write(json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": id, "reason": "cancelled" } })).await;
+                let _ = self.send(&cancelled).await;
                 Err("cancelled".to_owned())
             }
             r = tokio::time::timeout(timeout, rx) => match r {
@@ -226,7 +509,7 @@ impl Client {
         self.request("initialize", init, INIT_TIMEOUT, &never)
             .await
             .map_err(|e| format!("initialize failed: {e} {}", self.stderr_tail()))?;
-        self.write(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await?;
+        self.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await?;
         let mut cursor: Option<String> = None;
         loop {
             let params = cursor.as_ref().map_or(json!({}), |c| json!({ "cursor": c }));
@@ -284,7 +567,11 @@ pub struct Manager {
 
 pub fn load_workspace(root: &Path) -> Result<BTreeMap<String, ServerConfig>, String> {
     // .task-x/mcp.json; .anvil/mcp.json is the old location.
-    let p = [".task-x", ".anvil"].iter().map(|d| root.join(d).join("mcp.json")).find(|p| p.is_file()).unwrap_or_else(|| root.join(".task-x").join("mcp.json"));
+    let p = [".task-x", ".anvil"]
+        .iter()
+        .map(|d| root.join(d).join("mcp.json"))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| root.join(".task-x").join("mcp.json"));
     if !p.is_file() {
         return Ok(BTreeMap::new());
     }
@@ -344,7 +631,7 @@ impl Manager {
                 let c = self.clients.get(name);
                 json!({
                     "name": name,
-                    "command": cfg.command,
+                    "command": cfg.target(),
                     "disabled": cfg.disabled,
                     "running": c.is_some_and(|c| c.alive()),
                     "tools": c.map(|c| c.tools.iter().map(|t| t.qualified.clone()).collect::<Vec<_>>()).unwrap_or_default(),
@@ -378,26 +665,9 @@ done
         let mut cfgs = BTreeMap::new();
         cfgs.insert(
             "demo".into(),
-            ServerConfig {
-                command: "sh".into(),
-                args: vec!["-c".into(), SERVER.into()],
-                env: BTreeMap::new(),
-                cwd: None,
-                timeout_ms: Some(5_000),
-                disabled: false,
-            },
+            ServerConfig { command: "sh".into(), args: vec!["-c".into(), SERVER.into()], timeout_ms: Some(5_000), ..Default::default() },
         );
-        cfgs.insert(
-            "broken".into(),
-            ServerConfig {
-                command: "definitely-missing-mcp-xyz".into(),
-                args: vec![],
-                env: BTreeMap::new(),
-                cwd: None,
-                timeout_ms: None,
-                disabled: false,
-            },
-        );
+        cfgs.insert("broken".into(), ServerConfig { command: "definitely-missing-mcp-xyz".into(), ..Default::default() });
         m.configure(cfgs, None).await;
         let tools = m.tools();
         assert_eq!(tools.len(), 1);
@@ -408,6 +678,131 @@ done
         assert!(c.call(&t, json!({}), &cancel).await.unwrap_err().contains("missing required field"));
         let st = m.status();
         assert!(st["servers"].as_array().unwrap().iter().any(|s| s["name"] == "broken" && s["error"].is_string()));
+    }
+
+    #[test]
+    fn reads_claude_and_vscode_server_shapes() {
+        let cfg = |v: Value| serde_json::from_value::<ServerConfig>(v).unwrap();
+        let chrome = cfg(json!({ "type": "stdio", "command": "npx", "args": ["chrome-devtools-mcp@latest"], "envFile": ".env" }));
+        assert_eq!(chrome.kind(), Ok(Kind::Stdio));
+        let figma = cfg(json!({ "type": "http", "url": "http://127.0.0.1:3845/mcp" }));
+        assert_eq!(figma.kind(), Ok(Kind::Http));
+        assert_eq!(figma.target(), "http://127.0.0.1:3845/mcp");
+        assert_eq!(cfg(json!({ "url": "https://mcp.example.com/mcp" })).kind(), Ok(Kind::Http), "a url alone means http");
+        assert_eq!(cfg(json!({ "type": "sse", "url": "https://x.dev/sse" })).kind(), Ok(Kind::Sse));
+        assert!(cfg(json!({ "type": "ws", "url": "ws://x" })).kind().is_err());
+    }
+
+    #[test]
+    fn remote_servers_keep_headers_safe() {
+        let cfg = |url: &str, auth: bool| ServerConfig {
+            url: Some(url.into()),
+            headers: if auth { BTreeMap::from([("Authorization".into(), "Bearer t".into())]) } else { BTreeMap::new() },
+            ..Default::default()
+        };
+        assert!(remote(&cfg("https://mcp.figma.com/mcp", true)).is_ok());
+        assert!(remote(&cfg("http://127.0.0.1:3845/mcp", true)).is_ok(), "loopback may use plain http");
+        assert!(remote(&cfg("http://example.com/mcp", false)).is_ok());
+        assert!(remote(&cfg("http://example.com/mcp", true)).is_err(), "no token over plain http to another host");
+        assert!(remote(&cfg("file:///etc/passwd", false)).is_err());
+        assert!(remote(&ServerConfig { transport: Some("http".into()), ..Default::default() }).is_err(), "http needs a url");
+        let (_, h) = remote(&cfg("https://x.dev/mcp", true)).unwrap();
+        assert!(h["authorization"].is_sensitive());
+    }
+
+    #[test]
+    fn splits_event_streams_and_finds_answers() {
+        let mut r = SseReader::default();
+        assert!(r.push(b"event: endpoint\r\ndata: /messages?s=1").is_empty(), "an event waits for its blank line");
+        assert_eq!(r.push(b"\r\n\r\ndata: {\"id\":2,"), vec![("endpoint".into(), "/messages?s=1".into())]);
+        let ev = r.push("\"result\":{\"ok\":\"é\"}}\n\n".as_bytes());
+        assert_eq!(ev.len(), 1);
+        let v: Value = serde_json::from_str(&ev[0].1).unwrap();
+        assert_eq!(answer(&v, 2), Some(Ok(json!({ "ok": "é" }))));
+        assert_eq!(answer(&v, 3), None);
+        assert_eq!(answer(&json!([{ "id": 4, "error": { "message": "nope" } }]), 4), Some(Err("nope".into())));
+        assert_eq!(answer(&json!({ "id": 5, "method": "ping" }), 5), None, "a server request is not an answer");
+    }
+
+    /// One streamable-HTTP MCP server on a loopback port, answering in JSON or as an event stream.
+    async fn http_server() -> String {
+        use tokio::io::AsyncReadExt as _;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let body = loop {
+                        let n = s.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some(i) = text.find("\r\n\r\n") {
+                            let len = text[..i]
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= i + 4 + len {
+                                break text[i + 4..i + 4 + len].to_owned();
+                            }
+                        }
+                    };
+                    let msg: Value = serde_json::from_str(&body).unwrap_or_default();
+                    let id = msg["id"].clone();
+                    let (ctype, out) = match msg["method"].as_str().unwrap_or_default() {
+                        "initialize" => (
+                            "application/json",
+                            json!({ "jsonrpc": "2.0", "id": id, "result": { "protocolVersion": PROTOCOL_VERSION, "capabilities": {} } })
+                                .to_string(),
+                        ),
+                        "tools/list" => (
+                            "text/event-stream",
+                            format!(
+                                "event: message\ndata: {}\n\n",
+                                json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": [{ "name": "get_screenshot", "inputSchema": { "type": "object" } }] } })
+                            ),
+                        ),
+                        "tools/call" => (
+                            "application/json",
+                            json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": "frame" }] } })
+                                .to_string(),
+                        ),
+                        _ => {
+                            let _ = s.write_all(b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                            return;
+                        }
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\nmcp-session-id: s1\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        out.len()
+                    );
+                    let _ = s.write_all(head.as_bytes()).await;
+                    let _ = s.write_all(out.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    #[tokio::test]
+    async fn talks_to_a_streamable_http_server() {
+        let url = http_server().await;
+        let mut m = Manager::default();
+        m.configure(
+            BTreeMap::from([("figma".into(), ServerConfig { transport: Some("http".into()), url: Some(url), ..Default::default() })]),
+            None,
+        )
+        .await;
+        assert_eq!(m.status()["servers"][0]["error"], Value::Null, "{}", m.status());
+        let (c, t) = m.find("mcp__figma__get_screenshot").unwrap();
+        assert_eq!(c.call(&t, json!({}), &CancellationToken::new()).await.unwrap()["content"], "frame");
     }
 
     #[test]

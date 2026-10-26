@@ -524,7 +524,15 @@
         "task-x.mcpServers": {
           "type": "object",
           "default": {},
-          "markdownDescription": "MCP servers to start, keyed by name: `{ \"github\": { \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"], \"env\": {} } }`. Their tools appear as `mcp__<server>__<tool>` and need approval unless listed in `task-x.agent.allowTools`. A trusted workspace can add servers in `.anvil/mcp.json`.",
+          "markdownDescription": "MCP servers to start, keyed by name. A local server: `{ \"chrome-devtools\": { \"command\": \"npx\", \"args\": [\"-y\", \"chrome-devtools-mcp@latest\"] } }`. A remote server: `{ \"figma\": { \"type\": \"http\", \"url\": \"http://127.0.0.1:3845/mcp\" } }` (`type` is `stdio`, `http`, or `sse`; `headers` sets HTTP headers such as `Authorization`). These override servers of the same name from `task-x.mcp.import`. Their tools appear as `mcp__<server>__<tool>` and need approval unless listed in `task-x.agent.allowTools`. A trusted workspace can add servers in `.task-x/mcp.json`.",
+          "scope": "machine-overridable"
+        },
+        "task-x.mcp.import": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["claude", "vscode", "copilotCli"] },
+          "uniqueItems": true,
+          "default": ["claude", "vscode", "copilotCli"],
+          "markdownDescription": "Use the MCP servers you already set up in other tools. `claude`: Claude Desktop, Claude Code (`~/.claude.json`), and the workspace `.mcp.json`. `vscode`: GitHub Copilot in VS Code (the user `mcp.json`, the `mcp.servers` setting, and the workspace `.vscode/mcp.json`). `copilotCli`: `~/.copilot/mcp-config.json`. Workspace files are read only in a trusted workspace. With the Claude Code engine, Claude loads its own servers, so task-x adds only the others.",
           "scope": "machine-overridable"
         },
         "task-x.hooks": {

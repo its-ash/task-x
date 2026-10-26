@@ -115,10 +115,7 @@ impl Providers {
             .user_agent(concat!("task-x-runtime/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| ProviderError::new(ErrorKind::InvalidConfig, format!("failed to build HTTP client: {e}")))?;
-        Ok(Self { 
-            http,
-            model_info_cache: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        })
+        Ok(Self { http, model_info_cache: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())) })
     }
 
     async fn send(&self, req: HttpRequest, timeout: Duration, cancel: &CancellationToken) -> Result<reqwest::Response, ProviderError> {

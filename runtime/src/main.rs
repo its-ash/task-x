@@ -57,7 +57,8 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let approval = std::env::var(claude_cli::APPROVAL_ENV).ok().and_then(|v| v.split_once(' ').map(|(a, t)| (a.to_owned(), t.to_owned())));
+        let approval =
+            std::env::var(claude_cli::APPROVAL_ENV).ok().and_then(|v| v.split_once(' ').map(|(a, t)| (a.to_owned(), t.to_owned())));
         return mcp_server::serve(root, !argv.iter().any(|a| a == "--no-tools"), approval).await;
     }
 

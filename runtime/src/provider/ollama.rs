@@ -32,8 +32,18 @@ fn messages(req: &ChatRequest) -> Vec<Value> {
             }
         }
         let text = m.text();
+        let images: Vec<&str> = m
+            .content
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Image { data, .. } => Some(data.as_str()),
+                _ => None,
+            })
+            .collect();
         if !calls.is_empty() {
             out.push(json!({ "role": "assistant", "content": text, "tool_calls": calls }));
+        } else if !images.is_empty() {
+            out.push(json!({ "role": m.role, "content": text, "images": images }));
         } else if !text.is_empty() {
             out.push(json!({ "role": m.role, "content": text }));
         }
@@ -140,6 +150,21 @@ impl StreamDecoder for Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sends_attached_images_as_a_list() {
+        let req = ChatRequest {
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![
+                    ContentPart::Text { text: "q".into() },
+                    ContentPart::Image { media_type: "image/png".into(), data: "AA==".into() },
+                ],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(messages(&req)[0], json!({ "role": "user", "content": "q", "images": ["AA=="] }));
+    }
 
     #[test]
     fn builds_chat_request_without_key_against_default_host() {

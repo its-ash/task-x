@@ -11,6 +11,8 @@ This file records the state of the work between sessions. Mark an item done only
   - chat UI rendered in Chrome at 300 px and 500 px width
 
 **Not verified yet:**
+- The MCP HTTP transport test, and the tests that open a local port, were not run in the last session: its sandbox blocks local ports. All other runtime and extension tests passed.
+- Claude Code with `sandbox.allowUnsandboxedCommands: false` in a real run
 - Real Anthropic and OpenAI streaming (no keys used)
 - The extension inside a VS Code Extension Development Host
 - CI on Windows and Linux (the workflow is written but has not run)
@@ -39,6 +41,9 @@ This file records the state of the work between sessions. Mark an item done only
 | 18 Context compression | ✅ runtime, 🟡 UI | `agent/compact.rs` (prune, fold, drop excerpts), per-model windows in `provider/*.rs`, Ollama `num_ctx`, `context` event and meter |
 | 19 Claude Code uses the Rust tools | ✅ runtime, 🟡 manual check with a real Claude run | `mcp_server.rs` (`--mcp-server`), `claude_cli::args` |
 | 17 Input context | ✅ runtime, 🟡 UI | `@path` mentions (`EditorContext.mentions`), file and selection chips, syntax highlighting (highlight.js), notifications (`task-x.notifications`) |
+| 21 MCP from Claude and Copilot, HTTP transports | ✅ runtime and import (unit tests), 🟡 manual check with Figma and Chrome DevTools | `runtime/src/mcp.rs` (stdio, streamable HTTP, HTTP+SSE), `extension/src/{mcpImport,mcpSources}.ts`, `task-x.mcp.import`, `claude/run` `mcpServers` |
+| 22 Images in chat | ✅ runtime (unit tests), 🟡 UI and real models | `ContentPart::Image` and `image_parts` in `provider/types.rs`, all three providers, `agent/run` and `claude/run` `images`; paste, drop, and pick in `media/chat.js` |
+| 23 Release | 🟡 not run yet | `make deploy` (publishes `task-x.vsix` on the GitHub release), `make add` (installs it) |
 | 20 Safety and observability | 🟡 | `agent/policy.rs` (destructive tools need an `allow` entry), `tools/mod.rs` (`ErrorClass`, `TOOL_ATTEMPTS`, `retry_backoff`), `agent/mod.rs` (`synthesize` at the iteration and tool-call limits, retries for read-only calls, `info!` events for model and tool calls), `main.rs` (`TASK_X_LOG`) |
 
 ## What each phase delivers

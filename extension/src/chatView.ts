@@ -16,6 +16,8 @@ import {
   type ChatMode,
   type ContextWindowResult,
   type EditorContext,
+  type ImageInput,
+  imagesFrom,
   type ProviderErrorData,
   type RefineResult,
   type ResolvedSkill,
@@ -27,6 +29,7 @@ import { diffStats, formatOutput } from './output.js';
 import { formatCost, limits, routes, runParams } from './runParams.js';
 import { commitPaths, commitSubject } from './autoCommit.js';
 import { WorkspaceSync } from './workspace.js';
+import { claudeMcpServers } from './mcpSources.js';
 
 const TRANSCRIPT_KEY = 'task-x.transcript';
 const INCLUDE_EDITOR_KEY = 'task-x.includeEditor';
@@ -126,7 +129,7 @@ const MAX_LANE_STEPS = 30;
 
 /** A rendered transcript entry; persisted per workspace. */
 type Item =
-  | { kind: 'user'; text: string; mode: ChatMode }
+  | { kind: 'user'; text: string; mode: ChatMode; images?: number }
   | { kind: 'assistant'; text: string }
   | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string } }
   | { kind: 'file'; path: string; operation: number | null; diffKey: string; added: number; removed: number; diff: string; diffCut: boolean; undone?: boolean; kept?: boolean }
@@ -165,7 +168,7 @@ type Lane = {
 
 type Inbound =
   | { type: 'ready' }
-  | { type: 'send'; text: string; queue?: boolean }
+  | { type: 'send'; text: string; queue?: boolean; images?: unknown }
   | { type: 'cancel' }
   | { type: 'clear' }
   | { type: 'selectModel'; kind: string; model: string }
@@ -347,7 +350,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   // Context window per `kind:model`; 0 means unknown.
   private readonly windows = new Map<string, number>();
   /** Messages sent while a request was running; each one runs after the one before it. */
-  private readonly queue: { text: string; mode?: ChatMode }[] = [];
+  private readonly queue: { text: string; mode?: ChatMode; images?: ImageInput[] }[] = [];
   private readonly approvals = new Map<string, (d: ApprovalDecision | 'always') => void>();
   private readonly questions = new Map<string, { questions: Question[]; done: (answers: Record<string, string[]> | null) => void }>();
   private night: boolean;
@@ -836,9 +839,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'diffFile':
         if (typeof m.path === 'string') await this.diffFile(m.path);
         break;
-      case 'send':
-        if (typeof m.text === 'string') await (this.busy && m.queue !== true ? this.steer(m.text) : this.send(m.text));
+      case 'send': {
+        if (typeof m.text !== 'string') break;
+        // Steering is text only, so a message with images waits for the running task instead.
+        const images = imagesFrom(m.images);
+        await (images.length ? this.send(m.text, undefined, false, images) : this.busy && m.queue !== true ? this.steer(m.text) : this.send(m.text));
         break;
+      }
       case 'cancel':
         this.cancel();
         await this.setNightRequest(undefined);
@@ -1508,19 +1515,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return this.taskId;
   }
 
-  private async send(raw: string, modeOverride?: ChatMode, retry = false): Promise<void> {
-    const text = raw.trim();
+  private async send(raw: string, modeOverride?: ChatMode, retry = false, images: ImageInput[] = []): Promise<void> {
+    const text = raw.trim() || (images.length ? `Look at the attached image${images.length > 1 ? 's' : ''}.` : '');
     if (!text) return;
     if (text.length > MAX_INPUT_CHARS) return void this.add({ kind: 'error', text: `Message is longer than ${MAX_INPUT_CHARS} characters.` });
     if (this.busy) {
       if (this.queue.length >= MAX_QUEUE) return void this.add({ kind: 'error', text: `Only ${MAX_QUEUE} messages can wait. Stop the task or wait for one to finish.` });
-      this.queue.push({ text, mode: modeOverride });
+      this.queue.push({ text, mode: modeOverride, images });
       return void this.postQueue();
     }
     const mode: ChatMode = modeOverride ?? 'agent';
     const abort = new AbortController();
     this.setBusy(abort);
-    this.add({ kind: 'user', text, mode });
+    this.add({ kind: 'user', text, mode, ...(images.length ? { images: images.length } : {}) });
     const before = this.lastSummary();
     this.stalled = false;
     this.lastActivity = Date.now();
@@ -1536,7 +1543,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (engine() === 'claudeCode' && !worker) {
       try {
         const task = this.night ? await this.nightTask(text, retry, abort.signal) : text;
-        await this.sendClaude(text, mode, abort.signal, (o) => (off = o), task);
+        await this.sendClaude(text, mode, abort.signal, (o) => (off = o), task, images);
       } catch (e) {
         this.add({ kind: 'error', text: describeError(e), retryText: e instanceof RpcError && e.cancelled ? undefined : text });
       } finally {
@@ -1556,7 +1563,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const taskId = this.taskId;
       const prompt = this.night ? await this.nightTask(text, retry, abort.signal) : text;
       const provider = worker && isProviderRef(worker.kind) ? await providerConfigWith(this.ctx.secrets, worker.kind, worker.model) : undefined;
-      const params = await runParams(this.ctx.secrets, { prompt, mode, taskId, editor: this.editorContext(text), provider });
+      const params = await runParams(this.ctx.secrets, { prompt, mode, taskId, editor: this.editorContext(text), provider, images });
       const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
       off = client.onNotification('agent/event', (p) => {
         const { taskId: id, event } = p as AgentEventParams;
@@ -1568,7 +1575,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       for (let n = 1; n <= auto && summary.status === 'maxIterations' && !abort.signal.aborted; n++) {
         this.add({ kind: 'context', text: `Reached the turn limit after ${summary.iterations} turns. Continuing automatically (${n} of ${auto}).` });
         state.assistant = undefined;
-        summary = await client.request<AgentSummary>('agent/run', { ...params, prompt: CONTINUE_PROMPT }, { signal: abort.signal });
+        summary = await client.request<AgentSummary>('agent/run', { ...params, prompt: CONTINUE_PROMPT, images: [] }, { signal: abort.signal });
       }
       this.add({ kind: 'summary', ...summaryText(summary) });
       await this.commitTask(summary, text);
@@ -1613,7 +1620,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private drain(): void {
     const next = this.queue.shift();
     this.postQueue();
-    if (next) void this.send(next.text, next.mode);
+    if (next) void this.send(next.text, next.mode, false, next.images);
   }
 
   /** Hooks for a finished task, and a notification when the chat is not on screen. */
@@ -1673,7 +1680,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /** Runs the request through the Claude Code CLI; follow-ups resume the same Claude session. */
-  private async sendClaude(text: string, mode: ChatMode, signal: AbortSignal, setOff: (off: () => void) => void, task = text): Promise<void> {
+  private async sendClaude(text: string, mode: ChatMode, signal: AbortSignal, setOff: (off: () => void) => void, task = text, images: ImageInput[] = []): Promise<void> {
     const cliPath = findClaude();
     if (!cliPath) throw new Error('Claude Code CLI not found. Install it (https://docs.anthropic.com/claude-code) or set task-x.claudeCode.path.');
     if (!(await claudeAuth()).loggedIn) {
@@ -1710,6 +1717,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         sessionId: sessions[taskId],
         maxBudgetUsd: budget > 0 ? budget : undefined,
         useTaskTools: c.get<boolean>('claudeCode.useTaskXTools', true),
+        images,
+        mcpServers: claudeMcpServers(this.ctx),
         ...claudePermissions(mode),
       },
       { signal },
@@ -1728,7 +1737,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const js = webview.asWebviewUri(vscode.Uri.joinPath(media, 'chat.js'));
     const hljs = webview.asWebviewUri(vscode.Uri.joinPath(media, 'vendor', 'highlight.min.js'));
     const codicons = webview.asWebviewUri(vscode.Uri.joinPath(media, 'codicons', 'codicon.css'));
-    const csp = `default-src 'none'; style-src ${webview.cspSource}; font-src ${webview.cspSource}; img-src ${webview.cspSource}; script-src 'nonce-${nonce}';`;
+    const csp = `default-src 'none'; style-src ${webview.cspSource}; font-src ${webview.cspSource}; img-src ${webview.cspSource} data:; script-src 'nonce-${nonce}';`;
     return /* html */ `<!doctype html>
 <html lang="en">
 <head>
@@ -1763,6 +1772,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <div id="slash" role="listbox" aria-label="Skills" hidden></div>
   <div id="queue" class="queue" aria-label="Queued messages" hidden></div>
   <div id="ctx" class="ctx" aria-label="Context sent with the message"></div>
+  <div id="attachments" class="attachments" aria-label="Attached images" hidden></div>
+  <input type="file" id="attachFile" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
   <label for="input" class="sr-only">Message</label>
   <textarea id="input" rows="1"></textarea>
   <div class="toolbar" role="toolbar" aria-label="Chat options">
@@ -1774,6 +1785,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     <span class="spacer"></span>
     <span id="ctxMeter" class="meter" role="meter" aria-valuemin="0" aria-valuemax="100" hidden></span>
     <button type="button" id="indexBtn" class="pick index" hidden></button>
+    <button type="button" id="attachBtn" class="action" title="Attach images. You can also paste or drop them into the input." aria-label="Attach images"><span class="codicon codicon-file-media" aria-hidden="true"></span></button>
     <button type="button" id="refineBtn" class="action" title="Refine: rewrite the prompt with the routed model (task-x.routing), else the active model. Ctrl+Z restores your text." aria-label="Refine prompt"><span class="codicon codicon-sparkle" aria-hidden="true"></span></button>
     <button type="button" id="send" class="action primary"></button>
   </div>

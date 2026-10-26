@@ -53,7 +53,13 @@ pub fn load(index: &Index) -> Vec<Instruction> {
                 return None;
             }
             let (content, truncated) = clip(std::fs::read_to_string(canon).ok()?);
-            (!content.trim().is_empty()).then(|| Instruction { source: (*rel).into(), scope: Scope::Workspace, dir: String::new(), content, truncated })
+            (!content.trim().is_empty()).then(|| Instruction {
+                source: (*rel).into(),
+                scope: Scope::Workspace,
+                dir: String::new(),
+                content,
+                truncated,
+            })
         })
         .into_iter()
         .collect()
@@ -71,9 +77,14 @@ mod tests {
 
     #[test]
     fn sends_one_file_claude_md_first() {
-        let root = temp_repo(&[(".github/copilot-instructions.md", "root rules"), ("AGENTS.md", "agents rules"), ("pkg/CLAUDE.md", "pkg rules")]);
+        let root =
+            temp_repo(&[(".github/copilot-instructions.md", "root rules"), ("AGENTS.md", "agents rules"), ("pkg/CLAUDE.md", "pkg rules")]);
         let mut idx = Index::new(root.clone(), &[]).unwrap();
-        assert_eq!(loaded(&mut idx), [(".github/copilot-instructions.md".into(), "root rules".into())], "other instruction files are not read");
+        assert_eq!(
+            loaded(&mut idx),
+            [(".github/copilot-instructions.md".into(), "root rules".into())],
+            "other instruction files are not read"
+        );
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(".github/copilot-instructions.md", root.join("CLAUDE.md")).unwrap();

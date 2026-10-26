@@ -454,12 +454,16 @@ impl ToolCtx {
             return Ok((abs, rel));
         }
         let suffix = format!("/{rel}");
-        let hits: Vec<String> =
-            self.with_workspace(|w| w.index.files().filter(|f| f.rel.ends_with(&suffix)).take(6).map(|f| f.rel.clone()).collect()).unwrap_or_default();
+        let hits: Vec<String> = self
+            .with_workspace(|w| w.index.files().filter(|f| f.rel.ends_with(&suffix)).take(6).map(|f| f.rel.clone()).collect())
+            .unwrap_or_default();
         match hits.as_slice() {
             [one] => self.resolve(one),
             [] => Ok((abs, rel)),
-            many => Err(ToolError::new(ToolErrorKind::Ambiguous, format!("{rel} matches several files; use the full path: {}", many.join(", ")))),
+            many => Err(ToolError::new(
+                ToolErrorKind::Ambiguous,
+                format!("{rel} matches several files; use the full path: {}", many.join(", ")),
+            )),
         }
     }
 
@@ -549,7 +553,9 @@ pub const fn tool(
 
 pub fn registry() -> &'static [ToolDef] {
     static R: std::sync::OnceLock<Vec<ToolDef>> = std::sync::OnceLock::new();
-    R.get_or_init(|| [fs::tools(), search::tools(), edit::tools(), git::tools(), validate::tools(), web::tools()].into_iter().flatten().collect())
+    R.get_or_init(|| {
+        [fs::tools(), search::tools(), edit::tools(), git::tools(), validate::tools(), web::tools()].into_iter().flatten().collect()
+    })
 }
 
 pub fn find(name: &str) -> Option<&'static ToolDef> {

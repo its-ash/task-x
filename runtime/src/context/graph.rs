@@ -198,16 +198,25 @@ fn imports(rel: &str, content: &str, has: &impl Fn(&str) -> bool, go_dirs: &Hash
             static IMPORT: OnceLock<Regex> = OnceLock::new();
             let module = |base: &str, m: &str| {
                 let p = m.replace('.', "/");
-                let p = if p.is_empty() { base.to_owned() } else if base.is_empty() || base == "." { p } else { format!("{base}/{p}") };
+                let p = if p.is_empty() {
+                    base.to_owned()
+                } else if base.is_empty() || base == "." {
+                    p
+                } else {
+                    format!("{base}/{p}")
+                };
                 first(vec![format!("{p}.py"), format!("{p}/__init__.py"), format!("src/{p}.py"), format!("src/{p}/__init__.py")])
             };
             for c in re(&FROM, r"(?m)^\s*from\s+(\.*)([\w.]*)\s+import\s+([\w, ]+)").captures_iter(content) {
                 let dots = c[1].len();
-                let base = if dots == 0 { String::new() } else { (1..dots).try_fold(dir.to_owned(), |d, _| join(&d, "..")).unwrap_or_default() };
+                let base =
+                    if dots == 0 { String::new() } else { (1..dots).try_fold(dir.to_owned(), |d, _| join(&d, "..")).unwrap_or_default() };
                 match module(&base, &c[2]) {
                     // `from . import a, b` imports sibling modules.
                     Some(hit) if !c[2].is_empty() => out.push(hit),
-                    _ => out.extend(c[3].split(',').filter_map(|n| module(&base, format!("{}.{}", &c[2], n.trim()).trim_start_matches('.')))),
+                    _ => {
+                        out.extend(c[3].split(',').filter_map(|n| module(&base, format!("{}.{}", &c[2], n.trim()).trim_start_matches('.'))))
+                    }
                 }
             }
             for c in re(&IMPORT, r"(?m)^\s*import\s+([\w.]+)").captures_iter(content) {
@@ -218,7 +227,9 @@ fn imports(rel: &str, content: &str, has: &impl Fn(&str) -> bool, go_dirs: &Hash
             static GO: OnceLock<Regex> = OnceLock::new();
             for c in re(&GO, r#""([\w.\-/]+)""#).captures_iter(content.split(")\n").next().unwrap_or(content)) {
                 let spec = &c[1];
-                if let Some((_, f)) = go_dirs.iter().filter(|(d, _)| spec == d.as_str() || spec.ends_with(&format!("/{d}"))).max_by_key(|(d, _)| d.len()) {
+                if let Some((_, f)) =
+                    go_dirs.iter().filter(|(d, _)| spec == d.as_str() || spec.ends_with(&format!("/{d}"))).max_by_key(|(d, _)| d.len())
+                {
                     out.push(f.clone());
                 }
             }
@@ -237,7 +248,13 @@ impl ProjectGraph {
         let ids: HashMap<String, usize> = files.iter().enumerate().map(|(i, f)| (f.rel.clone(), i)).collect();
         let nodes = files
             .iter()
-            .map(|f| Node { path: f.rel.clone(), dir: dir_of(&f.rel).to_owned(), language: f.language, symbols: f.symbols.definitions.len(), size: f.size })
+            .map(|f| Node {
+                path: f.rel.clone(),
+                dir: dir_of(&f.rel).to_owned(),
+                language: f.language,
+                symbols: f.symbols.definitions.len(),
+                size: f.size,
+            })
             .collect();
         // Go: one representative (non-test) file per package directory.
         let mut go_dirs: HashMap<String, String> = HashMap::new();
@@ -275,10 +292,7 @@ impl ProjectGraph {
             out[e.from].push(k);
             inc[e.to].push(k);
         }
-        let mut g = Self { 
-            version: GRAPH_ENGINE_VERSION, 
-            nodes, edges, ids, out, inc, cycles: Vec::new(), build_ms: 0 
-        };
+        let mut g = Self { version: GRAPH_ENGINE_VERSION, nodes, edges, ids, out, inc, cycles: Vec::new(), build_ms: 0 };
         g.cycles = g.import_cycles();
         g.build_ms = started.elapsed().as_millis() as u64;
         g
@@ -353,7 +367,8 @@ impl ProjectGraph {
         let modules: HashSet<&str> = self.nodes.iter().map(|n| n.dir.as_str()).collect();
         let mut hubs: Vec<usize> = (0..self.nodes.len()).filter(|&v| self.in_degree(v) > 0).collect();
         hubs.sort_by_key(|&v| (std::cmp::Reverse(self.in_degree(v)), self.nodes[v].path.clone()));
-        let orphans = (0..self.nodes.len()).filter(|&v| self.out[v].is_empty() && self.inc[v].is_empty() && self.nodes[v].symbols > 0).count();
+        let orphans =
+            (0..self.nodes.len()).filter(|&v| self.out[v].is_empty() && self.inc[v].is_empty() && self.nodes[v].symbols > 0).count();
         json!({
             "files": self.nodes.len(),
             "edges": self.edges.len(),
@@ -493,7 +508,9 @@ impl ProjectGraph {
             .collect();
         let edges: Vec<Value> = weights
             .iter()
-            .filter_map(|(&(a, b), &(w, imp))| Some(json!({ "from": pos.get(&a)?, "to": pos.get(&b)?, "weight": w, "kind": if imp { "import" } else { "reference" } })))
+            .filter_map(|(&(a, b), &(w, imp))| {
+                Some(json!({ "from": pos.get(&a)?, "to": pos.get(&b)?, "weight": w, "kind": if imp { "import" } else { "reference" } }))
+            })
             .collect();
         json!({ "nodes": nodes, "edges": edges, "total": total, "stats": self.stats() })
     }
@@ -564,7 +581,10 @@ mod tests {
         let b = g.neighbors("b.ts").unwrap();
         assert_eq!(b["dependsOn"].as_array().unwrap().len(), 1);
         assert_eq!(b["dependsOn"][0]["symbols"], 1, "only render(), not the show() method");
-        assert!(g.neighbors("z.rs").unwrap()["dependsOn"].as_array().unwrap().is_empty(), "Host is ambiguous, helper() is private, render() is TypeScript");
+        assert!(
+            g.neighbors("z.rs").unwrap()["dependsOn"].as_array().unwrap().is_empty(),
+            "Host is ambiguous, helper() is private, render() is TypeScript"
+        );
         std::fs::remove_dir_all(&root).ok();
         let (g, root) = graph(&[
             ("src/a.rs", "pub fn alpha() { beta(); gamma(); }\n"),

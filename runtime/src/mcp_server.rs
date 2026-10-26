@@ -149,7 +149,11 @@ impl McpServer {
 
 /// Runs the server until stdin closes.
 pub async fn serve(root: PathBuf, tools: bool, approval: Option<(String, String)>) -> ExitCode {
-    let server = match tokio::task::spawn_blocking(move || McpServer::open(root, tools, approval)).await.map_err(|e| e.to_string()).and_then(|r| r) {
+    let server = match tokio::task::spawn_blocking(move || McpServer::open(root, tools, approval))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r)
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[task-x-runtime] mcp server: {e}");
@@ -186,7 +190,8 @@ mod tests {
     async fn serves_the_tool_registry_over_mcp() {
         let root = temp_repo(&[("src/app.ts", "export const color = 'red';\n"), (".env", "KEY=1\n")]);
         let s = McpServer::open(root.clone(), true, None).unwrap();
-        let init = rpc(&s, 1, "initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "t" } })).await;
+        let init =
+            rpc(&s, 1, "initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "t" } })).await;
         assert_eq!(init["result"]["serverInfo"]["name"], "task-x");
         assert!(s.handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await.is_none());
         let list = rpc(&s, 2, "tools/list", json!({})).await;
@@ -195,7 +200,13 @@ mod tests {
         // Reads must come before edits (stale-edit check), exactly as in the built-in agent.
         let read = rpc(&s, 3, "tools/call", json!({ "name": "read_file", "arguments": { "path": "src/app.ts" } })).await;
         assert_eq!(read["result"]["isError"], false);
-        let edit = rpc(&s, 4, "tools/call", json!({ "name": "replace_text", "arguments": { "path": "src/app.ts", "oldText": "red", "newText": "blue" } })).await;
+        let edit = rpc(
+            &s,
+            4,
+            "tools/call",
+            json!({ "name": "replace_text", "arguments": { "path": "src/app.ts", "oldText": "red", "newText": "blue" } }),
+        )
+        .await;
         assert_eq!(edit["result"]["isError"], false, "{edit}");
         assert_eq!(std::fs::read_to_string(root.join("src/app.ts")).unwrap(), "export const color = 'blue';\n");
         let secret = rpc(&s, 5, "tools/call", json!({ "name": "read_file", "arguments": { "path": ".env" } })).await;
@@ -209,7 +220,10 @@ mod tests {
         assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 1, "--no-tools serves only the approve tool");
         let denied = rpc(&only, 2, "tools/call", json!({ "name": "approve", "arguments": { "tool_name": "Bash", "input": {} } })).await;
         assert!(denied["result"]["content"][0]["text"].as_str().unwrap().contains("\"deny\""), "no runtime to ask counts as deny");
-        assert_eq!(rpc(&only, 3, "tools/call", json!({ "name": "read_file", "arguments": { "path": "src/app.ts" } })).await["result"]["isError"], true);
+        assert_eq!(
+            rpc(&only, 3, "tools/call", json!({ "name": "read_file", "arguments": { "path": "src/app.ts" } })).await["result"]["isError"],
+            true
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }

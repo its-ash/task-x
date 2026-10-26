@@ -168,12 +168,18 @@ fn web_fetch(ctx: &ToolCtx, input: serde_json::Value) -> ToolResult {
 
 /// GET with a size cap. Returns status, final URL, content type, body text, and whether the body was cut.
 async fn fetch(url: url::Url) -> Result<(u16, String, String, String, bool), ToolError> {
-    let fail = |e: reqwest::Error| ToolError::new(if e.is_timeout() { ToolErrorKind::Timeout } else { ToolErrorKind::Failed }, format!("fetch failed: {e}"));
+    let fail = |e: reqwest::Error| {
+        ToolError::new(if e.is_timeout() { ToolErrorKind::Timeout } else { ToolErrorKind::Failed }, format!("fetch failed: {e}"))
+    };
     let mut res = client()?.get(url).send().await.map_err(fail)?;
     let status = res.status().as_u16();
     let final_url = res.url().to_string();
-    let content_type = res.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
-    if ["image/", "audio/", "video/", "font/", "application/octet-stream", "application/zip", "application/pdf"].iter().any(|t| content_type.starts_with(t)) {
+    let content_type =
+        res.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_ascii_lowercase();
+    if ["image/", "audio/", "video/", "font/", "application/octet-stream", "application/zip", "application/pdf"]
+        .iter()
+        .any(|t| content_type.starts_with(t))
+    {
         return Err(ToolError::invalid(format!("{final_url} is {content_type}, not text")));
     }
     let mut buf = Vec::new();
@@ -189,8 +195,12 @@ async fn fetch(url: url::Url) -> Result<(u16, String, String, String, bool), Too
     Ok((status, final_url, content_type, String::from_utf8_lossy(&buf).into_owned(), cut))
 }
 
-static DROP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<(script|style|noscript|svg|template)\b.*?</(script|style|noscript|svg|template)\s*>|<!--.*?-->").expect("regex"));
-static BREAK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<(br|/p|/div|/li|/tr|/h[1-6]|/pre|/section|/article|/header|/footer|/table)\b[^>]*>").expect("regex"));
+static DROP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<(script|style|noscript|svg|template)\b.*?</(script|style|noscript|svg|template)\s*>|<!--.*?-->").expect("regex")
+});
+static BREAK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)<(br|/p|/div|/li|/tr|/h[1-6]|/pre|/section|/article|/header|/footer|/table)\b[^>]*>").expect("regex")
+});
 static TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]*>").expect("regex"));
 static SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t\r\f\v]+").expect("regex"));
 static BLANKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n\s*\n+").expect("regex"));
@@ -229,7 +239,9 @@ mod tests {
             assert_eq!(r.unwrap_err().kind, ToolErrorKind::InvalidInput);
         }
         let c2 = c.clone();
-        let r = tokio::task::spawn_blocking(move || run(&c2, "web_fetch", json!({ "url": "https://example.com", "format": "pdf" }))).await.unwrap();
+        let r = tokio::task::spawn_blocking(move || run(&c2, "web_fetch", json!({ "url": "https://example.com", "format": "pdf" })))
+            .await
+            .unwrap();
         assert_eq!(r.unwrap_err().kind, ToolErrorKind::InvalidInput);
     }
 

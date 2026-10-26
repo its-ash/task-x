@@ -149,7 +149,10 @@ pub fn extract(lang: Lang, source: &str) -> FileSymbols {
                 role = Some((false, kind, c.node));
             }
         }
-        let member = m.captures().iter().any(|c| names[c.index as usize] == "name" && c.node.parent().is_some_and(|p| MEMBER_PARENTS.contains(&p.kind())));
+        let member = m
+            .captures()
+            .iter()
+            .any(|c| names[c.index as usize] == "name" && c.node.parent().is_some_and(|p| MEMBER_PARENTS.contains(&p.kind())));
         let (Some(name), Some((is_def, kind, node))) = (name, role) else { continue };
         if name.is_empty() || name.len() > 200 {
             continue;

@@ -28,6 +28,9 @@ pub fn chat_request(cfg: &ResolvedConfig, req: &ChatRequest) -> HttpRequest {
                     ContentPart::ToolResult { tool_use_id, content, is_error, .. } => {
                         json!({ "type": "tool_result", "tool_use_id": tool_use_id, "content": content, "is_error": is_error })
                     }
+                    ContentPart::Image { media_type, data } => {
+                        json!({ "type": "image", "source": { "type": "base64", "media_type": media_type, "data": data } })
+                    }
                 })
                 .collect();
             json!({ "role": m.role, "content": content })
@@ -50,7 +53,17 @@ pub fn chat_request(cfg: &ResolvedConfig, req: &ChatRequest) -> HttpRequest {
 /// Context window in tokens: 1M for Claude 4.6 and later (Haiku 4.5: 200K), 200K for older models.
 pub fn context_window(model: &str) -> usize {
     let m = model.trim_start_matches("anthropic.");
-    let large = ["claude-fable", "claude-mythos", "claude-opus-5", "claude-sonnet-5", "claude-haiku-5", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-sonnet-4-6"];
+    let large = [
+        "claude-fable",
+        "claude-mythos",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-haiku-5",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+    ];
     if large.iter().any(|p| m.starts_with(p)) { 1_000_000 } else { 200_000 }
 }
 
@@ -206,6 +219,20 @@ mod tests {
         }
         .resolve()
         .unwrap()
+    }
+
+    #[test]
+    fn sends_attached_images_as_base64_blocks() {
+        let img = ContentPart::Image { media_type: "image/png".into(), data: "iVBORw0KGgo=".into() };
+        let req = ChatRequest {
+            messages: vec![Message { role: Role::User, content: vec![ContentPart::Text { text: "what is this".into() }, img] }],
+            ..Default::default()
+        };
+        let b = chat_request(&cfg(), &req).body.unwrap();
+        assert_eq!(
+            b["messages"][0]["content"][1],
+            json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=" } })
+        );
     }
 
     #[test]

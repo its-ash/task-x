@@ -282,7 +282,19 @@ struct ReplaceIn {
 }
 
 /// Fields a model may add to an edit; anything else is reported back as ignored.
-const EDIT_FIELDS: &[&str] = &["path", "file_path", "oldText", "old_text", "old_string", "newText", "new_text", "new_string", "expectedCount", "expected_count", "all"];
+const EDIT_FIELDS: &[&str] = &[
+    "path",
+    "file_path",
+    "oldText",
+    "old_text",
+    "old_string",
+    "newText",
+    "new_text",
+    "new_string",
+    "expectedCount",
+    "expected_count",
+    "all",
+];
 
 fn looks_like_edit(v: &Value) -> bool {
     v.as_object().is_some_and(|o| o.contains_key("path") || o.contains_key("oldText") || o.contains_key("old_text"))
@@ -340,9 +352,7 @@ fn normalize_edits(raw: Value) -> Result<Vec<Value>, ToolError> {
 /// Returns the raw edits value and the top-level keys nothing reads.
 fn take_edits(input: Value) -> Result<(Value, Vec<String>), ToolError> {
     let Value::Object(mut map) = input else {
-        return Err(ToolError::invalid(
-            "edit_files takes an object: {\"edits\": [{\"path\": ..., \"oldText\": ..., \"newText\": ...}]}",
-        ));
+        return Err(ToolError::invalid("edit_files takes an object: {\"edits\": [{\"path\": ..., \"oldText\": ..., \"newText\": ...}]}"));
     };
     if let Some(edits) = map.remove("edits") {
         return Ok((edits, map.keys().cloned().collect()));
@@ -423,7 +433,9 @@ fn replace_in(text: &str, rel: &str, i: &ReplaceIn, all: bool) -> Result<(String
     if !all && n != expected {
         return Err(ToolError::new(
             ToolErrorKind::Ambiguous,
-            format!("oldText matches {n} times in {rel} but expectedCount is {expected}; add surrounding lines to make it unique or set expectedCount"),
+            format!(
+                "oldText matches {n} times in {rel} but expectedCount is {expected}; add surrounding lines to make it unique or set expectedCount"
+            ),
         ));
     }
     Ok((text.replace(&i.old_text, &i.new_text), n))
@@ -611,10 +623,7 @@ fn transfer(c: &ToolCtx, input: Value, moving: bool) -> ToolResult {
     }
     let existing = std::fs::symlink_metadata(&to_abs).ok();
     if existing.is_some() && !i.overwrite {
-        return Err(ToolError::new(
-            ToolErrorKind::Conflict,
-            format!("{to_rel} already exists; pass overwrite: true to replace it"),
-        ));
+        return Err(ToolError::new(ToolErrorKind::Conflict, format!("{to_rel} already exists; pass overwrite: true to replace it")));
     }
     let result = match text_of(&from_abs) {
         Some(text) => {
@@ -795,12 +804,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(c.root.join("a.txt")).unwrap(), "1\n");
 
         // `edits` beside a stray key: the edit runs and the key is reported back.
-        let r = run(
-            &c,
-            "edit_files",
-            json!({ "edits": [{ "path": "b.txt", "oldText": "two", "newText": "2" }], "plan": "step 2" }),
-        )
-        .unwrap();
+        let r =
+            run(&c, "edit_files", json!({ "edits": [{ "path": "b.txt", "oldText": "two", "newText": "2" }], "plan": "step 2" })).unwrap();
         assert_eq!(r["replacements"], 1, "{r}");
         assert_eq!(r["ignoredFields"], json!(["plan"]), "the stray top-level key is named");
         assert_eq!(std::fs::read_to_string(c.root.join("b.txt")).unwrap(), "2\n");
@@ -872,7 +877,10 @@ mod tests {
         assert!(r["changed"][0]["diff"].as_str().unwrap().contains("-one\n+1\n"));
         let r = run(&c, "replace_text", json!({ "file_path": "a.txt", "old_string": "1\n", "new_string": "one\n" })).unwrap();
         assert_eq!(r["replacements"], 1);
-        assert!(run(&c, "replace_text", json!({ "file_path": "a.txt", "old_string": "one\n", "new_string": "1\n", "expected_count": 1 })).is_ok());
+        assert!(
+            run(&c, "replace_text", json!({ "file_path": "a.txt", "old_string": "one\n", "new_string": "1\n", "expected_count": 1 }))
+                .is_ok()
+        );
         let r = run(&c, "replace_all", json!({ "path": "a.txt", "oldText": "two", "newText": "2" })).unwrap();
         assert_eq!(r["replacements"], 2);
         assert_eq!(std::fs::read_to_string(c.root.join("a.txt")).unwrap(), "1\n2\n2\n");
@@ -903,7 +911,11 @@ mod tests {
         run(&c, "create_file", json!({ "path": "old.ts", "content": "new\n" })).unwrap();
         assert_eq!(std::fs::read_to_string(c.root.join("old.ts")).unwrap(), "new\n", "the same call works after the conflict");
         std::fs::write(c.root.join("old.ts"), "user edit\n").unwrap();
-        assert_eq!(run(&c, "create_file", json!({ "path": "old.ts", "content": "x\n" })).unwrap_err().kind, ToolErrorKind::Conflict, "a change by someone else needs a new look");
+        assert_eq!(
+            run(&c, "create_file", json!({ "path": "old.ts", "content": "x\n" })).unwrap_err().kind,
+            ToolErrorKind::Conflict,
+            "a change by someone else needs a new look"
+        );
         run(&c, "create_file", json!({ "path": "old.ts", "content": "x\n" })).unwrap();
         assert_eq!(std::fs::read_to_string(c.root.join("old.ts")).unwrap(), "x\n");
     }

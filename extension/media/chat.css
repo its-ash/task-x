@@ -268,6 +268,14 @@ button:disabled { opacity: .38; cursor: default; }
 .slash-empty { padding: 6px 8px; font-size: 12px; color: var(--muted); }
 #changes:not([hidden]) + #form { border-top-left-radius: 0; border-top-right-radius: 0; }
 #form:focus-within { border-color: var(--accent); }
+.attachments { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.attachments[hidden] { display: none; }
+.attachment { position: relative; width: 56px; height: 56px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.attachment img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.attachment .remove { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; min-width: 0; padding: 0; border-radius: 50%; color: var(--on-surface); background: var(--surface-highest); opacity: .9; }
+.attachment .remove .codicon { font-size: 12px; }
+.attach-hint { font-size: 11px; color: var(--muted); }
+.request-images { display: flex; align-items: center; gap: 4px; margin-top: 4px; font-size: 11px; color: var(--muted); }
 textarea { width: 100%; resize: none; min-height: 40px; max-height: 40vh; padding: 2px 4px; border: none; outline: none; font: inherit; line-height: 1.45; color: var(--on-surface); background: transparent; }
 textarea:focus-visible { outline: none; }
 textarea::placeholder { color: var(--on-surface-variant); }

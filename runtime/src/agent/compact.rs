@@ -51,6 +51,8 @@ pub fn estimate_tokens(system: &str, messages: &[Message]) -> usize {
                 ContentPart::Text { text } => text.len(),
                 ContentPart::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
                 ContentPart::ToolResult { content, .. } => content.len(),
+                // Providers bill an image at roughly 1600 tokens, whatever its base64 size.
+                ContentPart::Image { .. } => 1_600 * CHARS_PER_TOKEN,
             };
         }
     }

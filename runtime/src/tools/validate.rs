@@ -272,10 +272,7 @@ fn run_command(c: &ToolCtx, input: Value) -> ToolResult {
         return Err(ToolError::invalid("background is not available here; run the command without it"));
     }
     let command = i.command.into_vec()?;
-    if command.is_empty()
-        || command.len() > MAX_COMMAND_ARGS
-        || command.iter().any(|a| a.len() > MAX_COMMAND_ARG_LEN || a.contains('\0'))
-    {
+    if command.is_empty() || command.len() > MAX_COMMAND_ARGS || command.iter().any(|a| a.len() > MAX_COMMAND_ARG_LEN || a.contains('\0')) {
         return Err(ToolError::invalid(format!(
             "command must have 1..={MAX_COMMAND_ARGS} arguments of up to {MAX_COMMAND_ARG_LEN} characters"
         )));

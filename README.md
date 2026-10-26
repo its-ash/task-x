@@ -2,6 +2,33 @@
 
 task-x is a coding agent for VS Code that works with any model provider. A Rust runtime indexes the repository, builds context, runs tools, and drives the agent loop. A TypeScript extension gives the chat, approvals, diffs, and editor commands.
 
+## Install
+
+Download the extension from the [latest release](https://github.com/its-ash/task-x/releases/latest) and install it in VS Code.
+
+**With make** (from a clone of this repository):
+
+```sh
+make add    # download task-x.vsix from the latest release and install it
+```
+
+**By hand:**
+
+1. Download `task-x.vsix` from the [latest release](https://github.com/its-ash/task-x/releases/latest).
+2. Install it:
+   - In a terminal: `code --install-extension task-x.vsix`
+   - Or in VS Code: open the Extensions view, click **…** (Views and More Actions), select **Install from VSIX…**, and select the file.
+3. Reload the VS Code window.
+
+The `.vsix` holds a runtime built for the machine that published it (now macOS on Apple silicon). On another platform, build it from source (see [Quick start](#quick-start)).
+
+**To use it:**
+
+1. Open the **task-x** view in the activity bar.
+2. Click **Add provider…** in the model picker, or run **task-x: Add LLM Provider…**. Set the type, base URL, key, and model, then click **Test connection** and **Save and use**. Or sign in with Anthropic to use Claude Code (`claude auth login`).
+3. Type a request and press Enter. To show the agent a screenshot or a design, paste the image into the input, drop it on the input, or click the image button.
+4. Review the changed files in the panel above the input: open the diff, then click **Keep** or **Undo**.
+
 ## Features
 
 ### Chat
@@ -18,6 +45,7 @@ task-x is a coding agent for VS Code that works with any model provider. A Rust 
 - **Model picker:** search, provider tabs, and a *Recent* list of the last five models you used.
 - **Streaming Markdown** with syntax highlighting, copy buttons, and a tool timeline. Command output can be copied or opened in an editor.
 - **Input:** `@path` mentions for files and folders, `/` for skills, file and selection chips for the active editor (toggle whether they are sent), and queued messages while a task runs.
+- **Images:** paste, drop, or attach PNG, JPEG, GIF, or WebP images (up to 8, 5 MB each). They go to the model with the message: Anthropic, OpenAI, and OpenAI-compatible endpoints, Ollama vision models, and Claude Code. The model must support images.
 - **Task history** per workspace; stop a running task, or continue it when it reaches the turn limit.
 - **Context meter** and automatic compression for long tasks.
 - **Busy indicator:** an animated border runs around the input while the agent works.
@@ -54,6 +82,7 @@ task-x is a coding agent for VS Code that works with any model provider. A Rust 
 
 - **Skills** from `.github/skills`, `.claude/skills`, and `~/.claude/skills`, invoked with `/name`.
 - **Hooks** (`task-x.hooks`) and **MCP servers** (`task-x.mcpServers`). Check MCP status with `task-x.mcpStatus`.
+- **MCP servers from Claude and Copilot:** task-x also starts the servers you set up in Claude Desktop, Claude Code (`~/.claude.json`, `.mcp.json`), GitHub Copilot in VS Code (`mcp.json`, `.vscode/mcp.json`), and the Copilot CLI, such as Figma and Chrome DevTools. Local (stdio) and remote (HTTP and SSE) servers work. Choose the sources with `task-x.mcp.import`. Remote servers that need a browser sign-in (OAuth) need an `Authorization` header in `task-x.mcpServers` instead.
 
 ### Editor commands
 
@@ -110,14 +139,19 @@ In the development window:
 3. Choose **Ask**, **Plan**, or **Agent** next to the input and send a request.
 4. Review the changed files in the panel above the input: open the diff, then **Keep** or **Undo**.
 
-## Build, test, package
+## Build, test, package, release
 
 ```sh
 make build                                        # release runtime → extension/bin, compile extension
 cargo test --manifest-path runtime/Cargo.toml     # Rust unit, protocol, and performance tests
 npm --prefix extension test                       # client and end-to-end tests against the built runtime
 npm --prefix extension run package                # build a .vsix (bundles the runtime in extension/bin)
+make install                                      # build the .vsix and install it into VS Code
+make deploy                                       # build, push main, and publish the .vsix on GitHub
+make add                                          # install the .vsix of the latest GitHub release
 ```
+
+`make deploy` needs the GitHub CLI (`gh auth login`). It publishes `task-x-<version>.vsix` and `task-x.vsix` on the release `v<version>`, where the version comes from `extension/package.json`. If that release exists, its files are replaced. To publish a new version, increase `version` first.
 
 The tests use mock providers and local git repositories. They do not need API keys or network access.
 

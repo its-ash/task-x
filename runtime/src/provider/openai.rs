@@ -47,7 +47,21 @@ fn messages(req: &ChatRequest) -> Vec<Value> {
                 out.push(json!({ "role": "tool", "tool_call_id": tool_use_id, "content": content }));
             }
         }
-        if calls.is_empty() && !text.is_empty() {
+        let images: Vec<Value> = m
+            .content
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Image { media_type, data } => {
+                    Some(json!({ "type": "image_url", "image_url": { "url": format!("data:{media_type};base64,{data}") } }))
+                }
+                _ => None,
+            })
+            .collect();
+        if calls.is_empty() && !images.is_empty() {
+            let mut parts = if text.is_empty() { Vec::new() } else { vec![json!({ "type": "text", "text": text })] };
+            parts.extend(images);
+            out.push(json!({ "role": m.role, "content": parts }));
+        } else if calls.is_empty() && !text.is_empty() {
             out.push(json!({ "role": m.role, "content": text }));
         }
     }
@@ -295,6 +309,19 @@ mod tests {
         ProviderConfig { kind, model: "m".into(), base_url: base.map(Into::into), api_key: Some("k".into()), timeout_ms: None }
             .resolve()
             .unwrap()
+    }
+
+    #[test]
+    fn sends_attached_images_as_data_urls() {
+        let img = ContentPart::Image { media_type: "image/jpeg".into(), data: "/9j/".into() };
+        let req = ChatRequest {
+            messages: vec![Message { role: Role::User, content: vec![ContentPart::Text { text: "q".into() }, img] }],
+            ..Default::default()
+        };
+        let b = chat_request(&cfg(ProviderKind::OpenAi, None), &req).body.unwrap();
+        let parts = &b["messages"][0]["content"];
+        assert_eq!(parts[0], json!({ "type": "text", "text": "q" }));
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/jpeg;base64,/9j/");
     }
 
     #[test]
