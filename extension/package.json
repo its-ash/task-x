@@ -131,6 +131,11 @@
         "category": "task-x"
       },
       {
+        "command": "task-x.openBrowser",
+        "title": "Start Browser with Debug Port",
+        "category": "task-x"
+      },
+      {
         "command": "task-x.inspectContext",
         "title": "Inspect Workspace Context",
         "category": "task-x"
@@ -520,6 +525,12 @@
           "default": "",
           "scope": "machine",
           "description": "Absolute path to the task-x-runtime binary. Empty uses the bundled or locally built runtime."
+        },
+        "task-x.cdpEndpoint": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "DevTools endpoint of the browser the agent drives (browser tool). Default http://127.0.0.1:9222. Start Chrome or Edge with --remote-debugging-port=9222, or run task-x: Start Browser with Debug Port. Must be http on localhost."
         },
         "task-x.mcpServers": {
           "type": "object",

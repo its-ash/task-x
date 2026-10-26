@@ -7,9 +7,11 @@ VSIX = $(EXT)/task-x-$(VERSION).vsix
 # GitHub repository for releases, and the stable asset name `make add` downloads.
 REPO ?= its-ash/task-x
 ASSET := task-x.vsix
-# The `code` CLI itself calls Node's legacy `url.parse()`, which prints DEP0169 on every install.
-# Silence only that warning, not all of them (Node 21+).
-NODE_NO_DEP0169 = NODE_OPTIONS="--disable-warning=DEP0169"
+# VS Code's own `code` CLI prints Node's DEP0169 warning (its `url.parse()` call, not our code).
+# Its wrapper moves NODE_OPTIONS to VSCODE_NODE_OPTIONS, which cli.js never reads, so the flag
+# cannot disable the warning. Each install step captures the CLI's output, drops exactly those two
+# lines, and passes the CLI's own exit code through (a pipe would report grep's status instead).
+CODE_FILTER = grep -vE '^\(node:[0-9]+\) \[DEP0169\]|^\(Use `Code --trace-deprecation'
 
 .PHONY: run build deploy install add
 
@@ -34,7 +36,7 @@ install: build
 	rm -f $(EXT)/*.vsix
 	npm --prefix $(EXT) run package
 	@$(CODE) --uninstall-extension its-ash.anvil-agent >/dev/null 2>&1 || true
-	$(NODE_NO_DEP0169) $(CODE) --install-extension $(VSIX) --force
+	@mk_cdp=$$(mktemp); $(CODE) --install-extension $(VSIX) --force > "$$mk_cdp" 2>&1; status=$$?; $(CODE_FILTER) "$$mk_cdp" >&2 || true; rm -f "$$mk_cdp"; [ $$status -eq 0 ] || exit $$status
 	@echo "Installed $(VSIX). Reload VS Code windows to use it."
 
 # Builds the .vsix, pushes main, and publishes the .vsix on the GitHub release v<version>
@@ -66,5 +68,7 @@ add:
 		curl -fSL --progress-bar -o "$$tmp/$(ASSET)" "https://github.com/$(REPO)/releases/latest/download/$(ASSET)"; \
 	fi; \
 	$(CODE) --uninstall-extension its-ash.anvil-agent >/dev/null 2>&1 || true; \
-	$(NODE_NO_DEP0169) $(CODE) --install-extension "$$tmp/$(ASSET)" --force; \
+	mk_cdp=$$(mktemp); { $(CODE) --install-extension "$$tmp/$(ASSET)" --force > "$$mk_cdp" 2>&1; }; status=$$?; \
+	$(CODE_FILTER) "$$mk_cdp" >&2 || true; rm -f "$$mk_cdp" || true; \
+	[ $$status -eq 0 ] || exit $$status; \
 	echo "Installed task-x. Reload VS Code windows to use it."

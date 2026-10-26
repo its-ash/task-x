@@ -9,7 +9,7 @@ const INIT_TIMEOUT_MS = 10_000;
 const SHUTDOWN_TIMEOUT_MS = 3_000;
 // Only these variables reach the runtime; it needs network/proxy/locale settings, not the full host env.
 // USER and LOGNAME let the claude CLI find its login in the macOS Keychain.
-export const ENV_ALLOWLIST = ['PATH', 'HOME', 'USER', 'LOGNAME', 'CLAUDE_CONFIG_DIR', 'XDG_CONFIG_HOME', 'USERPROFILE', 'SYSTEMROOT', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'ANVIL_LOG'];
+export const ENV_ALLOWLIST = ['PATH', 'HOME', 'USER', 'LOGNAME', 'CLAUDE_CONFIG_DIR', 'XDG_CONFIG_HOME', 'USERPROFILE', 'SYSTEMROOT', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'ANVIL_LOG', 'TASK_X_CDP_ENDPOINT'];
 
 export const runtimeEnv = (): NodeJS.ProcessEnv => Object.fromEntries(ENV_ALLOWLIST.flatMap((k) => (process.env[k] !== undefined ? [[k, process.env[k]!]] : [])));
 
@@ -59,9 +59,11 @@ export class RuntimeProcess {
 
   static async start(
     binary: string,
-    opts: { clientVersion: string; dataDir?: string; sandbox?: boolean; log: (line: string) => void; onExit: (code: number | null, signal: NodeJS.Signals | null) => void },
+    opts: { clientVersion: string; dataDir?: string; sandbox?: boolean; cdpEndpoint?: string; log: (line: string) => void; onExit: (code: number | null, signal: NodeJS.Signals | null) => void },
   ): Promise<{ runtime: RuntimeProcess; info: InitializeResult }> {
     const env = runtimeEnv();
+    // The browser tool's DevTools endpoint: the setting wins over the host environment.
+    if (opts.cdpEndpoint?.trim()) env.TASK_X_CDP_ENDPOINT = opts.cdpEndpoint.trim();
     const child = spawn(binary, [], { stdio: ['pipe', 'pipe', 'pipe'], env, windowsHide: true });
     await new Promise<void>((resolve, reject) => {
       child.once('spawn', resolve);

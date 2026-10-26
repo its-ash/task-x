@@ -151,6 +151,7 @@ export function settings() {
     maxTokens: num('maxTokens', DEFAULT_MAX_TOKENS),
     systemPrompt: c.get<string>('systemPrompt', '').trim(),
     runtimePath: c.get<string>('runtimePath', ''),
+    cdpEndpoint: c.get<string>('cdpEndpoint', '')
   };
 }
 

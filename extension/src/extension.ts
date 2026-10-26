@@ -13,6 +13,7 @@ import { ProviderDialog } from './providerDialog.js';
 import type { TestReport } from './protocol.js';
 import type { JsonRpcClient } from './rpc.js';
 import { RuntimeProcess, findRuntime } from './runtime.js';
+import { DEFAULT_CDP_ENDPOINT, findBrowser, launchBrowser, normalizeCdpEndpoint } from './browserBridge.js';
 import { WorkspaceSync, renderRetrieval, renderSummary } from './workspace.js';
 
 let runtime: RuntimeProcess | undefined;
@@ -77,6 +78,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         dataDir: ctx.globalStorageUri.fsPath,
         // Commands always run in the OS sandbox: writes stay inside the workspace.
         sandbox: true,
+        cdpEndpoint: settings().cdpEndpoint || process.env.TASK_X_CDP_ENDPOINT,
         log: (l) => {
           raw.info(l);
           logs.add(levelOf(l), 'runtime', l);
@@ -365,6 +367,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('task-x.undoLast', () => chat.undoLast()),
     ...registerEditorCommands(chat, client),
     vscode.commands.registerCommand('task-x.restartRuntime', restartRuntime),
+    vscode.commands.registerCommand('task-x.openBrowser', async () => {
+      // The agent's browser tool drives a Chrome/Edge over CDP. This starts one with a debug port;
+      // the endpoint then comes through the environment to the runtime (config.ts exposes it).
+      const configured = normalizeCdpEndpoint(settings().cdpEndpoint || DEFAULT_CDP_ENDPOINT);
+      const port = Number(new URL(configured).port) || 9222;
+      const chrome = findBrowser({ existsSync: (p) => require('node:fs').existsSync(p) });
+      if (!chrome) throw new Error('No Chrome, Edge, or Chromium found. Install one, or start it yourself with --remote-debugging-port.');
+      launchBrowser(chrome, port);
+      void vscode.window.showInformationMessage(`task-x: browser started with a debugging port on ${configured}`);
+    }),
     bg,
     findings,
     vscode.commands.registerCommand('task-x.runInBackground', () => bg.start()),
