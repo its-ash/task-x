@@ -59,11 +59,24 @@ export class RuntimeProcess {
 
   static async start(
     binary: string,
-    opts: { clientVersion: string; dataDir?: string; sandbox?: boolean; cdpEndpoint?: string; log: (line: string) => void; onExit: (code: number | null, signal: NodeJS.Signals | null) => void },
+    opts: {
+      clientVersion: string;
+      dataDir?: string;
+      sandbox?: boolean;
+      cdpEndpoint?: string;
+      vscodeBrowser?: { url: string; token: string };
+      log: (line: string) => void;
+      onExit: (code: number | null, signal: NodeJS.Signals | null) => void;
+    },
   ): Promise<{ runtime: RuntimeProcess; info: InitializeResult }> {
     const env = runtimeEnv();
     // The browser tool's DevTools endpoint: the setting wins over the host environment.
     if (opts.cdpEndpoint?.trim()) env.TASK_X_CDP_ENDPOINT = opts.cdpEndpoint.trim();
+    // Without a DevTools endpoint, the browser tool drives VS Code's integrated browser through this bridge.
+    if (opts.vscodeBrowser) {
+      env.TASK_X_VSCODE_BROWSER = opts.vscodeBrowser.url;
+      env.TASK_X_VSCODE_BROWSER_TOKEN = opts.vscodeBrowser.token;
+    }
     const child = spawn(binary, [], { stdio: ['pipe', 'pipe', 'pipe'], env, windowsHide: true });
     await new Promise<void>((resolve, reject) => {
       child.once('spawn', resolve);

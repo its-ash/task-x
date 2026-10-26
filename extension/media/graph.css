@@ -11,7 +11,7 @@ button { font: inherit; color: inherit; background: none; border: none; cursor: 
 .brand h1 { margin: 0; font-size: 1.2em; font-weight: 600; letter-spacing: -.01em; }
 .brand p { margin: 2px 0 0; font-size: 12px; }
 .logo { flex: none; width: 36px; height: 36px; border-radius: 12px; color: var(--md-sys-color-on-primary-container); background: var(--md-sys-color-primary-container); display: grid; place-items: center; }
-.logo::before { content: ""; width: 20px; height: 20px; background: currentColor; mask: url("logo.svg") center / contain no-repeat; }
+.logo::before { content: ""; width: 20px; height: 20px; background: currentColor; mask: url("logo-mono.svg") center / contain no-repeat; }
 .controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 
 .tabs { position: relative; display: grid; grid-template-columns: repeat(var(--n, 2), minmax(0, 1fr)); padding: 3px; border-radius: 999px; background: var(--surface-highest); }

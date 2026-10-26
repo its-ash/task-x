@@ -1,8 +1,16 @@
 //! Browser automation over the Chrome DevTools Protocol (CDP).
 //!
-//! task-x drives a browser the user already has open, through its DevTools endpoint. A VS Code
-//! *Simple Browser* view is a webview and publishes no DevTools protocol, so the browser must be a
-//! real Chrome or Edge started with a remote debugging port (`--remote-debugging-port=9222`).
+//! task-x drives a browser the user already has open, through its DevTools endpoint: a Chrome or
+//! Edge started with `--remote-debugging-port=9222`, or VS Code itself started with the same flag.
+//! In VS Code the page inside a *Simple Browser* view is an out-of-process iframe, so it is listed
+//! as an `iframe` target and is driven like a tab. VS Code's own UI (the workbench and the webview
+//! hosts, `vscode-file:` and `vscode-webview:` URLs) is never offered as a target.
+//!
+//! Under the VS Code extension there is a second way in, which needs no restart and no debug port:
+//! the extension serves a loopback bridge (`TASK_X_VSCODE_BROWSER`, with a bearer token in
+//! `TASK_X_VSCODE_BROWSER_TOKEN`) that calls VS Code's own integrated-browser tools
+//! (`open_browser_page`, `read_page`, `click_element`, ...). It is used unless `TASK_X_CDP_ENDPOINT`
+//! is set.
 //!
 //! The endpoint is the one place where reaching loopback is required, so it is checked by its own
 //! rule: only a local http endpoint is accepted. `web_fetch` keeps refusing loopback.
@@ -13,15 +21,26 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::net::IpAddr;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:9222";
 const ENV_ENDPOINT: &str = "TASK_X_CDP_ENDPOINT";
+const VSCODE_ENV: &str = "TASK_X_VSCODE_BROWSER";
+const VSCODE_TOKEN_ENV: &str = "TASK_X_VSCODE_BROWSER_TOKEN";
+/// VS Code may ask the user before a page opens, so a bridge call can wait on a person.
+const VSCODE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The VS Code page the last call used: the default target when the model names none.
+static LAST_PAGE: Mutex<Option<String>> = Mutex::new(None);
 const CDP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_WAIT_MS: u64 = 5_000;
 const MAX_WAIT_MS: u64 = 30_000;
 const POLL: Duration = Duration::from_millis(100);
+/// URL schemes of VS Code's and the browser's own UI. Targets with these URLs are never driven.
+const INTERNAL_SCHEMES: &[&str] = &["vscode-file", "vscode-webview", "vscode", "devtools"];
+const START_HINT: &str = "Open Chrome or Edge with --remote-debugging-port=9222, or quit VS Code and start it with \
+     `code --remote-debugging-port=9222` to drive its Simple Browser, or set TASK_X_CDP_ENDPOINT.";
 
 const ACTIONS: &[&str] =
     &["tabs", "open", "goto", "click", "type", "press", "screenshot", "text", "html", "eval", "wait", "back", "forward", "close"];
@@ -29,7 +48,7 @@ const ACTIONS: &[&str] =
 pub fn tools() -> Vec<ToolDef> {
     vec![tool(
         "browser",
-        "Drive the browser the user has open, over the Chrome DevTools Protocol: list tabs (tabs), open a page (open), navigate (goto), click a CSS selector (click), type into a selector (type), press a key (press), read the visible text (text) or the HTML (html), take a screenshot (screenshot), run JavaScript in the page (eval), wait for a selector (wait), go back or forward (back, forward), and close the tab (close). Requires a Chrome or Edge started with --remote-debugging-port (a VS Code Simple Browser view cannot be driven).",
+        "Drive the browser the user has open, over the Chrome DevTools Protocol: list tabs (tabs), open a page (open), navigate (goto), click a CSS selector (click), type into a selector (type), press a key (press), read the visible text (text) or the HTML (html), take a screenshot (screenshot), run JavaScript in the page (eval), wait for a selector (wait), go back or forward (back, forward), and close the tab (close). Inside VS Code it drives VS Code's integrated browser (open puts the page in an editor tab; the target is the page id open returns; text returns an accessibility snapshot; close is not available). Outside VS Code it needs a Chrome or Edge started with --remote-debugging-port.",
         Permission::Network,
         || {
             object(
@@ -80,7 +99,7 @@ fn endpoint() -> Result<url::Url, ToolError> {
 
 /// The DevTools endpoint must be local http: that is what makes it the browser on this machine.
 fn check_endpoint(url: &url::Url) -> Result<(), ToolError> {
-    const HINT: &str = "start Chrome or Edge with --remote-debugging-port=9222 and set TASK_X_CDP_ENDPOINT to its local address";
+    const HINT: &str = "start Chrome, Edge, or VS Code with --remote-debugging-port=9222 and set TASK_X_CDP_ENDPOINT to its local address";
     if url.scheme() != "http" {
         return Err(ToolError::invalid(format!("the browser endpoint must be http, not {}; {HINT}", url.scheme())));
     }
@@ -116,10 +135,7 @@ fn http() -> Result<reqwest::Client, ToolError> {
 fn unreachable(e: &reqwest::Error) -> ToolError {
     ToolError::new(
         ToolErrorKind::Failed,
-        format!(
-            "no browser answered at the DevTools endpoint ({e}). Open Chrome or Edge with --remote-debugging-port=9222, \
-             or set {ENV_ENDPOINT}. A VS Code Simple Browser view is a webview and cannot be driven."
-        ),
+        format!("no browser answered at the DevTools endpoint ({e}). {START_HINT}"),
     )
 }
 
@@ -130,17 +146,39 @@ async fn targets(base: &url::Url) -> Result<Vec<Target>, ToolError> {
     res.json::<Vec<Target>>().await.map_err(|e| ToolError::new(ToolErrorKind::Failed, format!("the endpoint did not list targets: {e}")))
 }
 
+fn is_internal(url: &str) -> bool {
+    url.split_once(':').is_some_and(|(s, _)| INTERNAL_SCHEMES.contains(&s.to_ascii_lowercase().as_str()))
+}
+
+/// A page the agent may drive: a tab, or a page embedded in a view (a VS Code Simple Browser).
 fn is_page(t: &Target) -> bool {
-    t.kind == "page"
+    matches!(t.kind.as_str(), "page" | "iframe" | "webview") && !is_internal(&t.url)
+}
+
+/// A page inside another page's view, not a tab of its own.
+fn is_embedded(t: &Target) -> bool {
+    t.kind != "page"
+}
+
+/// Drivable pages, tabs first, so a Chrome tab is still the default ahead of its iframes.
+async fn pages(base: &url::Url) -> Result<Vec<Target>, ToolError> {
+    let mut pages: Vec<Target> = targets(base).await?.into_iter().filter(is_page).collect();
+    pages.sort_by_key(is_embedded);
+    Ok(pages)
 }
 
 async fn pick_target(base: &url::Url, wanted: Option<&str>) -> Result<Target, ToolError> {
-    let pages: Vec<Target> = targets(base).await?.into_iter().filter(is_page).collect();
+    let pages = pages(base).await?;
     let Some(wanted) = wanted else {
         return pages
             .into_iter()
             .next()
-            .ok_or_else(|| ToolError::new(ToolErrorKind::NotFound, "the browser has no page tab open; use the open action to start one"));
+            .ok_or_else(|| {
+                ToolError::new(
+                    ToolErrorKind::NotFound,
+                    "the browser has no page open; use the open action, or in VS Code open a Simple Browser view (command Simple Browser: Show)",
+                )
+            });
     };
     pages
         .iter()
@@ -238,6 +276,26 @@ fn center_expr(selector: &str) -> String {
     )
 }
 
+/// A JavaScript expression that clicks one element, for views that refuse synthetic input.
+fn click_expr(selector: &str) -> String {
+    format!("(() => {{ const e = document.querySelector({sel}); if (!e) return false; e.click(); return true; }})()", sel = json!(selector))
+}
+
+/// A JavaScript expression that inserts text at the focus, for views that refuse synthetic input.
+fn insert_expr(text: &str) -> String {
+    format!("document.execCommand('insertText', false, {t})", t = json!(text))
+}
+
+/// A JavaScript expression that sends one key to the focused element; Enter submits its form.
+fn key_expr(key: &str) -> String {
+    format!(
+        "((k) => {{ const e = document.activeElement || document.body; \
+         for (const t of ['keydown', 'keyup']) e.dispatchEvent(new KeyboardEvent(t, {{ key: k, bubbles: true, cancelable: true }})); \
+         if (k === 'Enter' && e.form) e.form.requestSubmit(); return true; }})({k})",
+        k = json!(key)
+    )
+}
+
 /// A JavaScript expression that focuses one element, or reports it missing.
 fn focus_expr(selector: &str) -> String {
     format!("(() => {{ const e = document.querySelector({sel}); if (!e) return false; e.focus(); return true; }})()", sel = json!(selector))
@@ -305,14 +363,23 @@ fn browser(ctx: &ToolCtx, input: Value) -> ToolResult {
 }
 
 async fn run(p: &BrowserInput) -> ToolResult {
-    let base = endpoint()?;
     let action = p.action.as_str();
     let timeout = Duration::from_millis(p.timeout_ms.unwrap_or(DEFAULT_WAIT_MS).min(MAX_WAIT_MS));
+    // An explicit DevTools endpoint wins; otherwise VS Code's own browser, when the extension serves it.
+    if std::env::var(ENV_ENDPOINT).map_or(true, |s| s.trim().is_empty()) {
+        if let Some(bridge) = Bridge::from_env() {
+            return run_vscode(p, &bridge, timeout).await;
+        }
+    }
+    let base = endpoint()?;
 
     // `tabs` needs no page session: it is how the model finds a target id.
     if action == "tabs" {
-        let tabs: Vec<Value> =
-            targets(&base).await?.into_iter().filter(is_page).map(|t| json!({ "id": t.id, "url": t.url, "title": t.title })).collect();
+        let tabs: Vec<Value> = pages(&base)
+            .await?
+            .into_iter()
+            .map(|t| json!({ "id": t.id, "url": t.url, "title": t.title, "embedded": is_embedded(&t) }))
+            .collect();
         return Ok(json!({ "tabs": tabs, "count": tabs.len(), "endpoint": base.as_str() }));
     }
 
@@ -324,6 +391,9 @@ async fn run(p: &BrowserInput) -> ToolResult {
 
     let target = pick_target(&base, p.target.as_deref()).await?;
     if action == "close" {
+        if is_embedded(&target) {
+            return Err(ToolError::invalid("this page is inside a view (a VS Code Simple Browser); close the view in VS Code"));
+        }
         let id = target.id;
         let url = base.join(&format!("json/close/{id}")).map_err(|e| ToolError::invalid(format!("bad endpoint: {e}")))?;
         http()?.get(url).send().await.map_err(|e| unreachable(&e))?;
@@ -355,7 +425,11 @@ async fn run(p: &BrowserInput) -> ToolResult {
             if cdp.eval(&focus_expr(selector)).await.unwrap_or(Value::Bool(false)) != Value::Bool(true) {
                 return Err(ToolError::new(ToolErrorKind::NotFound, format!("no element matches {selector}")));
             }
-            cdp.call("Input.insertText", json!({ "text": text })).await?;
+            if let Err(e) = cdp.call("Input.insertText", json!({ "text": text })).await {
+                if cdp.eval(&insert_expr(text)).await? != Value::Bool(true) {
+                    return Err(e);
+                }
+            }
             Ok(json!({ "typed": text.chars().count(), "into": selector }))
         }
         "press" => {
@@ -364,7 +438,16 @@ async fn run(p: &BrowserInput) -> ToolResult {
             Ok(json!({ "pressed": key }))
         }
         "screenshot" => {
-            let r = cdp.call("Page.captureScreenshot", json!({ "format": "png" })).await?;
+            let r = cdp.call("Page.captureScreenshot", json!({ "format": "png" })).await.map_err(|e| {
+                if is_embedded(&target) {
+                    ToolError::new(
+                        ToolErrorKind::Failed,
+                        format!("{}; this page is inside a view (a VS Code Simple Browser), use text or html instead", e.message),
+                    )
+                } else {
+                    e
+                }
+            })?;
             let data = r["data"].as_str().unwrap_or_default();
             Ok(
                 json!({ "format": "png", "base64": data, "bytes": data.len() * 3 / 4, "url": cdp.eval("location.href").await.unwrap_or(Value::Null) }),
@@ -400,6 +483,135 @@ async fn run(p: &BrowserInput) -> ToolResult {
     }
 }
 
+/// Environment the MCP server child needs to reach the same browser as this runtime.
+pub fn bridge_env() -> Vec<(&'static str, String)> {
+    [VSCODE_ENV, VSCODE_TOKEN_ENV, ENV_ENDPOINT]
+        .into_iter()
+        .filter_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()).map(|v| (k, v)))
+        .collect()
+}
+
+/// The extension's loopback bridge to VS Code's integrated-browser tools.
+struct Bridge {
+    url: url::Url,
+    token: String,
+}
+
+impl Bridge {
+    fn from_env() -> Option<Self> {
+        let url = url::Url::parse(std::env::var(VSCODE_ENV).ok()?.trim()).ok().filter(|u| check_endpoint(u).is_ok())?;
+        let token = std::env::var(VSCODE_TOKEN_ENV).ok().filter(|t| !t.is_empty())?;
+        Some(Self { url, token })
+    }
+
+    /// Calls one VS Code browser tool and returns its content parts.
+    async fn call(&self, tool: &str, input: Value) -> Result<Vec<Value>, ToolError> {
+        let url = self.url.join("invoke").map_err(|e| ToolError::invalid(format!("bad {VSCODE_ENV}: {e}")))?;
+        let client = reqwest::Client::builder()
+            .timeout(VSCODE_TIMEOUT)
+            .build()
+            .map_err(|e| ToolError::new(ToolErrorKind::Failed, format!("could not create an HTTP client: {e}")))?;
+        let res = client.post(url).bearer_auth(&self.token).json(&json!({ "tool": tool, "input": input })).send().await.map_err(|e| {
+            ToolError::new(ToolErrorKind::Failed, format!("VS Code's browser bridge did not answer ({e}); reload the VS Code window"))
+        })?;
+        let status = res.status();
+        let body: Value = res
+            .json()
+            .await
+            .map_err(|e| ToolError::new(ToolErrorKind::Failed, format!("VS Code's browser bridge sent no JSON ({status}): {e}")))?;
+        if let Some(err) = body["error"].as_str() {
+            return Err(ToolError::new(ToolErrorKind::Failed, format!("{tool}: {err}")));
+        }
+        Ok(body["content"].as_array().cloned().unwrap_or_default())
+    }
+}
+
+fn text_of(parts: &[Value]) -> String {
+    parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("")
+}
+
+/// The page id in an `open_browser_page` result (`Page ID: <id>`).
+fn page_id_of(text: &str) -> Option<String> {
+    text.lines().find_map(|l| l.trim().strip_prefix("Page ID:")).map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
+fn remember(page: &str) {
+    if let Ok(mut last) = LAST_PAGE.lock() {
+        *last = Some(page.to_owned());
+    }
+}
+
+/// The VS Code tool and input for one page action.
+fn vscode_call(p: &BrowserInput, page: &str, timeout: Duration) -> Result<(&'static str, Value), ToolError> {
+    let action = p.action.as_str();
+    let ms = timeout.as_millis() as u64;
+    Ok(match action {
+        "goto" => {
+            let url = required(&p.url, "url", action)?;
+            check_page_url(url)?;
+            ("navigate_page", json!({ "pageId": page, "type": "url", "url": url }))
+        }
+        "back" | "forward" => ("navigate_page", json!({ "pageId": page, "type": action })),
+        "text" => ("read_page", json!({ "pageId": page })),
+        "html" => ("run_playwright_code", json!({ "pageId": page, "code": "return await page.content()", "timeoutMs": ms })),
+        "eval" => {
+            let script = required(&p.script, "script", action)?;
+            ("run_playwright_code", json!({ "pageId": page, "code": format!("return await page.evaluate({})", json!(script)), "timeoutMs": ms }))
+        }
+        "wait" => {
+            let sel = required(&p.selector, "selector", action)?;
+            let code = format!("await page.waitForSelector({}, {{ timeout: {ms} }}); return true", json!(sel));
+            ("run_playwright_code", json!({ "pageId": page, "code": code, "timeoutMs": ms + 1_000 }))
+        }
+        "click" => {
+            let sel = required(&p.selector, "selector", action)?;
+            ("click_element", json!({ "pageId": page, "selector": sel, "element": sel }))
+        }
+        "type" => {
+            let sel = required(&p.selector, "selector", action)?;
+            let text = p.text.as_deref().unwrap_or_default();
+            ("type_in_page", json!({ "pageId": page, "selector": sel, "element": sel, "text": text }))
+        }
+        "press" => ("type_in_page", json!({ "pageId": page, "key": key_definition(required(&p.key, "key", action)?).1 })),
+        "screenshot" => ("screenshot_page", json!({ "pageId": page })),
+        other => return Err(ToolError::invalid(format!("unsupported browser action '{other}'"))),
+    })
+}
+
+async fn run_vscode(p: &BrowserInput, b: &Bridge, timeout: Duration) -> ToolResult {
+    let action = p.action.as_str();
+    match action {
+        "tabs" => return Ok(json!({ "browser": "vscode", "pages": text_of(&b.call("list_browser_pages", json!({})).await?) })),
+        "open" => {
+            let url = required(&p.url, "url", action)?;
+            check_page_url(url)?;
+            let text = text_of(&b.call("open_browser_page", json!({ "url": url })).await?);
+            let id = page_id_of(&text).ok_or_else(|| ToolError::new(ToolErrorKind::Failed, format!("VS Code did not open the page: {text}")))?;
+            remember(&id);
+            return Ok(json!({ "browser": "vscode", "id": id, "url": url, "summary": text }));
+        }
+        "close" => return Err(ToolError::invalid("VS Code's integrated browser pages are closed from their editor tab, not by the agent")),
+        _ => {}
+    }
+    let page = p
+        .target
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| LAST_PAGE.lock().ok().and_then(|l| l.clone()))
+        .ok_or_else(|| ToolError::new(ToolErrorKind::NotFound, "no VS Code browser page yet; use open with a url, or pass a page id from tabs as target"))?;
+    let (tool, input) = vscode_call(p, &page, timeout)?;
+    let parts = b.call(tool, input).await?;
+    remember(&page);
+    if action == "screenshot" {
+        let img = parts.iter().find(|x| x["type"] == "image").ok_or_else(|| {
+            ToolError::new(ToolErrorKind::Failed, format!("VS Code returned no image: {}", text_of(&parts)))
+        })?;
+        let data = img["base64"].as_str().unwrap_or_default();
+        return Ok(json!({ "format": img["mimeType"], "base64": data, "bytes": data.len() * 3 / 4, "page": page }));
+    }
+    Ok(json!({ "browser": "vscode", "page": page, "result": text_of(&parts) }))
+}
+
 /// A page URL the browser may open: http(s) only, and a real host.
 fn check_page_url(raw: &str) -> Result<(), ToolError> {
     let url = url::Url::parse(raw.trim()).map_err(|e| ToolError::invalid(format!("invalid url: {e}")))?;
@@ -418,7 +630,15 @@ async fn open_tab(base: &url::Url, url: &str) -> ToolResult {
         Err(e) => return Err(unreachable(&e)),
     };
     let res = if res.status().is_success() { res } else { client.get(target).send().await.map_err(|e| unreachable(&e))? };
-    let t: Target = res.json().await.map_err(|e| ToolError::new(ToolErrorKind::Failed, format!("the tab did not open: {e}")))?;
+    let t: Target = res.json().await.map_err(|e| {
+        ToolError::new(
+            ToolErrorKind::Failed,
+            format!(
+                "the tab did not open: {e}. VS Code cannot open tabs over DevTools; open a Simple Browser view \
+                 (command Simple Browser: Show) and use goto on it"
+            ),
+        )
+    })?;
     Ok(json!({ "id": t.id, "url": t.url, "title": t.title }))
 }
 
@@ -452,9 +672,15 @@ async fn click(cdp: &mut Cdp, selector: &str) -> Result<(), ToolError> {
     down["type"] = json!("mousePressed");
     let mut up = base;
     up["type"] = json!("mouseReleased");
-    cdp.call("Input.dispatchMouseEvent", down).await?;
-    cdp.call("Input.dispatchMouseEvent", up).await?;
-    Ok(())
+    let sent = match cdp.call("Input.dispatchMouseEvent", down).await {
+        Ok(_) => cdp.call("Input.dispatchMouseEvent", up).await.map(drop),
+        Err(e) => Err(e),
+    };
+    // A view that refuses synthetic input still takes a DOM click.
+    match sent {
+        Err(e) if cdp.eval(&click_expr(selector)).await? != Value::Bool(true) => Err(e),
+        _ => Ok(()),
+    }
 }
 
 async fn press(cdp: &mut Cdp, key: &str) -> Result<(), ToolError> {
@@ -463,11 +689,11 @@ async fn press(cdp: &mut Cdp, key: &str) -> Result<(), ToolError> {
         return Err(ToolError::invalid(format!("unsupported key '{key}'; use a name such as Enter, Tab, Escape, or ArrowDown")));
     }
     for kind in ["keyDown", "keyUp"] {
-        cdp.call(
-            "Input.dispatchKeyEvent",
-            json!({ "type": kind, "key": k, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk }),
-        )
-        .await?;
+        let params = json!({ "type": kind, "key": k, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk });
+        if let Err(e) = cdp.call("Input.dispatchKeyEvent", params).await {
+            // A view that refuses synthetic input still takes a DOM key event.
+            return if kind == "keyDown" && cdp.eval(&key_expr(k)).await? == Value::Bool(true) { Ok(()) } else { Err(e) };
+        }
     }
     Ok(())
 }
@@ -510,6 +736,62 @@ mod tests {
         for bad in ["https://127.0.0.1:9222", "http://10.0.0.5:9222", "http://example.com:9222"] {
             assert!(check_endpoint(&url_of(bad)).is_err(), "{bad} must be refused");
         }
+    }
+
+    fn target(kind: &str, url: &str) -> Target {
+        Target { id: "t".into(), kind: kind.into(), url: url.into(), title: String::new(), ws: None }
+    }
+
+    #[test]
+    fn simple_browser_pages_are_drivable_and_vscode_ui_is_not() {
+        assert!(is_page(&target("page", "https://example.com/")));
+        assert!(is_page(&target("iframe", "http://localhost:3000/")), "a Simple Browser page is an iframe target");
+        for (kind, url) in [
+            ("page", "vscode-file://vscode-app/out/vs/code/electron-browser/workbench/workbench.html"),
+            ("iframe", "vscode-webview://abc/index.html?id=1"),
+            ("page", "devtools://devtools/bundled/inspector.html"),
+            ("service_worker", "https://example.com/sw.js"),
+            ("other", "https://example.com/"),
+        ] {
+            assert!(!is_page(&target(kind, url)), "{kind} {url} must not be driven");
+        }
+        assert!(is_embedded(&target("iframe", "https://a.test/")) && !is_embedded(&target("page", "https://a.test/")));
+    }
+
+    fn input(v: Value) -> BrowserInput {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn vscode_actions_map_to_its_browser_tools() {
+        let t = Duration::from_millis(5_000);
+        let call = |v: Value| vscode_call(&input(v), "p1", t).unwrap();
+        assert_eq!(
+            call(json!({ "action": "goto", "url": "https://google.com" })),
+            ("navigate_page", json!({ "pageId": "p1", "type": "url", "url": "https://google.com" }))
+        );
+        assert_eq!(call(json!({ "action": "back" })).1["type"], "back");
+        assert_eq!(call(json!({ "action": "text" })).0, "read_page");
+        assert_eq!(call(json!({ "action": "press", "key": "Space" })).1["key"], "Space");
+        let (tool, v) = call(json!({ "action": "click", "selector": "button.go" }));
+        assert_eq!((tool, v["selector"].as_str(), v["element"].as_str()), ("click_element", Some("button.go"), Some("button.go")));
+        let eval = call(json!({ "action": "eval", "script": "document.title + \"x\"" })).1;
+        assert_eq!(eval["code"], r#"return await page.evaluate("document.title + \"x\"")"#, "the script is a JS string literal");
+        assert!(call(json!({ "action": "wait", "selector": "#q" })).1["code"].as_str().unwrap().contains("timeout: 5000"));
+        assert!(vscode_call(&input(json!({ "action": "goto", "url": "file:///etc/passwd" })), "p1", t).is_err());
+    }
+
+    #[test]
+    fn the_page_id_is_read_from_the_open_result() {
+        assert_eq!(page_id_of("Page ID: 3f2a-11\n\nSummary:\n").as_deref(), Some("3f2a-11"));
+        assert_eq!(page_id_of("The user declined to share the page."), None);
+    }
+
+    #[test]
+    fn fallback_scripts_escape_their_input() {
+        assert!(click_expr("a'b").contains(r#""a'b""#));
+        assert!(insert_expr("x\"); alert(1); (\"").contains(r#""x\"); alert(1); (\"""#));
+        assert!(key_expr("Enter").ends_with(r#"("Enter")"#));
     }
 
     #[test]

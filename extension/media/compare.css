@@ -13,7 +13,7 @@ body { margin: 0; padding: 20px 24px; font-family: var(--vscode-font-family); fo
 .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
 .top .brand { display: flex; align-items: center; gap: 12px; }
 .logo { flex: none; width: 36px; height: 36px; border-radius: 12px; background: var(--accent-container); color: var(--on-accent-container); display: grid; place-items: center; }
-.logo::before { content: ""; width: 20px; height: 20px; background: currentColor; mask: url("logo.svg") center / contain no-repeat; }
+.logo::before { content: ""; width: 20px; height: 20px; background: currentColor; mask: url("logo-mono.svg") center / contain no-repeat; }
 .top h1 { margin: 0; font-size: 1.35em; font-weight: 600; letter-spacing: -.01em; }
 .top p { margin: 4px 0 0; color: var(--muted); max-width: 80ch; line-height: 1.5; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 14px; }

@@ -3,8 +3,8 @@
  *
  * The runtime tool (runtime/src/tools/browser.rs) finds its browser at `TASK_X_CDP_ENDPOINT`,
  * default http://127.0.0.1:9222. VS Code does not need to own the browser: the user starts Chrome
- * or Edge with --remote-debugging-port (a VS Code Simple Browser view is a webview and cannot be
- * driven), and this module only (a) passes the setting into the runtime's environment and (b) can
+ * or Edge with --remote-debugging-port (or starts VS Code with it, to drive its Simple Browser
+ * views), and this module only (a) passes the setting into the runtime's environment and (b) can
  * start a browser when a debug port is requested. No `vscode` imports, so plain Node can test it.
  */
 import { spawn, type ChildProcess } from 'node:child_process';

@@ -14,10 +14,12 @@ import type { TestReport } from './protocol.js';
 import type { JsonRpcClient } from './rpc.js';
 import { RuntimeProcess, findRuntime } from './runtime.js';
 import { DEFAULT_CDP_ENDPOINT, findBrowser, launchBrowser, normalizeCdpEndpoint } from './browserBridge.js';
+import { type BrowserHost, startBrowserHost } from './vscodeBrowser.js';
 import { WorkspaceSync, renderRetrieval, renderSummary } from './workspace.js';
 
 let runtime: RuntimeProcess | undefined;
 let starting: Promise<RuntimeProcess> | undefined;
+let browserHost: BrowserHost | undefined;
 
 export function activate(ctx: vscode.ExtensionContext): void {
   initChoice(ctx.workspaceState);
@@ -73,7 +75,15 @@ export function activate(ctx: vscode.ExtensionContext): void {
     starting ??= (async () => {
       const bin = findRuntime(ctx.extensionPath, settings().runtimePath);
       out.info(`starting runtime: ${bin}`);
+      if (!browserHost) {
+        browserHost = await startBrowserHost((l) => out.warn(l)).catch((e) => {
+          out.warn(`VS Code browser bridge not started: ${describeError(e)}`);
+          return undefined;
+        });
+        if (browserHost) ctx.subscriptions.push(browserHost);
+      }
       const { runtime: rt, info } = await RuntimeProcess.start(bin, {
+        vscodeBrowser: browserHost && { url: browserHost.url, token: browserHost.token },
         clientVersion: version,
         dataDir: ctx.globalStorageUri.fsPath,
         // Commands always run in the OS sandbox: writes stay inside the workspace.

@@ -47,7 +47,7 @@ This file records the state of the work between sessions. Mark an item done only
 | 24 Provider dialog and model picker | ✅ runtime and list logic (unit tests), 🟡 not checked inside VS Code | `provider/models` (`ModelInfo` in `provider/types.rs`), `extension/src/{models,providerDialog}.ts`, picker in `media/chat.js` |
 | 23 Release | 🟡 not run yet | `make deploy` (publishes `task-x.vsix` on the GitHub release), `make add` (installs it) |
 | 20 Safety and observability | 🟡 | `agent/policy.rs` (destructive tools need an `allow` entry), `tools/mod.rs` (`ErrorClass`, `TOOL_ATTEMPTS`, `retry_backoff`), `agent/mod.rs` (`synthesize` at the iteration and tool-call limits, retries for read-only calls, `info!` events for model and tool calls), `main.rs` (`TASK_X_LOG`) |
-| 25 Browser automation | ✅ runtime (unit tests), 🟡 not checked against a live Chrome | `tools/browser.rs` (CDP over a websocket), the `browser` tool: tabs, open, goto, click, type, press, screenshot, text, html, eval, wait, back, forward, close; `docs/security.md` |
+| 25 Browser automation | ✅ runtime (unit tests), ✅ VS Code integrated browser (`open` checked live on VS Code 1.143), 🟡 not checked against a live Chrome or a VS Code Simple Browser over CDP | `tools/browser.rs` (CDP over a websocket), the `browser` tool: tabs, open, goto, click, type, press, screenshot, text, html, eval, wait, back, forward, close; `docs/security.md` |
 
 ## What each phase delivers
 

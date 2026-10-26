@@ -290,7 +290,10 @@ fn read_range(c: &ToolCtx, input: Value) -> ToolResult {
     #[serde(deny_unknown_fields)]
     struct In {
         path: String,
+        // The result names its range startLine/endLine, so a model often sends those names back.
+        #[serde(alias = "startLine", alias = "start_line")]
         start: usize,
+        #[serde(alias = "endLine", alias = "end_line")]
         end: usize,
     }
     let i: In = parse(input)?;
@@ -439,6 +442,9 @@ mod tests {
         let c = ctx(&[("lib.rs", "fn one() {}\n\nfn two() {\n    one();\n}\n")]);
         let r = run(&c, "read_range", json!({ "path": "lib.rs", "start": 3, "end": 4 })).unwrap();
         assert_eq!(r["content"], "     3\tfn two() {\n     4\t    one();");
+        let named = run(&c, "read_range", json!({ "path": "lib.rs", "startLine": 3, "endLine": 4 })).unwrap();
+        assert_eq!(named["content"], r["content"], "startLine/endLine are accepted as start/end");
+        assert_eq!(run(&c, "read_range", json!({ "path": "lib.rs", "start_line": 3, "end_line": 4 })).unwrap()["content"], r["content"]);
         let r = run(&c, "read_file", json!({ "path": "lib.rs", "offset": 5, "limit": 10 })).unwrap();
         assert_eq!((r["endLine"].as_u64(), r["more"].as_bool()), (Some(5), Some(false)));
         let s = run(&c, "read_symbol", json!({ "name": "two" })).unwrap();

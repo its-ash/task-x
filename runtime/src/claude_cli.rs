@@ -218,8 +218,16 @@ pub fn args(p: &Params, task_tools: Option<(&Path, &Path)>, instructions: &str, 
             server_args.push("--no-tools".into());
         }
         let mut server = json!({ "type": "stdio", "command": exe, "args": server_args });
+        // The browser tool in the MCP server reaches the same browser (VS Code's, or a DevTools endpoint).
+        let mut env: serde_json::Map<String, Value> =
+            crate::tools::browser::bridge_env().into_iter().map(|(k, v)| (k.to_owned(), Value::String(v))).collect();
         if let Some(v) = approval {
-            server["env"] = json!({ APPROVAL_ENV: v });
+            env.insert(APPROVAL_ENV.into(), json!(v));
+        }
+        if !env.is_empty() {
+            server["env"] = Value::Object(env);
+        }
+        if approval.is_some() {
             a.extend(["--permission-prompt-tool".into(), format!("mcp__{}__{APPROVE_TOOL}", crate::mcp_server::SERVER_NAME)]);
         }
         servers.insert(crate::mcp_server::SERVER_NAME.into(), server);
