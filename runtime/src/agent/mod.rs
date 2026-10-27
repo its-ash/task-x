@@ -252,6 +252,8 @@ const MAX_QUESTIONS: usize = 4;
 const MAX_OPTIONS: usize = 8;
 const MAX_QUESTION_CHARS: usize = 300;
 const MAX_OPTION_CHARS: usize = 120;
+/// Longest free-text answer kept per question.
+pub const MAX_OTHER_CHARS: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,8 +282,39 @@ pub struct AskRequest {
     pub questions: Vec<Question>,
 }
 
-/// Chosen option texts by question id, or `None` when the user dismissed the questions.
-pub type AskFn = Arc<dyn Fn(AskRequest, CancellationToken) -> BoxFuture<'static, Option<HashMap<String, Vec<String>>>> + Send + Sync>;
+/// The user's answers: chosen option texts and typed text, both by question id.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Answers {
+    #[serde(rename = "answers")]
+    pub selected: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub other: HashMap<String, String>,
+}
+
+impl Answers {
+    /// The offered options picked for `q` (one for radio questions).
+    pub fn picked(&self, q: &Question) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for a in self.selected.get(&q.id).into_iter().flatten() {
+            if q.options.contains(a) && !out.contains(a) {
+                out.push(a.clone());
+            }
+        }
+        if q.kind == QuestionKind::Radio {
+            out.truncate(1);
+        }
+        out
+    }
+
+    /// The trimmed text typed for `q`, cut to `MAX_OTHER_CHARS`, if any.
+    pub fn other(&self, q: &Question) -> Option<String> {
+        let t = self.other.get(&q.id)?.trim();
+        (!t.is_empty()).then(|| t.chars().take(MAX_OTHER_CHARS).collect())
+    }
+}
+
+/// The answers, or `None` when the user dismissed the questions.
+pub type AskFn = Arc<dyn Fn(AskRequest, CancellationToken) -> BoxFuture<'static, Option<Answers>> + Send + Sync>;
 pub type EmitFn = Arc<dyn Fn(&str, Value) + Send + Sync>;
 
 /// Messages waiting for each running top-level task, by task id (`agent/steer`).
@@ -632,18 +665,19 @@ fn parse_questions(input: &Value) -> Result<Vec<Question>, String> {
         .collect()
 }
 
-/// The tool result: the chosen options per question, with only the offered options kept.
-fn answer_json(qs: &[Question], answers: Option<HashMap<String, Vec<String>>>) -> Value {
+/// The tool result: the chosen options per question, with only the offered options kept, and any typed text.
+fn answer_json(qs: &[Question], answers: Option<Answers>) -> Value {
     let Some(answers) = answers else {
         return json!({ "answered": false, "message": "The user dismissed the questions. Continue without them, choose a reasonable default and say so, or ask again in a different way." });
     };
     let list: Vec<Value> = qs
         .iter()
         .map(|q| {
-            let picked: Vec<String> =
-                answers.get(&q.id).map_or_else(Vec::new, |v| v.iter().filter(|a| q.options.contains(a)).cloned().collect());
-            let picked = if q.kind == QuestionKind::Radio { picked.into_iter().take(1).collect() } else { picked };
-            json!({ "question": q.text, "selected": picked })
+            let mut a = json!({ "question": q.text, "selected": answers.picked(q) });
+            if let Some(t) = answers.other(q) {
+                a["other"] = json!(t);
+            }
+            a
         })
         .collect();
     json!({ "answered": true, "answers": list })
@@ -652,7 +686,7 @@ fn answer_json(qs: &[Question], answers: Option<HashMap<String, Vec<String>>>) -
 fn ask_spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
         name: ASK_USER.into(),
-        description: "Ask the user one to four questions and wait for the answers. Use it only when a choice blocks progress and only the user can make it. Use radio when exactly one option applies, checkbox when several can. Each question has 2 to 8 options. Returns the chosen option texts per question.".into(),
+        description: "Ask the user one to four questions and wait for the answers. Use it only when a choice blocks progress and only the user can make it. Use radio when exactly one option applies, checkbox when several can. Each question has 2 to 8 options. The user can also type their own answer. Returns the chosen option texts per question, and `other` when the user typed an answer.".into(),
         input_schema: json!({
             "type": "object",
             "properties": { "questions": { "type": "array", "minItems": 1, "maxItems": MAX_QUESTIONS, "items": {
@@ -2242,7 +2276,7 @@ mod tests {
             store: Store::new(Some(&root.join(".anvil-data"))),
             emit: Arc::new(move |_, e| events.lock().unwrap().push(e)),
             approve: Arc::new(move |_, _| Box::pin(async move { decision })),
-            ask: Arc::new(|_: AskRequest, _: CancellationToken| Box::pin(async { None::<HashMap<String, Vec<String>>> })),
+            ask: Arc::new(|_: AskRequest, _: CancellationToken| Box::pin(async { None::<Answers> })),
             mcp: Arc::default(),
             hooks: Arc::default(),
             subagents: Arc::default(),
@@ -2295,10 +2329,13 @@ mod tests {
         h.ask = Arc::new(move |req: AskRequest, _: CancellationToken| {
             log.lock().unwrap().push(req.questions.len());
             Box::pin(async {
-                Some(HashMap::from([
-                    ("q1".to_string(), vec!["tabs".to_string(), "spaces".to_string()]),
-                    ("q2".to_string(), vec!["lint".to_string(), "bogus".to_string()]),
-                ]))
+                Some(Answers {
+                    selected: HashMap::from([
+                        ("q1".to_string(), vec!["tabs".to_string(), "spaces".to_string()]),
+                        ("q2".to_string(), vec!["lint".to_string(), "bogus".to_string()]),
+                    ]),
+                    other: HashMap::from([("q2".to_string(), "  also fmt  ".to_string()), ("q1".to_string(), "   ".to_string())]),
+                })
             })
         });
         let r = run(h, params(&base, ChatMode::Agent, Mode::AskBeforeEdit), CancellationToken::new()).await.unwrap();
@@ -2308,6 +2345,8 @@ mod tests {
         let result = reqs[1]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap()["content"].to_string();
         assert!(result.contains("tabs") && !result.contains("spaces"), "radio keeps one choice");
         assert!(result.contains("lint") && !result.contains("bogus"), "unoffered options are dropped");
+        assert!(result.contains(r#"\"other\":\"also fmt\""#), "typed text is trimmed and kept: {result}");
+        assert_eq!(result.matches("other").count(), 1, "blank text is dropped");
         std::fs::remove_dir_all(root).ok();
     }
 

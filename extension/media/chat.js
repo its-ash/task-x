@@ -435,9 +435,12 @@
       turnFiles = { body, files: new Map() };
     }
     const { body, files } = turnFiles;
-    const f = files.get(it.path) ?? { added: 0, removed: 0 };
+    const f = files.get(it.path) ?? { added: 0, removed: 0, edits: 0, undone: 0, kept: 0 };
     f.added += it.added ?? 0;
     f.removed += it.removed ?? 0;
+    f.edits++;
+    if (it.undone) f.undone++;
+    if (it.kept) f.kept++;
     files.set(it.path, f);
     const total = [...files.values()].reduce((s, v) => ({ added: s.added + v.added, removed: s.removed + v.removed }), { added: 0, removed: 0 });
     const head = el('div', 'files-head');
@@ -452,8 +455,12 @@
       const open = button('file-btn', name, () => vscode.postMessage({ type: 'diffFile', path }), `Show changes in ${path}`);
       const stat = el('span', 'stat');
       stat.append(el('span', 'add', `+${v.added}`), el('span', 'del', `-${v.removed}`));
-      const row = el('li');
+      // Each file has its own Undo: it reverts the agent's changes to this file only.
+      const undone = v.undone === v.edits, kept = v.kept + v.undone === v.edits && v.kept > 0;
+      const row = el('li', undone ? 'undone' : kept ? 'kept' : '');
       row.append(open, stat);
+      if (undone || kept) row.append(el('span', 'file-state', undone ? 'Undone' : 'Kept'));
+      else row.append(button('action file-undo', icon('discard'), (e) => { e.currentTarget.disabled = true; vscode.postMessage({ type: 'revert', paths: [path] }); }, `Undo the changes to ${path} only`));
       list.append(row);
     }
     body.replaceChildren(head, list);
@@ -574,7 +581,7 @@
         break;
       }
       case 'questions': {
-        response().append(questionCard(it.questions, it.answers, null));
+        response().append(questionCard(it.questions, it.answers, null, it.other));
         current = null;
         break;
       }
@@ -718,51 +725,179 @@
   }
 
   // Questions from the agent. A live card (callId set) sends the answers; a saved one only shows them.
-  function questionCard(questions, answers, callId) {
+  function questionCard(questions, answers, callId, other) {
+    return callId ? liveQuestionCard(questions, callId) : savedQuestionCard(questions, answers, other);
+  }
+  function questionHead(text, extra) {
+    const head = el('div', 'q-head');
+    head.append(icon('comment-discussion'), el('span', 'q-title', text));
+    if (extra) head.append(el('span', 'spacer'), extra);
+    return head;
+  }
+  function savedQuestionCard(questions, answers, other) {
+    const card = el('div', 'questions resolved');
+    card.append(questionHead(questions.length > 1 ? 'Questions' : 'Question', answers ? null : el('span', 'q-badge', 'Skipped')));
+    const list = el('ol', 'q-summary');
+    for (const q of questions) {
+      const li = el('li');
+      li.append(el('div', 'q-text', q.text));
+      const vals = [...(answers?.[q.id] ?? [])];
+      const typed = other?.[q.id];
+      const row = el('div', 'q-picked');
+      for (const v of vals) row.append(el('span', 'q-chip', v));
+      if (typed) row.append(el('span', 'q-chip typed', typed));
+      if (!vals.length && !typed) row.append(el('span', 'q-none', answers ? 'No answer' : '—'));
+      li.append(row);
+      list.append(li);
+    }
+    card.append(list);
+    return card;
+  }
+  function liveQuestionCard(questions, callId) {
     const card = el('div', 'questions');
-    if (callId) card.dataset.callId = callId;
-    card.classList.toggle('resolved', !callId);
-    const name = (qi) => `${callId ?? 'saved'}-${qi}`;
-    const head = el('div', 'approval-head');
-    head.append(icon('question'), el('span', null, questions.length > 1 ? 'Questions' : 'Question'));
-    card.append(head);
+    card.dataset.callId = callId;
+    const multi = questions.length > 1;
+    const picked = questions.map(() => new Set());
+    const typed = questions.map(() => '');
+    const answered = (qi) => picked[qi].size > 0 || typed[qi].trim() !== '';
+    const valid = (qi) => questions[qi].kind !== 'radio' || answered(qi);
+    let at = 0;
+    const step = el('span', 'q-step');
+    card.append(questionHead(multi ? 'Questions' : 'Question', multi ? step : null));
+
+    const tabs = el('div', 'q-tabs');
+    tabs.setAttribute('role', 'tablist');
+    const panels = el('div', 'q-panels');
+    const tabEls = [];
+    const panelEls = [];
     questions.forEach((q, qi) => {
+      const id = `${callId}-${qi}`;
+      const tab = button('q-tab', [el('span', 'q-num', String(qi + 1)), el('span', 'q-label', q.text)], () => go(qi));
+      tab.id = `qt-${id}`;
+      tab.title = q.text;
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-controls', `qp-${id}`);
+      tabEls.push(tab);
+      tabs.append(tab);
+
+      const panel = el('div', 'q-panel');
+      panel.id = `qp-${id}`;
+      panel.setAttribute('role', 'tabpanel');
+      panel.setAttribute('aria-labelledby', `qt-${id}`);
       const fs = el('fieldset', 'question');
-      fs.append(el('legend', null, q.text));
-      const picked = answers?.[q.id] ?? [];
-      for (const opt of q.options) {
+      const legend = el('legend', null, q.text);
+      fs.append(legend, el('div', 'q-hint', q.kind === 'radio' ? 'Pick one, or type your own answer.' : 'Pick any that apply, and add your own if needed.'));
+      const opts = el('div', 'q-options');
+      q.options.forEach((opt, oi) => {
         const label = el('label', 'option');
         const input = el('input');
         input.type = q.kind === 'radio' ? 'radio' : 'checkbox';
-        input.name = name(qi);
+        input.name = id;
         input.value = opt;
-        input.checked = picked.includes(opt);
-        input.disabled = !callId;
-        label.append(input, el('span', null, opt));
-        fs.append(label);
-      }
-      card.append(fs);
+        input.addEventListener('change', () => {
+          if (q.kind === 'radio') picked[qi].clear();
+          input.checked ? picked[qi].add(opt) : picked[qi].delete(opt);
+          sync();
+          if (q.kind === 'radio' && input.checked && multi && qi < questions.length - 1 && !typed[qi].trim()) setTimeout(() => go(qi + 1), 180);
+        });
+        label.append(input, el('span', 'opt-text', opt), el('kbd', 'opt-key', String(oi + 1)));
+        opts.append(label);
+      });
+      const area = el('textarea', 'q-other');
+      area.rows = 1;
+      area.maxLength = 1000;
+      area.placeholder = q.kind === 'radio' ? 'Other answer…' : 'Add details or another answer…';
+      area.setAttribute('aria-label', `Your own answer to: ${q.text}`);
+      area.addEventListener('input', () => {
+        typed[qi] = area.value;
+        area.style.height = 'auto';
+        area.style.height = `${Math.min(area.scrollHeight, 160)}px`;
+        if (q.kind === 'radio' && area.value.trim() && picked[qi].size) {
+          picked[qi].clear();
+          for (const i of opts.querySelectorAll('input')) i.checked = false;
+        }
+        sync();
+      });
+      fs.append(opts, area);
+      panel.append(fs);
+      panel.addEventListener('keydown', (e) => {
+        if (e.target === area || e.altKey || e.ctrlKey || e.metaKey) return;
+        const n = Number(e.key);
+        const box = opts.querySelectorAll('input')[n - 1];
+        if (!box) return;
+        e.preventDefault();
+        box.checked = q.kind === 'radio' ? true : !box.checked;
+        box.dispatchEvent(new Event('change'));
+        box.focus();
+      });
+      panelEls.push(panel);
+      panels.append(panel);
     });
-    if (!callId && !answers) card.append(el('div', 'detail', 'Skipped'));
-    if (callId) {
-      const selected = (qi) => [...card.querySelectorAll(`input[name="${CSS.escape(name(qi))}"]:checked`)].map((i) => i.value);
-      const ready = () => { send.disabled = questions.some((q, qi) => q.kind === 'radio' && !selected(qi).length); };
-      const send = button('btn', 'Send answers', () => {
-        const out = {};
-        questions.forEach((q, qi) => { out[q.id] = selected(qi); });
-        vscode.postMessage({ type: 'answerQuestions', callId, answers: out });
-        send.disabled = skip.disabled = true;
+    tabs.addEventListener('keydown', (e) => {
+      const d = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+      if (!d) return;
+      e.preventDefault();
+      go((at + d + questions.length) % questions.length);
+      tabEls[at].focus();
+    });
+    if (multi) card.append(tabs);
+    card.append(panels);
+
+    const back = button('btn secondary', [icon('arrow-left'), 'Back'], () => go(at - 1));
+    const next = button('btn secondary', ['Next', icon('arrow-right')], () => go(at + 1));
+    const send = button('btn', [icon('send'), 'Send answers'], submit);
+    const skip = button('btn text', 'Skip', () => finish(null));
+    const note = el('span', 'q-note');
+    const actions = el('div', 'actions');
+    actions.append(skip, el('span', 'spacer'), note);
+    if (multi) actions.append(back, next);
+    actions.append(send);
+    card.append(actions);
+
+    card.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        questions.every((_, qi) => valid(qi)) ? submit() : go(questions.findIndex((_, qi) => !valid(qi)));
+      }
+    });
+
+    function go(qi) {
+      at = Math.max(0, Math.min(questions.length - 1, qi));
+      tabEls.forEach((t, i) => {
+        const on = i === at;
+        t.classList.toggle('active', on);
+        t.setAttribute('aria-selected', String(on));
+        t.tabIndex = on ? 0 : -1;
       });
-      const skip = button('btn secondary', 'Skip', () => {
-        vscode.postMessage({ type: 'answerQuestions', callId, answers: null });
-        send.disabled = skip.disabled = true;
-      });
-      card.addEventListener('change', ready);
-      ready();
-      const actions = el('div', 'actions');
-      actions.append(send, skip);
-      card.append(actions);
+      panelEls.forEach((p, i) => { p.hidden = i !== at; });
+      sync();
+      panelEls[at].querySelector('input')?.focus({ preventScroll: true });
     }
+    function sync() {
+      tabEls.forEach((t, i) => t.classList.toggle('done', answered(i)));
+      const left = questions.filter((_, qi) => !valid(qi)).length;
+      step.textContent = `${at + 1} of ${questions.length}`;
+      back.disabled = at === 0;
+      next.disabled = at === questions.length - 1;
+      send.disabled = left > 0;
+      note.textContent = left ? `${left} left to answer` : '';
+    }
+    function submit() {
+      if (questions.some((_, qi) => !valid(qi))) return;
+      const out = {};
+      const extra = {};
+      questions.forEach((q, qi) => {
+        out[q.id] = [...picked[qi]];
+        if (typed[qi].trim()) extra[q.id] = typed[qi].trim();
+      });
+      finish(out, extra);
+    }
+    function finish(out, extra) {
+      vscode.postMessage({ type: 'answerQuestions', callId, answers: out, other: extra });
+      card.classList.add('sending');
+      for (const c of card.querySelectorAll('button, input, textarea')) c.disabled = true;
+    }
+    go(0);
     return card;
   }
   function renderQuestions(m) {
@@ -771,7 +906,7 @@
     const card = enter(questionCard(m.questions, null, m.callId));
     response().append(card);
     scroll(true);
-    card.querySelector('input')?.focus();
+    card.querySelector('.q-panel:not([hidden]) input')?.focus();
   }
 
   function renderApproval(m) {
@@ -814,14 +949,18 @@
   toggle.addEventListener('click', () => { collapsed = !collapsed; vscode.setState({ ...(vscode.getState() || {}), changesCollapsed: collapsed }); applyCollapsed(); });
   $('keepAll').addEventListener('click', () => vscode.postMessage({ type: 'keep' }));
   $('revertAll').addEventListener('click', () => vscode.postMessage({ type: 'revert' }));
+  // Files appear here as the agent edits them; a file new to the list slides in.
+  let shownChanges = new Set();
   function renderChanges(files) {
+    const seen = shownChanges;
+    shownChanges = new Set(files.map((f) => f.path));
     changes.hidden = !files.length;
     if (!files.length) return void changesList.replaceChildren();
     const added = files.reduce((n, f) => n + f.added, 0), removed = files.reduce((n, f) => n + f.removed, 0);
     $('changesTitle').textContent = `${files.length} file${files.length > 1 ? 's' : ''} changed`;
     $('changesStat').replaceChildren(el('span', 'add', `+${added}`), el('span', 'del', `-${removed}`));
     changesList.replaceChildren(...files.map((f) => {
-      const li = el('li', 'change ' + f.status);
+      const li = el('li', `change ${f.status}${seen.has(f.path) ? '' : ' new'}`);
       const slash = f.path.lastIndexOf('/');
       const open = button('file-btn', [], () => vscode.postMessage({ type: 'diffFile', path: f.path }), `Show changes in ${f.path}`);
       open.append(icon('file'), el('span', 'fname', slash >= 0 ? f.path.slice(slash + 1) : f.path));
@@ -831,7 +970,7 @@
       const acts = el('span', 'acts');
       acts.append(
         button('action', icon('check'), () => vscode.postMessage({ type: 'keep', paths: [f.path] }), `Keep changes to ${f.path}`),
-        button('action', icon('discard'), () => vscode.postMessage({ type: 'revert', paths: [f.path] }), `Undo changes to ${f.path}`),
+        button('btn small secondary file-undo', [icon('discard'), 'Undo'], (e) => { e.currentTarget.disabled = true; vscode.postMessage({ type: 'revert', paths: [f.path] }); }, `Undo the changes to ${f.path} only`),
       );
       li.append(open, stat, acts, el('span', 'letter', { added: 'A', deleted: 'D', modified: 'M' }[f.status]));
       return li;
@@ -957,28 +1096,75 @@
     meter.setAttribute('aria-label', meter.title);
   }
 
-  // ---------- Views: Chat and History tabs ----------
-  const viewTabs = { chat: $('tabChat'), history: $('tabHistory') };
-  const historyBox = $('history');
+  // ---------- Tabs: chats and subagents, like browser tabs, then History ----------
+  const strip = $('tabStrip'), historyTab = $('tabHistory'), historyBox = $('history');
+  let tabs = [], activeTab = null;
   function showView(v) {
     document.body.dataset.view = v;
-    for (const [k, b] of Object.entries(viewTabs)) { b.setAttribute('aria-selected', String(k === v)); b.tabIndex = k === v ? 0 : -1; }
+    historyTab.setAttribute('aria-selected', String(v === 'history'));
+    historyTab.tabIndex = v === 'history' ? 0 : -1;
+    renderTabs();
     historyBox.hidden = v !== 'history';
     if (v === 'history') {
       if (!historyBox.childElementCount) historyBox.append(el('div', 'history-empty', 'Loading…'));
       vscode.postMessage({ type: 'listTasks' });
-    } else input.focus();
+    } else if (document.body.dataset.tabKind !== 'subagent') input.focus();
   }
-  viewTabs.chat.addEventListener('click', () => showView('chat'));
-  viewTabs.history.addEventListener('click', () => showView('history'));
+  const TAB_STATUS = { running: 'Running', completed: 'Done', failed: 'Failed', cancelled: 'Stopped' };
+  function renderTabs() {
+    const onChat = document.body.dataset.view !== 'history';
+    const cur = tabs.find((t) => t.id === activeTab);
+    const hadFocus = strip.contains(document.activeElement);
+    document.body.dataset.tabKind = cur?.kind || 'chat';
+    strip.replaceChildren(...tabs.map((t) => {
+      const on = onChat && t.id === activeTab;
+      const tab = el('div', `chat-tab ${t.kind}`);
+      tab.dataset.id = t.id;
+      if (t.role) tab.dataset.role = t.role;
+      if (t.status) tab.dataset.status = t.status;
+      tab.setAttribute('role', 'tab');
+      tab.setAttribute('aria-selected', String(on));
+      tab.setAttribute('aria-controls', 'log');
+      tab.tabIndex = on ? 0 : -1;
+      const what = t.kind === 'subagent' ? `Subagent ${t.title} (${t.role || 'agent'})` : `Agent chat: ${t.title}`;
+      tab.title = t.status ? `${what} · ${TAB_STATUS[t.status] || t.status}` : what;
+      const mark = t.status === 'running' ? icon('loading', 'codicon-modifier-spin tab-icon') : icon(t.kind === 'subagent' ? ROLE_ICONS[t.role] || 'person' : 'comment-discussion', 'tab-icon');
+      const close = button('tab-close', icon('close'), (e) => { e.stopPropagation(); closeTab(t.id); }, `Close ${t.title}`);
+      close.tabIndex = -1;
+      tab.append(mark, el('span', 'tab-title', t.title));
+      if (t.kind === 'subagent' && t.status && t.status !== 'running') tab.append(el('span', 'tab-state'));
+      tab.append(close);
+      tab.addEventListener('click', () => selectTab(t.id));
+      tab.addEventListener('auxclick', (e) => { if (e.button === 1) { e.preventDefault(); closeTab(t.id); } });
+      return tab;
+    }));
+    const sel = strip.querySelector('[aria-selected="true"]');
+    sel?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    if (hadFocus) (sel || strip.querySelector('.chat-tab'))?.focus();
+  }
+  function selectTab(id) {
+    if (id !== activeTab) {
+      activeTab = id;
+      vscode.postMessage({ type: 'selectTab', id });
+    }
+    showView('chat');
+  }
+  function closeTab(id) { vscode.postMessage({ type: 'closeTab', id }); }
+  historyTab.addEventListener('click', () => showView('history'));
   $('views').addEventListener('keydown', (e) => {
-    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-    const next = document.body.dataset.view === 'chat' ? 'history' : 'chat';
+    const all = [...strip.querySelectorAll('.chat-tab'), historyTab];
+    const at = all.indexOf(document.activeElement);
+    if (at < 0) return;
+    if ((e.key === 'Delete' || e.key === 'Backspace') && at < all.length - 1) { e.preventDefault(); return closeTab(all[at].dataset.id); }
+    if ((e.key === 'Enter' || e.key === ' ') && at < all.length - 1) { e.preventDefault(); return all[at].click(); }
+    const d = { ArrowLeft: -1, ArrowRight: 1, Home: -at, End: all.length - 1 - at }[e.key];
+    if (d === undefined) return;
     e.preventDefault();
-    showView(next);
-    viewTabs[next].focus();
+    const next = all[(at + d + all.length) % all.length];
+    next.focus();
+    next.click();
   });
-  $('newChat').addEventListener('click', () => { vscode.postMessage({ type: 'clear' }); showView('chat'); });
+  $('newChat').addEventListener('click', () => vscode.postMessage({ type: 'newTab' }));
 
   // Saved tasks, newest first, grouped by day.
   const STATUS_ICONS = { completed: 'pass-filled', running: 'loading codicon-modifier-spin', cancelled: 'circle-slash', failed: 'error' };
@@ -1362,7 +1548,8 @@
         replaying = true;
         m.items.forEach(renderItem);
         replaying = false;
-        current = null;
+        // A tab drawn while its answer streams keeps the last message open for the text still to come.
+        if (!m.streaming) current = null;
         welcome();
         scroll(true);
         break;
@@ -1428,6 +1615,11 @@
       }
       case 'queue': renderQueue(m.items, m.steering); break;
       case 'tasks': renderTasks(m); break;
+      case 'tabs':
+        tabs = m.tabs;
+        activeTab = m.active;
+        renderTabs();
+        break;
       case 'view': showView(m.view); break;
       case 'copySelection': {
         const text = getSelection()?.toString();

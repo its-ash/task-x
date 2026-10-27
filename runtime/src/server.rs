@@ -680,7 +680,8 @@ impl Server {
                 Box::pin(async move {
                     // No answer, or an error, counts as dismissed.
                     let v = asker.request_client("agent/askUser", json!(req), &cancel).await.ok()?;
-                    serde_json::from_value(v["answers"].clone()).ok()
+                    v["answers"].as_object()?;
+                    serde_json::from_value(v).ok()
                 })
             }),
         }

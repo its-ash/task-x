@@ -522,7 +522,7 @@ const UNSANDBOXED_DENIED: &str = "Commands always run in the task-x sandbox. Run
 const ASK_TOOL: &str = "AskUserQuestion";
 
 /// Shows Claude Code's questions in the chat. The answers go back as `updatedInput.answers`
-/// (question text → chosen labels, joined by ", "), the form Claude Code reads.
+/// (question text → chosen labels and typed text, joined by ", "), the form Claude Code reads.
 async fn ask_user(mut input: Value, call_id: String, task_id: &str, host: &ApprovalHost) -> Value {
     use crate::agent::{Question, QuestionKind};
     let asked: Vec<&Value> = input["questions"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
@@ -551,11 +551,9 @@ async fn ask_user(mut input: Value, call_id: String, task_id: &str, host: &Appro
     let answers: serde_json::Map<String, Value> = questions
         .iter()
         .map(|q| {
-            let mut chosen: Vec<&String> = picked.get(&q.id).into_iter().flatten().filter(|a| q.options.contains(a)).collect();
-            if q.kind == QuestionKind::Radio {
-                chosen.truncate(1);
-            }
-            (q.text.clone(), json!(chosen.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")))
+            let mut chosen = picked.picked(q);
+            chosen.extend(picked.other(q));
+            (q.text.clone(), json!(chosen.join(", ")))
         })
         .collect();
     input["answers"] = Value::Object(answers);
@@ -1107,10 +1105,13 @@ mod tests {
                         .collect::<Vec<_>>(),
                 );
                 Box::pin(async {
-                    Some(HashMap::from([
-                        ("q1".to_owned(), vec!["Vue".to_owned(), "React".to_owned()]),
-                        ("q2".to_owned(), vec!["lint".to_owned(), "made up".to_owned(), "test".to_owned()]),
-                    ]))
+                    Some(crate::agent::Answers {
+                        selected: HashMap::from([
+                            ("q1".to_owned(), vec!["Vue".to_owned(), "React".to_owned()]),
+                            ("q2".to_owned(), vec!["lint".to_owned(), "made up".to_owned(), "test".to_owned()]),
+                        ]),
+                        other: HashMap::from([("q2".to_owned(), "fmt".to_owned())]),
+                    })
                 })
             }),
             cancel: CancellationToken::new(),
@@ -1124,8 +1125,8 @@ mod tests {
         assert_eq!(r["behavior"], "allow", "questions never need approval");
         assert_eq!(
             r["updatedInput"]["answers"],
-            json!({ "Which framework?": "Vue", "Which checks?": "lint, test" }),
-            "one pick for radio, offered options only"
+            json!({ "Which framework?": "Vue", "Which checks?": "lint, test, fmt" }),
+            "one pick for radio, offered options only, then typed text"
         );
         assert_eq!(r["updatedInput"]["questions"][0]["header"], "Stack", "the questions go back unchanged");
         assert_eq!(

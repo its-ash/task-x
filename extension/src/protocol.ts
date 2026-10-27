@@ -269,9 +269,10 @@ export interface AskUserRequest {
   questions: Question[];
 }
 
-/** Chosen option texts by question id; `answers` is null when the user dismissed the questions. */
+/** Chosen option texts and typed text by question id; `answers` is null when the user dismissed the questions. */
 export interface AskUserResult {
   answers: Record<string, string[]> | null;
+  other?: Record<string, string>;
 }
 
 export interface ApprovalRequest {
