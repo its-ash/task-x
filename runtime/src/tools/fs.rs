@@ -274,15 +274,23 @@ fn read_file(c: &ToolCtx, input: Value) -> ToolResult {
     #[serde(deny_unknown_fields)]
     struct In {
         path: String,
-        #[serde(default)]
+        // Results name their range startLine/endLine, so a model often sends those, or read_range's start/end, here.
+        #[serde(default, alias = "start", alias = "startLine", alias = "start_line")]
         offset: Option<usize>,
         #[serde(default)]
         limit: Option<usize>,
+        #[serde(default, alias = "endLine", alias = "end_line")]
+        end: Option<usize>,
     }
     let i: In = parse(input)?;
     let (rel, text) = read_text(c, &i.path)?;
     let start = i.offset.unwrap_or(1).max(1);
-    range_result(&rel, &text, start, start + i.limit.unwrap_or(MAX_READ_LINES).clamp(1, MAX_READ_LINES) - 1)
+    let end = match i.end {
+        Some(end) if end < start => return Err(ToolError::invalid(format!("read_file: end {end} is before start {start}"))),
+        Some(end) => end,
+        None => start + i.limit.unwrap_or(MAX_READ_LINES).clamp(1, MAX_READ_LINES) - 1,
+    };
+    range_result(&rel, &text, start, end)
 }
 
 fn read_range(c: &ToolCtx, input: Value) -> ToolResult {
@@ -290,34 +298,36 @@ fn read_range(c: &ToolCtx, input: Value) -> ToolResult {
     #[serde(deny_unknown_fields)]
     struct In {
         path: String,
-        // The result names its range startLine/endLine, so a model often sends those names back.
-        #[serde(alias = "startLine", alias = "start_line")]
+        // The result names its range startLine/endLine, so a model often sends those names back, or read_file's offset/limit.
+        #[serde(alias = "startLine", alias = "start_line", alias = "offset")]
         start: usize,
-        #[serde(alias = "endLine", alias = "end_line")]
-        end: usize,
+        #[serde(default, alias = "endLine", alias = "end_line")]
+        end: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
     }
     let i: In = parse(input)?;
+    let start = i.start;
+    let end = i
+        .end
+        .or_else(|| i.limit.map(|n| start + n.max(1) - 1))
+        .ok_or_else(|| ToolError::invalid("read_range: give end (the last line) or limit (the number of lines)"))?;
     let (rel, text) = read_text(c, &i.path)?;
     let total = text.lines().count();
-    if i.start == 0 {
+    if start == 0 {
         return Err(ToolError::invalid(format!(
-            "read_range: start must be 1-based and at least 1, got {} ({} has {total} lines; valid 1..={total})",
-            i.start, rel
+            "read_range: start must be 1-based and at least 1, got {start} ({rel} has {total} lines; valid 1..={total})"
         )));
     }
-    if i.end < i.start {
+    if end < start {
+        return Err(ToolError::invalid(format!("read_range: end {end} is before start {start} ({rel} has {total} lines; valid 1..={total})")));
+    }
+    if start > total {
         return Err(ToolError::invalid(format!(
-            "read_range: end {} is before start {} ({} has {total} lines; valid 1..={total})",
-            i.end, i.start, rel
+            "read_range: start {start} is past the end of {rel} ({rel} has {total} lines; valid 1..={total})"
         )));
     }
-    if i.start > total {
-        return Err(ToolError::invalid(format!(
-            "read_range: start {} is past the end of {} ({} has {total} lines; valid 1..={total})",
-            i.start, rel, rel
-        )));
-    }
-    range_result(&rel, &text, i.start, i.end)
+    range_result(&rel, &text, start, end)
 }
 
 fn read_multiple_files(c: &ToolCtx, input: Value) -> ToolResult {
@@ -445,6 +455,11 @@ mod tests {
         let named = run(&c, "read_range", json!({ "path": "lib.rs", "startLine": 3, "endLine": 4 })).unwrap();
         assert_eq!(named["content"], r["content"], "startLine/endLine are accepted as start/end");
         assert_eq!(run(&c, "read_range", json!({ "path": "lib.rs", "start_line": 3, "end_line": 4 })).unwrap()["content"], r["content"]);
+        assert_eq!(run(&c, "read_range", json!({ "path": "lib.rs", "offset": 3, "limit": 2 })).unwrap()["content"], r["content"], "offset/limit work too");
+        assert_eq!(run(&c, "read_file", json!({ "path": "lib.rs", "startLine": 3, "endLine": 4 })).unwrap()["content"], r["content"], "read_file takes a range");
+        assert_eq!(run(&c, "read_file", json!({ "path": "lib.rs", "start": 3, "end": 4 })).unwrap()["content"], r["content"]);
+        assert_eq!(run(&c, "read_file", json!({ "path": "lib.rs", "offset": 4, "endLine": 3 })).unwrap_err().kind, ToolErrorKind::InvalidInput);
+        assert_eq!(run(&c, "read_range", json!({ "path": "lib.rs", "start": 3 })).unwrap_err().kind, ToolErrorKind::InvalidInput);
         let r = run(&c, "read_file", json!({ "path": "lib.rs", "offset": 5, "limit": 10 })).unwrap();
         assert_eq!((r["endLine"].as_u64(), r["more"].as_bool()), (Some(5), Some(false)));
         let s = run(&c, "read_symbol", json!({ "name": "two" })).unwrap();

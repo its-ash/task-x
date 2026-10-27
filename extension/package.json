@@ -2,7 +2,7 @@
   "name": "task-x",
   "displayName": "task-x",
   "description": "Model-agnostic AI coding agent with a Rust runtime. Works with Claude, OpenAI, Ollama, and OpenAI-compatible endpoints.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "its-ash",
   "license": "MIT",
   "private": true,
