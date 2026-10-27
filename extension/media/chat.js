@@ -359,10 +359,15 @@
   }
 
   // ---------- Transcript ----------
-  // Empty chat: only the animated logo (orbiting rings), no text or buttons.
+  // Empty chat: a verse from the Bhagavad Gita (18.66), no buttons.
+  const WELCOME = 'सर्वधर्मान्परित्यज्य मामेकं शरणं व्रज।\nअहं त्वा सर्वपापेभ्यो मोक्षयिष्यामि मा शुचः॥';
   function welcome() {
     if (log.children.length) return;
-    log.append(el('div', 'welcome', 'Hi !'));
+    const w = el('div', 'welcome');
+    const verse = el('p', 'welcome-verse', WELCOME);
+    verse.lang = 'sa';
+    w.append(verse);
+    log.append(w);
   }
   function response() {
     if (!turn) { turn = { el: el('div', 'turn'), response: null }; log.append(turn.el); }
