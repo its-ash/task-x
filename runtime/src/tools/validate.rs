@@ -206,9 +206,10 @@ impl Argv {
 }
 
 /// A command line split into argv. Whitespace separates words, `'…'` and `"…"` group them, and a
-/// backslash escapes the next character. Nothing is interpreted: no pipes, globs, or variables, so
+/// backslash escapes the next character (inside `"…"` only `$`, `` ` ``, `"`, and `\`, as in sh, so
+/// `"a\|b"` keeps its backslash). Nothing is interpreted: no pipes, globs, or variables, so
 /// `a | b` becomes three arguments exactly as the tool documents.
-fn split_args(line: &str) -> Vec<String> {
+pub(super) fn split_args(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut started = false;
@@ -220,6 +221,9 @@ fn split_args(line: &str) -> Vec<String> {
             Some('\'') => cur.push(c),
             Some(_) if c == '\\' => {
                 if let Some(n) = chars.next() {
+                    if !matches!(n, '$' | '`' | '"' | '\\' | '\n') {
+                        cur.push('\\');
+                    }
                     cur.push(n);
                 }
             }
@@ -271,6 +275,11 @@ fn run_command(c: &ToolCtx, input: Value) -> ToolResult {
         // The agent loop runs background commands itself; other callers (MCP) cannot be told later.
         return Err(ToolError::invalid("background is not available here; run the command without it"));
     }
+    // A plain line keeps its pipes for the search reader; a JSON array in a string is argv.
+    let line = match &i.command {
+        Argv::Text(s) if !s.trim_start().starts_with('[') => Some(s.clone()),
+        _ => None,
+    };
     let command = i.command.into_vec()?;
     if command.is_empty() || command.len() > MAX_COMMAND_ARGS || command.iter().any(|a| a.len() > MAX_COMMAND_ARG_LEN || a.contains('\0')) {
         return Err(ToolError::invalid(format!(
@@ -283,6 +292,10 @@ fn run_command(c: &ToolCtx, input: Value) -> ToolResult {
     let (abs, label) = c.resolve(i.cwd.as_deref().unwrap_or("."))?;
     if !abs.is_dir() {
         return Err(ToolError::invalid(format!("{label} is not a directory")));
+    }
+    // grep, rg, and find are answered from the index, with the search tool to call next time.
+    if let Some(r) = super::shell_search::answer(c, &command, line.as_deref(), &label) {
+        return r;
     }
     let timeout = Duration::from_secs(i.timeout_secs.unwrap_or(DEFAULT_COMMAND_SECS).clamp(1, MAX_COMMAND_SECS));
     let out = exec::run_sandboxed(&command, &abs, &label, timeout, &c.cancel, &exec::Sandbox { writable_root: &c.root })?;
@@ -413,6 +426,8 @@ mod tests {
         assert_eq!(argv(json!({ "command": "git commit -m \"two words\"" })), ["git", "commit", "-m", "two words"]);
         // Nothing is interpreted: a pipe stays one argument.
         assert_eq!(argv(json!({ "command": "ls | head" })), ["ls", "|", "head"]);
+        // Inside double quotes a backslash stays unless it escapes $ ` " or \, as in sh.
+        assert_eq!(argv(json!({ "command": r#"grep "a\|b" "say \"hi\"" x\ y"# })), ["grep", r"a\|b", "say \"hi\"", "x y"]);
         // Unusable values still fail clearly.
         let empty: RunIn = serde_json::from_value(json!({ "command": "   " })).unwrap();
         assert_eq!(empty.command.into_vec().unwrap_err().kind, ToolErrorKind::InvalidInput);

@@ -271,11 +271,11 @@ pub fn record(c: &ToolCtx, op: &str, changes: &[Change]) -> Value {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReplaceIn {
-    #[serde(alias = "file_path")]
+    #[serde(alias = "file_path", alias = "filePath", alias = "file")]
     path: String,
-    #[serde(alias = "old_text", alias = "old_string")]
+    #[serde(alias = "old_text", alias = "old_string", alias = "oldString", alias = "search", alias = "old")]
     old_text: String,
-    #[serde(alias = "new_text", alias = "new_string")]
+    #[serde(alias = "new_text", alias = "new_string", alias = "newString", alias = "replace", alias = "new")]
     new_text: String,
     #[serde(default, alias = "expected_count")]
     expected_count: Option<usize>,
@@ -285,19 +285,39 @@ struct ReplaceIn {
 const EDIT_FIELDS: &[&str] = &[
     "path",
     "file_path",
+    "filePath",
+    "file",
     "oldText",
     "old_text",
     "old_string",
+    "oldString",
+    "search",
+    "old",
     "newText",
     "new_text",
     "new_string",
+    "newString",
+    "replace",
+    "new",
     "expectedCount",
     "expected_count",
     "all",
 ];
+/// The names a model uses for an edit's file.
+const PATH_FIELDS: &[&str] = &["path", "file_path", "filePath", "file"];
+/// The names a model uses for the text an edit replaces.
+const OLD_FIELDS: &[&str] = &["oldText", "old_text", "old_string", "oldString", "search", "old"];
 
 fn looks_like_edit(v: &Value) -> bool {
-    v.as_object().is_some_and(|o| o.contains_key("path") || o.contains_key("oldText") || o.contains_key("old_text"))
+    v.as_object().is_some_and(|o| PATH_FIELDS.iter().chain(OLD_FIELDS).any(|k| o.contains_key(*k)))
+}
+
+/// The file path a call gives beside `edits`, used for each edit that names no file.
+fn take_path(map: &mut serde_json::Map<String, Value>) -> Option<String> {
+    PATH_FIELDS.iter().find_map(|k| match map.get(*k) {
+        Some(Value::String(s)) if !s.trim().is_empty() => map.remove(*k).and_then(|v| v.as_str().map(str::to_owned)),
+        _ => None,
+    })
 }
 
 /// The batch of edits a model sent, in the shapes models actually produce: an array (the schema),
@@ -349,22 +369,25 @@ fn normalize_edits(raw: Value) -> Result<Vec<Value>, ToolError> {
 /// model may write a single edit's fields directly (`{path, oldText, newText}`) or add a stray key
 /// such as a step number. A strict `{edits}`-only reader answered all of those with
 /// "unknown field `path`, expected `edits`", which never says what to send instead.
-/// Returns the raw edits value and the top-level keys nothing reads.
-fn take_edits(input: Value) -> Result<(Value, Vec<String>), ToolError> {
+/// Returns the raw edits value, the file path given beside `edits` (for edits that name none), and
+/// the top-level keys nothing reads.
+fn take_edits(input: Value) -> Result<(Value, Option<String>, Vec<String>), ToolError> {
     let Value::Object(mut map) = input else {
         return Err(ToolError::invalid("edit_files takes an object: {\"edits\": [{\"path\": ..., \"oldText\": ..., \"newText\": ...}]}"));
     };
     if let Some(edits) = map.remove("edits") {
-        return Ok((edits, map.keys().cloned().collect()));
+        // `{"path": "a.js", "edits": [{oldText, newText}, ...]}`: one file, several edits.
+        let path = take_path(&mut map);
+        return Ok((edits, path, map.keys().cloned().collect()));
     }
     let object = Value::Object(map.clone());
     // One edit written without the wrapper: the fields of an edit, directly.
     if looks_like_edit(&object) {
-        return Ok((object, Vec::new()));
+        return Ok((object, None, Vec::new()));
     }
     // A map of key → edit (`{"1": {...}}`), which `normalize_edits` reads in numeric order.
     if !map.is_empty() && map.values().all(Value::is_object) {
-        return Ok((Value::Object(map), Vec::new()));
+        return Ok((Value::Object(map), None, Vec::new()));
     }
     Err(ToolError::invalid(
         "edit_files needs edits: {\"edits\": [{\"path\": ..., \"oldText\": ..., \"newText\": ...}]}; a single edit may also be sent directly",
@@ -372,7 +395,7 @@ fn take_edits(input: Value) -> Result<(Value, Vec<String>), ToolError> {
 }
 
 fn edit_files(c: &ToolCtx, input: Value) -> ToolResult {
-    let (raw, mut ignored) = take_edits(input)?;
+    let (raw, path, mut ignored) = take_edits(input)?;
     let edits = normalize_edits(raw)?;
     if edits.is_empty() || edits.len() > MAX_BATCH_EDITS {
         return Err(ToolError::invalid(format!("edits must have 1..={MAX_BATCH_EDITS} items")));
@@ -382,6 +405,16 @@ fn edit_files(c: &ToolCtx, input: Value) -> ToolResult {
     for (k, raw) in edits.into_iter().enumerate() {
         let mut v = raw;
         let all = v.as_object_mut().and_then(|o| o.remove("all")).is_some_and(|a| a.as_bool() == Some(true));
+        if let (Some(o), Some(p)) = (v.as_object_mut(), &path) {
+            if !PATH_FIELDS.iter().any(|k| o.contains_key(*k)) {
+                o.insert("path".into(), json!(p));
+            }
+        }
+        if v.as_object().is_some_and(|o| !PATH_FIELDS.iter().any(|k| o.contains_key(*k))) {
+            return Err(ToolError::invalid(format!(
+                "edits[{k}] names no file: give each edit a \"path\", or put one \"path\" beside \"edits\" for edits to a single file"
+            )));
+        }
         if let Some(o) = v.as_object() {
             for key in o.keys().filter(|key| !EDIT_FIELDS.contains(&key.as_str())) {
                 let key = key.clone();
@@ -809,6 +842,25 @@ mod tests {
         assert_eq!(r["replacements"], 1, "{r}");
         assert_eq!(r["ignoredFields"], json!(["plan"]), "the stray top-level key is named");
         assert_eq!(std::fs::read_to_string(c.root.join("b.txt")).unwrap(), "2\n");
+
+        // One path beside `edits` applies to the edits that name no file; an edit's own path wins.
+        let c2 = ctx(&[("s.js", "let a = 1;\nlet b = 2;\n"), ("t.js", "t\n")]);
+        let r = run(
+            &c2,
+            "edit_files",
+            json!({ "path": "s.js", "edits": [
+                { "oldText": "a = 1", "newText": "a = 10" },
+                { "old_string": "b = 2", "new_string": "b = 20" },
+                { "file_path": "t.js", "search": "t", "replace": "T" },
+            ] }),
+        )
+        .unwrap();
+        assert_eq!(r["replacements"], 3, "{r}");
+        assert!(r.get("ignoredFields").is_none(), "the top-level path is read: {r}");
+        assert_eq!(std::fs::read_to_string(c2.root.join("s.js")).unwrap(), "let a = 10;\nlet b = 20;\n");
+        assert_eq!(std::fs::read_to_string(c2.root.join("t.js")).unwrap(), "T\n");
+        let bad = run(&c2, "edit_files", json!({ "edits": [{ "oldText": "x", "newText": "y" }] })).unwrap_err();
+        assert!(bad.message.contains("edits[0] names no file") && !bad.message.contains("missing field"), "{}", bad.message);
 
         // No edits at all: the message says what to send, instead of naming a serde field.
         let bad = run(&c, "edit_files", json!({ "5": "nope" })).unwrap_err();

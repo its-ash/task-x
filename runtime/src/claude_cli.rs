@@ -84,7 +84,7 @@ const BUILTIN_FILE_TOOLS: &[&str] = &["Read", "Edit", "MultiEdit", "Write", "Not
 /// Inline interpreter scripts (`node -e`, `python3 -c`) are left to the hook, which blocks only
 /// the ones that call a file-write API, so read-only checks still run.
 const SHELL_EDITS: &[&str] = &["Bash(sed -i:*)", "Bash(perl -i:*)", "Bash(perl -pi:*)", "Bash(cat >:*)", "Bash(cat <<:*)", "Bash(tee:*)"];
-const TOOL_NOTE: &str = "Work on files only through the mcp__task-x__ tools: read_file, read_range, search_text, search_regex, find_files, find_symbol, find_references, get_dependencies, replace_text, edit_files, insert_at_line, apply_patch, create_file, rename_file, delete_file. Read a file before you edit it. For several replacements in one or more files, call edit_files once with all of them. Never write or rewrite files with shell commands (python, node, sed, perl, cat, tee, heredocs) and never script edits; a hook blocks them. Use Bash only to build, test, lint, and run git.";
+const TOOL_NOTE: &str = "Work on files only through the mcp__task-x__ tools: read_file, read_range, search_text, search_regex, find_files, find_symbol, find_references, get_dependencies, replace_text, edit_files, insert_at_line, apply_patch, create_file, rename_file, delete_file. Read a file before you edit it. For several replacements in one or more files, call edit_files once with all of them. Search with search_regex (a pattern, with an optional glob such as scripts/*.{js,mjs}), search_text, find_files, find_symbol, and find_references, not with grep, rg, or find in Bash; a hook blocks those. Never write or rewrite files with shell commands (python, node, sed, perl, cat, tee, heredocs) and never script edits; a hook blocks them. Use Bash only to build, test, lint, and run git.";
 /// Long commands run in parallel with the rest of the work.
 const BACKGROUND_NOTE: &str = "For slow commands (package installs, builds, long test runs, dev servers) call Bash with run_in_background: true and keep working on other parts of the task; do not sleep or wait for them. Read their output with BashOutput when you need it, and check it before you finish.";
 /// Catches shell file rewrites anywhere in a command (after `cd x &&`, in a pipe, in `$(...)`),
@@ -110,14 +110,18 @@ static WRITE_API: LazyLock<Regex> = LazyLock::new(|| {
 const SHELL_EDIT_BLOCKED: &str = "Blocked: this command writes files from the shell. Use the mcp__task-x__ tools instead: replace_text for one change, edit_files for many changes across files, apply_patch for a diff, create_file for a new file.";
 
 /// `--hook-shell-edit`: a Claude Code PreToolUse hook. Reads the hook JSON from stdin; exit code 2
-/// blocks the Bash call and sends the reason to Claude.
-pub fn shell_edit_hook(input: &str) -> Result<(), &'static str> {
-    let cmd =
-        serde_json::from_str::<Value>(input).ok().and_then(|v| v["tool_input"]["command"].as_str().map(String::from)).unwrap_or_default();
+/// blocks the Bash call and sends the reason to Claude. It blocks file writes from the shell, and
+/// code searches (`grep`, `rg`, `find`) with the task-x search call that does the same.
+pub fn shell_edit_hook(input: &str) -> Result<(), String> {
+    let v = serde_json::from_str::<Value>(input).unwrap_or_default();
+    let cmd = v["tool_input"]["command"].as_str().unwrap_or_default();
     // Writing to the console is not a file edit.
     let script = cmd.replace("stdout.write(", "").replace("stderr.write(", "");
-    let edits = SHELL_EDIT.is_match(&cmd) || (INLINE_SCRIPT.is_match(&cmd) && WRITE_API.is_match(&script));
-    if edits { Err(SHELL_EDIT_BLOCKED) } else { Ok(()) }
+    if SHELL_EDIT.is_match(cmd) || (INLINE_SCRIPT.is_match(cmd) && WRITE_API.is_match(&script)) {
+        return Err(SHELL_EDIT_BLOCKED.into());
+    }
+    let cwd = std::path::PathBuf::from(v["cwd"].as_str().unwrap_or("."));
+    crate::tools::shell_search::suggestion(cmd, &cwd).map_or(Ok(()), Err)
 }
 
 fn sh_quote(s: &str) -> String {
@@ -244,11 +248,15 @@ pub fn args(p: &Params, task_tools: Option<(&Path, &Path)>, instructions: &str, 
     }
     a.extend(["--settings".into(), settings.to_string()]);
     // Claude Code reads only CLAUDE.md files itself, so task-x passes the other guidance it loaded.
-    let system: Vec<&str> =
-        [task_tools.filter(|_| p.use_task_tools).map(|_| TOOL_NOTE), Some(BACKGROUND_NOTE), Some(instructions).filter(|s| !s.is_empty())]
-            .into_iter()
-            .flatten()
-            .collect();
+    let system: Vec<&str> = [
+        task_tools.filter(|_| p.use_task_tools).map(|_| TOOL_NOTE),
+        Some(BACKGROUND_NOTE),
+        Some(crate::agent::prompt::REPLY_FORMAT),
+        Some(instructions).filter(|s| !s.is_empty()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     if !system.is_empty() {
         a.extend(["--append-system-prompt".into(), system.join("\n\n")]);
     }
@@ -1190,8 +1198,7 @@ mod tests {
             "python3 tools/gen.py",
             "sed -n 1,5p f.rs",
             "cat f.rs",
-            "grep -rn tee src",
-            "rg python3",
+            "git log --oneline | grep fix",
             "",
             "ls docs/timezone && grep -c 'Zone' docs/timezone/index.html && node -e 'const U={\"½\":.5}; const s=require(\"fs\").readFileSync(\"docs/timezone/index.html\",\"utf8\"); console.log(Object.keys(U).filter(k => s.includes(k)).length > 0)'",
             "node -e \"process.stdout.write(String(1 + 1))\"",
@@ -1200,5 +1207,10 @@ mod tests {
             assert!(hook(ok).is_ok(), "{ok}");
         }
         assert!(hook("not json").is_ok() && shell_edit_hook("{}").is_ok());
+        // Code searches go to the task-x search tools; the message names the call.
+        for search in ["grep -rn tee src", "rg python3", "find . -name '*.rs'", r#"grep -rn "ROAD_END\|createRoad" scripts/*.js | sort"#] {
+            let msg = hook(search).unwrap_err();
+            assert!(msg.contains("mcp__task-x__") && !msg.contains("writes files"), "{search}: {msg}");
+        }
     }
 }

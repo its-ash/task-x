@@ -8,6 +8,7 @@ pub mod fs;
 pub mod git;
 pub mod patch;
 pub mod search;
+pub mod shell_search;
 pub mod validate;
 pub mod web;
 

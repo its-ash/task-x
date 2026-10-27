@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 const DEFAULT_LIMIT: usize = 100;
-const MAX_LIMIT: usize = 1_000;
+pub(super) const MAX_LIMIT: usize = 1_000;
 const MAX_EXCERPT: usize = 300;
 const MAX_PATTERN: usize = 1_000;
 
@@ -154,7 +154,7 @@ fn excerpt(line: &str) -> String {
     format!("{}…", &t[..cut])
 }
 
-fn build_regex(pattern: &str, literal: bool, case_sensitive: bool) -> Result<Regex, ToolError> {
+pub(super) fn build_regex(pattern: &str, literal: bool, case_sensitive: bool) -> Result<Regex, ToolError> {
     if pattern.is_empty() || pattern.len() > MAX_PATTERN {
         return Err(ToolError::invalid(format!("pattern must be 1..={MAX_PATTERN} characters")));
     }
@@ -168,11 +168,16 @@ fn build_regex(pattern: &str, literal: bool, case_sensitive: bool) -> Result<Reg
 
 fn grep(c: &ToolCtx, re: &Regex, glob: Option<&str>, limit: usize, offset: usize) -> ToolResult {
     let filter = glob.map(|g| globset([g]).map_err(ToolError::invalid)).transpose()?;
+    grep_where(c, re, |rel| !filter.as_ref().is_some_and(|g| !g.is_match(rel)), limit, offset)
+}
+
+/// Matching lines in the indexed files whose path `keep` accepts.
+pub(super) fn grep_where(c: &ToolCtx, re: &Regex, keep: impl Fn(&str) -> bool, limit: usize, offset: usize) -> ToolResult {
     c.with_workspace(|w| {
         let mut matches = Vec::new();
         let mut total = 0usize;
         for f in w.index.files() {
-            if filter.as_ref().is_some_and(|g| !g.is_match(&f.rel)) {
+            if !keep(&f.rel) {
                 continue;
             }
             let Some(text) = f.content.as_deref() else { continue };

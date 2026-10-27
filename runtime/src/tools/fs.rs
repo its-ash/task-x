@@ -320,7 +320,9 @@ fn read_range(c: &ToolCtx, input: Value) -> ToolResult {
         )));
     }
     if end < start {
-        return Err(ToolError::invalid(format!("read_range: end {end} is before start {start} ({rel} has {total} lines; valid 1..={total})")));
+        return Err(ToolError::invalid(format!(
+            "read_range: end {end} is before start {start} ({rel} has {total} lines; valid 1..={total})"
+        )));
     }
     if start > total {
         return Err(ToolError::invalid(format!(
@@ -455,10 +457,21 @@ mod tests {
         let named = run(&c, "read_range", json!({ "path": "lib.rs", "startLine": 3, "endLine": 4 })).unwrap();
         assert_eq!(named["content"], r["content"], "startLine/endLine are accepted as start/end");
         assert_eq!(run(&c, "read_range", json!({ "path": "lib.rs", "start_line": 3, "end_line": 4 })).unwrap()["content"], r["content"]);
-        assert_eq!(run(&c, "read_range", json!({ "path": "lib.rs", "offset": 3, "limit": 2 })).unwrap()["content"], r["content"], "offset/limit work too");
-        assert_eq!(run(&c, "read_file", json!({ "path": "lib.rs", "startLine": 3, "endLine": 4 })).unwrap()["content"], r["content"], "read_file takes a range");
+        assert_eq!(
+            run(&c, "read_range", json!({ "path": "lib.rs", "offset": 3, "limit": 2 })).unwrap()["content"],
+            r["content"],
+            "offset/limit work too"
+        );
+        assert_eq!(
+            run(&c, "read_file", json!({ "path": "lib.rs", "startLine": 3, "endLine": 4 })).unwrap()["content"],
+            r["content"],
+            "read_file takes a range"
+        );
         assert_eq!(run(&c, "read_file", json!({ "path": "lib.rs", "start": 3, "end": 4 })).unwrap()["content"], r["content"]);
-        assert_eq!(run(&c, "read_file", json!({ "path": "lib.rs", "offset": 4, "endLine": 3 })).unwrap_err().kind, ToolErrorKind::InvalidInput);
+        assert_eq!(
+            run(&c, "read_file", json!({ "path": "lib.rs", "offset": 4, "endLine": 3 })).unwrap_err().kind,
+            ToolErrorKind::InvalidInput
+        );
         assert_eq!(run(&c, "read_range", json!({ "path": "lib.rs", "start": 3 })).unwrap_err().kind, ToolErrorKind::InvalidInput);
         let r = run(&c, "read_file", json!({ "path": "lib.rs", "offset": 5, "limit": 10 })).unwrap();
         assert_eq!((r["endLine"].as_u64(), r["more"].as_bool()), (Some(5), Some(false)));

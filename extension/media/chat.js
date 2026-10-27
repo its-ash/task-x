@@ -276,24 +276,83 @@
   nightSwitch.addEventListener('change', () => vscode.postMessage({ type: 'selectNight', enabled: nightSwitch.checked }));
   autoCommitBox.addEventListener('change', () => vscode.postMessage({ type: 'selectAutoCommit', enabled: autoCommitBox.checked }));
 
-  // ---------- Markdown (fenced code, inline code, bold, headings, lists) ----------
-  function renderInline(parent, text) {
+  // ---------- Markdown (fenced code, inline code, bold, italic, highlights, headings, lists, callouts) ----------
+  // Inline: `code`, **bold**, *italic*, ==highlight==, and (recommended) as a badge.
+  const INLINE = /(`[^`\n]+`|\*\*[^*\n]+\*\*|==[^=\n]+==|\*\((?:recommended|suggested)\)\*|\((?:recommended|suggested)\)|(?<![\w*])\*[^*\s][^*\n]*\*(?![\w*])|(?<![\w_])_[^_\s][^_\n]*_(?![\w_]))/gi;
+  function renderInline(parent, text, opts = {}) {
+    // In a question card, the opening question of a paragraph or item stands out.
+    const q = opts.ask ? text.match(/^[^.!?\n]{3,240}\?(?=\s|$)/) : null;
+    if (q) {
+      const s = el('span', 'md-ask');
+      renderInline(s, q[0]);
+      parent.append(s);
+      text = text.slice(q[0].length);
+    }
     let last = 0;
-    for (const m of text.matchAll(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/g)) {
+    for (const m of text.matchAll(INLINE)) {
       if (m.index > last) parent.append(text.slice(last, m.index));
       const t = m[0];
-      parent.append(t.startsWith('`') ? el('code', null, t.slice(1, -1)) : el('strong', null, t.slice(2, -2)));
+      if (t.startsWith('`')) parent.append(el('code', null, t.slice(1, -1)));
+      else if (/^\*?\((?:recommended|suggested)\)\*?$/i.test(t)) parent.append(el('span', 'md-badge', t.replace(/[*()]/g, '').replace(/^./, (c) => c.toUpperCase())));
+      else if (t.startsWith('**')) parent.append(el('strong', null, t.slice(2, -2)));
+      else if (t.startsWith('==')) parent.append(el('mark', 'md-mark', t.slice(2, -2)));
+      else parent.append(el('em', null, t.slice(1, -1)));
       last = m.index + t.length;
     }
     if (last < text.length) parent.append(text.slice(last));
+  }
+  // Callout cards: GitHub alerts (`> [!WARNING]`), and sections whose heading asks the user for
+  // something or flags a risk. Each kind has its own colour and icon.
+  const CALLOUTS = {
+    note: ['info', 'Note'], tip: ['lightbulb', 'Tip'], important: ['star-full', 'Important'],
+    warning: ['warning', 'Warning'], caution: ['error', 'Caution'], question: ['question', 'Your input needed'],
+  };
+  const CALLOUT_ALIAS = { decision: 'question', ask: 'question', confirm: 'question', danger: 'caution', risk: 'warning', info: 'note' };
+  const ASK_HEADING = /\b(?:need(?:s|ed)? from you|to confirm|please (?:confirm|choose|decide)|your (?:call|decision|input)|decisions? (?:needed|for you)|questions? for you|open questions|action (?:required|needed)|next steps? for you)\b/i;
+  const WARN_HEADING = /\b(?:constraint|caveat|warning|risks?|heads[- ]up|security|breaking|gotcha|watch out|flag(?:ging)?)\b/i;
+  function calloutKind(raw) {
+    const k = raw.toLowerCase();
+    return CALLOUTS[k] ? k : CALLOUT_ALIAS[k] || 'note';
+  }
+  function callout(kind, title) {
+    const card = el('div', `md-callout ${kind}`);
+    const head = el('div', 'md-callout-head');
+    head.append(icon(CALLOUTS[kind][0]));
+    const t = el('span', 'md-callout-title');
+    renderInline(t, title || CALLOUTS[kind][1]);
+    head.append(t);
+    const body = el('div', 'md-callout-body');
+    card.append(head, body);
+    return { card, body };
   }
   function renderMarkdown(container, text) {
     container.replaceChildren();
     const lines = text.split('\n');
     let list = null, para = [];
-    const flush = () => { if (para.length) { const p = el('p'); renderInline(p, para.join('\n')); container.append(p); para = []; } };
+    // Where blocks go: the message, or the card of the section being read.
+    let out = container, ask = false;
+    const flush = () => { if (para.length) { const p = el('p'); renderInline(p, para.join('\n'), { ask }); out.append(p); para = []; } };
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
+      const quote = line.match(/^\s*>\s?(.*)$/);
+      if (quote) {
+        flush(); list = null;
+        const body = [quote[1]];
+        for (; i + 1 < lines.length && /^\s*>/.test(lines[i + 1]); i++) body.push(lines[i + 1].replace(/^\s*>\s?/, ''));
+        const alert = body[0].match(/^\[!(\w+)\][ \t]*(.*)$/);
+        if (alert) {
+          const kind = calloutKind(alert[1]);
+          const { card, body: inner } = callout(kind, alert[2].trim());
+          renderMarkdown(inner, body.slice(1).join('\n'));
+          if (kind === 'question') inner.querySelectorAll(':scope > p, li').forEach((n) => markAsk(n));
+          out.append(card);
+        } else {
+          const bq = el('blockquote', 'md-quote');
+          renderMarkdown(bq, body.join('\n'));
+          out.append(bq);
+        }
+        continue;
+      }
       const fence = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
       if (fence) {
         flush(); list = null;
@@ -310,19 +369,48 @@
         const pre = el('pre');
         pre.append(highlight(code, fence[2].trim().split(/\s/)[0]));
         wrap.append(head, pre);
-        container.append(wrap);
+        out.append(wrap);
         continue;
       }
-      const h = line.match(/^(#{1,4})\s+(.*)$/), li = line.match(/^\s*(?:[-*]|\d+\.)\s+(.*)$/);
-      if (h) { flush(); list = null; const e = el('h' + Math.min(6, h[1].length + 2)); renderInline(e, h[2]); container.append(e); }
-      else if (li) {
+      // A heading, or a line that is only bold text, starts a section; a section that asks the
+      // user something or flags a risk becomes a card until the next heading.
+      const h = line.match(/^(#{1,4})\s+(.*)$/) || line.match(/^\s*()\*\*([^*\n]{2,80})\*\*:?\s*$/);
+      const li = line.match(/^\s*(?:[-*]|\d+\.)\s+(.*)$/);
+      if (h) {
+        flush(); list = null; out = container; ask = false;
+        const title = h[2].trim().replace(/:$/, '');
+        const kind = ASK_HEADING.test(title) ? 'question' : WARN_HEADING.test(title) ? 'warning' : null;
+        if (kind) {
+          const { card, body } = callout(kind, title);
+          container.append(card);
+          out = body;
+          ask = kind === 'question';
+        } else {
+          const e = el(h[1] ? 'h' + Math.min(6, h[1].length + 2) : 'h4');
+          renderInline(e, title);
+          container.append(e);
+        }
+      } else if (li) {
         flush();
-        if (!list) { list = el(/^\s*\d+\./.test(line) ? 'ol' : 'ul'); container.append(list); }
-        const e = el('li'); renderInline(e, li[1]); list.append(e);
+        if (!list) { list = el(/^\s*\d+\./.test(line) ? 'ol' : 'ul'); out.append(list); }
+        const e = el('li');
+        renderInline(e, li[1], { ask });
+        if (/\((?:recommended|suggested)\)/i.test(li[1])) e.classList.add('md-recommended');
+        list.append(e);
       } else if (!line.trim()) { flush(); list = null; }
       else { list = null; para.push(line); }
     }
     flush();
+  }
+  // Marks the opening question of a rendered paragraph or item (alert cards render their body first).
+  function markAsk(node) {
+    const first = node.firstChild;
+    if (first?.nodeType !== Node.TEXT_NODE) return;
+    const q = first.textContent.match(/^[^.!?\n]{3,240}\?(?=\s|$)/);
+    if (!q) return;
+    const s = el('span', 'md-ask', q[0]);
+    first.textContent = first.textContent.slice(q[0].length);
+    node.insertBefore(s, first);
   }
   // Syntax highlighting with highlight.js (common languages). Its output escapes all source text,
   // so the HTML it returns holds only its own <span class="hljs-…"> markup around escaped text.

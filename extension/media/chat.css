@@ -164,6 +164,27 @@ body[data-view="history"] #log, body[data-view="history"] #changes, body[data-vi
 .md h3, .md h4, .md h5, .md h6 { margin: 12px 0 4px; font-size: 1em; font-weight: 600; }
 .md ul, .md ol { margin: 0 0 8px; padding-left: 20px; }
 .md li { margin: 2px 0; }
+.md strong { font-weight: 650; color: var(--on-surface); }
+.md em { font-style: italic; color: var(--on-surface-variant); }
+/* Highlights: ==text== as a marker, (recommended) as a badge, the user's question in bold accent. */
+.md .md-mark { padding: 0 4px; border-radius: 4px; font-weight: 600; color: var(--md-ext-on-amber-container); background: var(--md-ext-amber-container); }
+.md .md-badge { display: inline-block; margin: 0 2px; padding: 0 7px; border-radius: 999px; font-size: .8em; font-weight: 700; letter-spacing: .02em; line-height: 1.6; vertical-align: 1px; color: var(--md-ext-on-green-container); background: var(--md-ext-green-container); }
+.md .md-ask { font-weight: 650; color: var(--c, var(--accent)); }
+.md li.md-recommended { margin: 6px 0; padding: 6px 10px; border: 1px solid color-mix(in srgb, var(--ok) 35%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--ok) 10%, var(--surface)); }
+.md .md-quote { margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 12px; color: var(--on-surface-variant); background: var(--surface-high); }
+/* Callout cards: GitHub alerts and sections that ask the user something or flag a risk. */
+.md .md-callout { --c: var(--md-sys-color-secondary); margin: 12px 0; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--c) 28%, transparent); border-radius: 16px; background: linear-gradient(160deg, color-mix(in srgb, var(--c) 14%, var(--surface)), color-mix(in srgb, var(--c) 6%, var(--surface))); box-shadow: 0 1px 2px color-mix(in srgb, var(--shadow) 40%, transparent), 0 6px 18px -12px var(--shadow); }
+.md .md-callout.tip { --c: var(--ok); }
+.md .md-callout.important { --c: var(--md-sys-color-tertiary); }
+.md .md-callout.warning { --c: var(--warn); }
+.md .md-callout.caution { --c: var(--md-sys-color-error, var(--del)); }
+.md .md-callout.question { --c: var(--accent); }
+.md .md-callout-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-weight: 700; color: var(--c); }
+.md .md-callout-head .codicon { display: grid; place-items: center; flex: none; width: 24px; height: 24px; border-radius: 50%; font-size: 14px; color: var(--surface); background: var(--c); }
+.md .md-callout-title { min-width: 0; word-break: break-word; }
+.md .md-callout-body > :last-child { margin-bottom: 0; }
+.md .md-callout-body > ol, .md .md-callout-body > ul { padding-left: 22px; }
+.md .md-callout-body li::marker { font-weight: 700; color: var(--c); }
 .md code { font-family: var(--mono); font-size: .92em; color: var(--vscode-textPreformat-foreground); background: var(--vscode-textPreformat-background, var(--vscode-textCodeBlock-background)); padding: 1px 5px; border-radius: 6px; }
 .code { margin: 8px 0 12px; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--vscode-editor-background); }
 .code-head { display: flex; justify-content: space-between; align-items: center; padding: 3px 4px 3px 12px; font-size: 11px; font-weight: 600; color: var(--on-surface-variant); background: var(--surface-high); }
