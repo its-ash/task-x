@@ -91,19 +91,8 @@
   .bar { display: flex; align-items: center; gap: 20px; min-height: 64px; }
   .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: -.01em; color: var(--fg); }
   .brand:hover { text-decoration: none; }
-  /* The hippo mark: mid grays by default (reads on light), lifted to lighter grays on dark. */
-  .hippo { display: block; flex: none; }
-  .hippo .c1 { fill: #6c6c70; }
-  .hippo .c2 { fill: #56565a; }
-  .hippo .c3 { fill: #2d2d2d; }
-  .hippo .c4 { fill: #a0a0a4; }
-  .hippo .c5 { fill: #6c6c70; }
-  [data-theme="dark"] .hippo .c1 { fill: #d5dade; }
-  [data-theme="dark"] .hippo .c2 { fill: #b9c0c6; }
-  [data-theme="dark"] .hippo .c3 { fill: #e6edf4; }
-  [data-theme="dark"] .hippo .c4 { fill: #94a1ac; }
-  [data-theme="dark"] .hippo .c5 { fill: #e6edf4; }
-  .brand img { display: block; border-radius: 5px; }
+  /* The chip mark: white on the brand gradient, the same as the extension icon. */
+  .mark { display: block; flex: none; border-radius: 7px; }
   .nav { margin-inline-start: auto; display: flex; align-items: center; gap: 4px; }
   .nav a { color: var(--fg-muted); font-size: 14px; padding: 10px 10px; border-radius: 8px; font-weight: 500; }
   .nav a:hover { color: var(--fg); background: var(--primary-tint); text-decoration: none; }
@@ -172,6 +161,17 @@
   .term pre { margin: 0; padding: 18px 18px 20px; overflow-x: auto; font-size: 13.5px; line-height: 1.75; }
   .cmt { color: var(--fg-muted); }
   .pr { color: var(--accent); user-select: none; }
+  /* Install terminal: one tab per system. */
+  .os-tabs { display: inline-flex; gap: 4px; padding: 3px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elev); }
+  .os-tab {
+    font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--fg-muted);
+  }
+  .os-tab:hover { color: var(--fg); }
+  .os-tab[aria-selected="true"] { color: var(--on-primary); background: var(--primary); }
+  .os-tab .codicon { font-size: 13px; color: inherit; }
+  .term .os-note { margin: 0; padding: 0 18px 16px; color: var(--fg-muted); font-size: 12.5px; line-height: 1.6; }
 
   /* ---------- sections: one layout family per section ---------- */
   section { padding-block: 72px; border-top: 1px solid var(--border); }
@@ -269,17 +269,7 @@
 <header class="site-header">
   <div class="wrap bar">
     <a class="brand" href="#main">
-      <svg class="hippo" width="24" height="24" viewBox="0 0 64 64" aria-hidden="true">
-        <path class="c1" d="M57,41c0,7.39-5.74,11.62-13,12-.33,0-.66,0-1,0a13.83,13.83,0,0,1-5-.92l-.07,0a16.19,16.19,0,0,0-11.86,0l-.07,0A13.83,13.83,0,0,1,21,53c-.34,0-.67,0-1,0-7.26-.35-13-4.58-13-12,0-5.18,2.81-7.7,7-10.12V24.5A17.49,17.49,0,0,1,43,11.33c.3.26.58.52.86.8a17.64,17.64,0,0,1,2.89,3.81A17.34,17.34,0,0,1,49,24.5v5.85C53.73,32.6,57,35.42,57,41Z" />
-        <path class="c2" d="M20.91,10.58A17.34,17.34,0,0,0,16.21,16a4.5,4.5,0,1,1,4.7-5.41Z" />
-        <circle class="c3" cx="23.5" cy="20.5" r="1.5" />
-        <circle class="c3" cx="40.5" cy="20.5" r="1.5" />
-        <path class="c2" d="M52,11.5a4.51,4.51,0,0,1-5.24,4.44,17.64,17.64,0,0,0-2.89-3.81c-.28-.28-.56-.54-.86-.8a4.5,4.5,0,0,1,9,.17Z" />
-        <path class="c4" d="M26,52.08V56a1,1,0,0,1-1,1H21a1,1,0,0,1-1-1V53c.33,0,.66,0,1,0A13.83,13.83,0,0,0,26,52.08Z" />
-        <path class="c4" d="M44,53v3a1,1,0,0,1-1,1H39a1,1,0,0,1-1-1V52.08A13.83,13.83,0,0,0,43,53C43.34,53,43.67,53,44,53Z" />
-        <circle class="c5" cx="18.5" cy="41.5" r="2.5" />
-        <circle class="c5" cx="45.5" cy="41.5" r="2.5" />
-      </svg>
+      <img class="mark" src="logo.svg" width="28" height="28" alt="" />
       task-x
     </a>
     <nav class="nav" aria-label="Main">
@@ -316,15 +306,26 @@
       <div class="col-b term-col rise">
         <div class="term">
           <div class="term-head">
-            <span class="codicon codicon-terminal" aria-hidden="true"></span>
-            <span class="name">install</span>
+            <div class="os-tabs" role="tablist" aria-label="System">
+              <button class="os-tab" role="tab" type="button" id="tabMac" aria-controls="osMac" aria-selected="true"><span class="codicon codicon-terminal" aria-hidden="true"></span>macOS</button>
+              <button class="os-tab" role="tab" type="button" id="tabWin" aria-controls="osWin" aria-selected="false" tabindex="-1"><span class="codicon codicon-terminal-powershell" aria-hidden="true"></span>Windows</button>
+            </div>
             <button class="copy" id="copy" type="button"><span class="codicon codicon-copy" aria-hidden="true"></span><span id="copyLabel">Copy</span></button>
           </div>
+          <div id="osMac" role="tabpanel" aria-labelledby="tabMac">
 <pre><code><span class="cmt"># from the latest release</span>
 <span class="pr">$</span> code --install-extension task-x.vsix
 
 <span class="cmt"># from a clone of this repo</span>
 <span class="pr">$</span> make add</code></pre>
+          </div>
+          <div id="osWin" role="tabpanel" aria-labelledby="tabWin" hidden>
+<pre><code><span class="cmt"># PowerShell: build the runtime for Windows, then install</span>
+<span class="pr">&gt;</span> git clone https://github.com/its-ash/task-x.git
+<span class="pr">&gt;</span> cd task-x
+<span class="pr">&gt;</span> .\scripts\install-windows.ps1</code></pre>
+            <p class="os-note">Needs git, Rust (MSVC), and Node 22+. The release <code>.vsix</code> holds a macOS runtime, so Windows builds its own.</p>
+          </div>
         </div>
       </div>
     </div>
@@ -533,11 +534,37 @@
           reset = setTimeout(function () { label.textContent = 'Copy'; }, 1600);
         };
         if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+          navigator.clipboard.writeText(typeof text === 'function' ? text() : text).then(function () { done(true); }, function () { done(false); });
         } else { done(false); }
       });
     }
-    wireCopy(document.getElementById('copy'), document.getElementById('copyLabel'), 'code --install-extension task-x.vsix');
+    var installs = {
+      tabMac: 'code --install-extension task-x.vsix',
+      tabWin: 'git clone https://github.com/its-ash/task-x.git\ncd task-x\n.\\scripts\\install-windows.ps1',
+    };
+    var osTab = /windows/i.test(navigator.userAgent) ? 'tabWin' : 'tabMac';
+    var tabs = document.querySelectorAll('.os-tab');
+    function showOs(id) {
+      osTab = id;
+      tabs.forEach(function (t) {
+        var on = t.id === id;
+        t.setAttribute('aria-selected', String(on));
+        t.tabIndex = on ? 0 : -1;
+        document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+      });
+    }
+    tabs.forEach(function (t) {
+      t.addEventListener('click', function () { showOs(t.id); });
+      t.addEventListener('keydown', function (e) {
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+        e.preventDefault();
+        var next = t.id === 'tabMac' ? 'tabWin' : 'tabMac';
+        showOs(next);
+        document.getElementById(next).focus();
+      });
+    });
+    showOs(osTab);
+    wireCopy(document.getElementById('copy'), document.getElementById('copyLabel'), function () { return installs[osTab]; });
     wireCopy(document.getElementById('protoCopy'), document.getElementById('protoLabel'), 'agent/run -> agent/event (toolStarted, fileChanged, done)');
   })();
 </script>

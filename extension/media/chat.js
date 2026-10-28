@@ -447,14 +447,28 @@
   }
 
   // ---------- Transcript ----------
-  // Empty chat: a verse from the Bhagavad Gita (18.66), no buttons.
-  const WELCOME = 'सर्वधर्मान्परित्यज्य मामेकं शरणं व्रज।\nअहं त्वा सर्वपापेभ्यो मोक्षयिष्यामि मा शुचः॥';
+  // Empty chat: one short line, picked at random each time an empty chat is drawn.
+  const WELCOME = [
+    'Tokens warm. Context loaded. What are we building?',
+    'I read the repo so you do not have to. Ask away.',
+    'Weights loaded. Coffee optional. Bugs beware.',
+    'Give me a goal; I will bring the diffs.',
+    'Every refactor starts with one prompt.',
+    'Neurons idle. Let us make something ship.',
+    'Small steps, verified. Where do we start?',
+    'Undo is one click away. Be bold.',
+    'I do not sleep. Unless Night Mode says retry.',
+    'Describe the change. I will find the files.',
+    'Your code, your model, my tools. Ready.',
+    'Hello, human. The tests are waiting.',
+  ];
+  let welcomeLine = '';
   function welcome() {
     if (log.children.length) return;
+    const others = WELCOME.filter((l) => l !== welcomeLine);
+    welcomeLine = others[Math.floor(Math.random() * others.length)];
     const w = el('div', 'welcome');
-    const verse = el('p', 'welcome-verse', WELCOME);
-    verse.lang = 'sa';
-    w.append(verse);
+    w.append(icon('sparkle', 'welcome-icon'), el('p', 'welcome-verse', welcomeLine));
     log.append(w);
   }
   function response() {

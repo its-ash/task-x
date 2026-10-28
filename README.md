@@ -20,7 +20,23 @@ make add    # download task-x.vsix from the latest release and install it
    - Or in VS Code: open the Extensions view, click **…** (Views and More Actions), select **Install from VSIX…**, and select the file.
 3. Reload the VS Code window.
 
-The `.vsix` holds a runtime built for the machine that published it (now macOS on Apple silicon). On another platform, build it from source (see [Quick start](#quick-start)).
+The `.vsix` holds a runtime built for the machine that published it (now macOS on Apple silicon). On another platform, build it from source (see [Quick start](#quick-start), or [Windows](#windows) below).
+
+### Windows
+
+The release `.vsix` does not run on Windows, so build the runtime on your machine. You need [git](https://git-scm.com/download/win), [Rust](https://rustup.rs) with the MSVC toolchain (the Visual Studio C++ Build Tools), [Node.js](https://nodejs.org) 22 or later, and VS Code with `code` on the `PATH`.
+
+In PowerShell:
+
+```powershell
+git clone https://github.com/its-ash/task-x.git
+cd task-x
+.\scripts\install-windows.ps1
+```
+
+The script builds `task-x-runtime.exe`, packages the extension with it, and installs it into VS Code. Use `-Code code-insiders` for VS Code Insiders. If PowerShell blocks the script, run it once with `powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1`. Then reload the VS Code window.
+
+On Windows, commands run without an OS sandbox: task-x uses `sandbox-exec` on macOS and `bwrap` on Linux only. The workspace and permission checks still apply.
 
 **To use it:**
 
@@ -122,10 +138,11 @@ docs/        Protocol, providers, context, security, extensibility
 
 ## Requirements
 
-- Rust 1.85 or later
+- Rust 1.85 or later (on Windows, the MSVC toolchain)
 - Node.js (see `.nvmrc`)
 - VS Code 1.100 or later
 - git (for worktree subagents and auto-commit)
+- `make` for the commands below (macOS and Linux); on Windows use `scripts\install-windows.ps1`
 
 ## Quick start
 
