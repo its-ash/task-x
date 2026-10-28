@@ -351,7 +351,7 @@
     menu.append(seg, el('div', `settings-desc ${cur}`, EDIT_MODES[cur][2]));
     menuHeader(menu, 'Models');
     modelRowSetting(menu, 'refine', 'sparkle', 'Refine model', 'Rewrites your prompt with the sparkle button.', 'routed or chat model');
-    modelRowSetting(menu, 'helper', 'zap', 'Helper model', 'A small, cheap model for file summaries and research subagents.', 'chat model');
+    modelRowSetting(menu, 'helper', 'zap', 'Loop model', 'A small, cheap model for file summaries and research subagents.', 'chat model');
     menuHeader(menu, 'Options');
     toggleRow(menu, {
       key: 'loop', ic: 'sync', title: 'Loop Mode', on: state.night,

@@ -345,8 +345,16 @@ body[data-view="history"] #log, body[data-view="history"] #changes, body[data-vi
 .questions .option:hover { background: color-mix(in srgb, var(--on-surface) var(--md-state-hover), transparent); }
 .questions .option:has(input:checked) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .questions .option:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
-.questions .option input { flex: none; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.questions .option input { appearance: none; flex: none; display: grid; place-content: center; box-sizing: border-box; width: 16px; height: 16px; margin: 0; border: 2px solid var(--outline, var(--on-surface-variant)); border-radius: 50%; background: transparent; cursor: pointer; transition: border-color var(--md-duration-short4) ease, background-color var(--md-duration-short4) ease; }
+.questions .option input[type=checkbox] { border-radius: 4px; }
+.questions .option input::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); transform: scale(0); transition: transform var(--md-duration-short4) var(--md-motion-standard); }
+.questions .option input[type=checkbox]::before { content: "\eab2"; width: auto; height: auto; border-radius: 0; font: normal normal normal 12px/1 codicon; color: var(--on-accent); background: none; }
+.questions .option:hover input:not(:checked) { border-color: var(--on-surface); }
+.questions .option input:checked { border-color: var(--accent); }
+.questions .option input[type=checkbox]:checked { background: var(--accent); }
+.questions .option input:checked::before { transform: scale(1); }
 .questions .option input:focus-visible { outline: none; }
+@media (forced-colors: active) { .questions .option input { border-color: ButtonText; } .questions .option input:checked { border-color: Highlight; } .questions .option input::before { background: Highlight; } .questions .option input[type=checkbox]:checked { background: Highlight; } .questions .option input[type=checkbox]::before { color: HighlightText; background: none; } }
 .opt-text { flex: 1; min-width: 0; word-break: break-word; }
 .opt-key { flex: none; min-width: 16px; padding: 0 4px; border: 1px solid var(--border); border-radius: 4px; font-family: var(--mono); font-size: 10px; line-height: 16px; text-align: center; color: var(--on-surface-variant); opacity: 0; transition: opacity var(--md-duration-short4) ease; }
 .q-panel:focus-within .opt-key, .questions .option:hover .opt-key { opacity: 1; }
@@ -501,8 +509,8 @@ textarea::placeholder { color: var(--on-surface-variant); }
 .settings-head { display: flex; align-items: center; gap: 8px; padding: 6px 6px 2px; font-weight: 600; color: var(--on-surface); }
 .settings-head .codicon { color: var(--accent); }
 .seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 3px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-high); }
-.menu-item.seg-btn { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 4px; border-radius: 9px; font-weight: 600; color: var(--on-surface-variant); }
-.menu-item.seg-btn[aria-checked=true] { color: var(--on-accent); background: var(--accent); box-shadow: 0 1px 3px var(--shadow); }
+.menu-item.seg-btn { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 4px; border: 1px solid color-mix(in srgb, var(--outline) 60%, transparent); border-radius: 9px; font-weight: 600; color: var(--on-surface-variant); }
+.menu-item.seg-btn[aria-checked=true] { border-color: transparent; color: var(--on-accent); background: var(--accent); box-shadow: 0 1px 3px var(--shadow); }
 .menu-item.seg-btn.safe[aria-checked=true] { color: var(--md-ext-on-green, #fff); background: var(--ok); }
 .menu-item.seg-btn.ask[aria-checked=true] { color: var(--md-ext-on-amber, #000); background: var(--warn); }
 .settings-desc { margin: 6px 2px 2px; padding: 8px 10px; border-radius: 10px; font-size: 11.5px; line-height: 1.45; color: var(--on-surface-variant); background: color-mix(in srgb, var(--accent) 8%, transparent); }
@@ -514,10 +522,15 @@ textarea::placeholder { color: var(--on-surface-variant); }
 .setting-text { display: grid; gap: 2px; min-width: 0; }
 .setting-text .title { font-weight: 600; }
 .setting-text .desc { grid-column: auto; }
-.setting-switch { position: relative; flex: none; width: 30px; height: 18px; border-radius: 999px; background: var(--outline, var(--border)); transition: background-color var(--md-duration-short4) ease; }
-.setting-switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: var(--surface); transition: transform var(--md-duration-short4) var(--md-motion-standard); }
-.setting-row[aria-checked=true] .setting-switch { background: var(--accent); }
-.setting-row[aria-checked=true] .setting-switch::after { transform: translateX(12px); background: var(--on-accent); }
+.setting-switch { position: relative; flex: none; box-sizing: border-box; width: 34px; height: 20px; border: 2px solid var(--outline, var(--border)); border-radius: 999px; background: var(--surface-high); transition: background-color var(--md-duration-short4) ease, border-color var(--md-duration-short4) ease; }
+.setting-switch::after { content: ""; position: absolute; top: 1px; left: 1px; width: 14px; height: 14px; border-radius: 50%; background: var(--outline, var(--border)); transform: scale(.72); transition: transform var(--md-duration-short4) var(--md-motion-standard), background-color var(--md-duration-short4) ease, box-shadow var(--md-duration-short4) ease; }
+.setting-row:hover:not(:disabled) .setting-switch { border-color: var(--on-surface-variant); }
+.setting-row:hover:not(:disabled) .setting-switch::after { box-shadow: 0 0 0 5px color-mix(in srgb, var(--fg) 8%, transparent); }
+.setting-row:focus-visible .setting-switch { outline: 2px solid var(--focus, var(--accent)); outline-offset: 2px; }
+.setting-row[aria-checked=true] .setting-switch { border-color: var(--accent); background: var(--accent); }
+.setting-row[aria-checked=true] .setting-switch::after { transform: translateX(14px); background: var(--on-accent); box-shadow: 0 1px 2px var(--shadow); }
+.setting-row[aria-checked=true]:hover:not(:disabled) .setting-switch::after { box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 18%, transparent); }
+@media (forced-colors: active) { .setting-switch { border-color: ButtonText; } .setting-switch::after { background: ButtonText; } .setting-row[aria-checked=true] .setting-switch { border-color: Highlight; background: Highlight; } .setting-row[aria-checked=true] .setting-switch::after { background: HighlightText; } }
 /* Toolbar chip for the settings: its colour shows the edit mode. */
 .pick.settings-pick { flex: none; gap: 5px; }
 .pick.settings-pick > .codicon:first-child { color: var(--accent); }
