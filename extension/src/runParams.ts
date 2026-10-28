@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { editMode, isProviderRef, providerConfig, settings, SECTION } from './config.js';
+import { editMode, isProviderRef, providerConfig, providerConfigWith, settings, SECTION, toolModels } from './config.js';
 import { type ChatMode, type EditorContext, type ImageInput, type PolicyConfig, type PriceRule, type ProviderConfig, ROLES, type Role } from './protocol.js';
 
 const TASK_KINDS = ['question', 'bugInvestigation', 'codeModification', 'newFeature', 'refactoring', 'testing', 'documentation', 'repositoryWide', 'architecture'];
@@ -35,7 +35,14 @@ export function limits() {
     // 0 lets the runtime use the model's known window.
     contextWindowTokens: clamp(c.get('context.windowTokens'), 0, 10_000_000, 0) || undefined,
     compactPercent: clamp(c.get('context.compactAt'), 30, 95, 85),
+    lazyTools: c.get<boolean>('agent.lazyTools', true),
   };
+}
+
+/** The cheap helper model for file summaries and research subagents, when one is picked and usable. */
+export async function helperProvider(secrets: vscode.SecretStorage): Promise<ProviderConfig | undefined> {
+  const h = toolModels().helper;
+  return h && isProviderRef(h.kind) ? providerConfigWith(secrets, h.kind, h.model).catch(() => undefined) : undefined;
 }
 
 /** `task-x.pricing` rules that are well formed. */
@@ -77,6 +84,7 @@ export async function runParams(secrets: vscode.SecretStorage, o: { prompt: stri
     )
   ).filter((r) => r.provider);
   return {
+    helper: await helperProvider(secrets),
     prompt: o.prompt,
     images: o.images ?? [],
     provider,

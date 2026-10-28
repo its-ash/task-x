@@ -3,15 +3,16 @@
 This file records the state of the work between sessions. Mark an item done only after a test or a manual check proves it.
 
 **Last verified:**
-- Runtime: `cargo test` passes 158 tests (150 unit, 8 protocol); `cargo clippy --all-targets` reports no warnings. The unit tests include a Team-mode run (plan → research and implementation subagents → merge into the edit log), best-of-N with two candidates, plan validation, cost estimates, checkpoint reload, a 70 KB skill file, forced summaries at the iteration and tool-call limits, destructive-tool opt-in, error classes, retry backoff, a fallback that rebuilds the request for the new model's window, a blocking hook that runs before the approval prompt, `web_fetch` refusing local and private targets, approval previews for every editing tool, streamed tool calls that share one index or repeat their arguments, subagent roles written in any capitalisation or as an alias, hidden folders pruned from the index while hidden files stay, `edit_files` accepting the batch shapes models send and a loose top level, `copy_file`/`move_file` bringing a file in from outside the workspace, a worktree the agent created being discarded without an opt-in, policy denials not counting as being stuck, a command whose pipe a child holds open no longer hanging, a slow command handed to the background while a quick one returns its output, a resumed task keeping its tool results, and interrupted (`running`) records marked failed at start.
-- Extension: `npm test` passes 31 tests, including end-to-end runs through the built runtime with mock providers, a checkpoint reload across a runtime restart, and the review-findings parser.
+- Runtime: `cargo test` passes 188 tests (180 unit, 8 protocol); `cargo clippy --all-targets` reports no warnings. The unit tests include prompt caching (breakpoints, and cache reads priced at a tenth), shortened command output with `read_log`, repeated reads answered with a note, the 300-line read default with an outline, `multi_search` and multi-name `read_symbol`, the lazy tool list (`find_tool`, and a deferred tool loaded by name), `summarize_file` through the helper model, project memory in the prompt, a Team-mode run (plan → research and implementation subagents → merge into the edit log), best-of-N with two candidates, plan validation, cost estimates, checkpoint reload, a 70 KB skill file, forced summaries at the iteration and tool-call limits, destructive-tool opt-in, error classes, retry backoff, a fallback that rebuilds the request for the new model's window, a blocking hook that runs before the approval prompt, `web_fetch` refusing local and private targets, approval previews for every editing tool, streamed tool calls that share one index or repeat their arguments, subagent roles written in any capitalisation or as an alias, hidden folders pruned from the index while hidden files stay, `edit_files` accepting the batch shapes models send and a loose top level, `copy_file`/`move_file` bringing a file in from outside the workspace, a worktree the agent created being discarded without an opt-in, policy denials not counting as being stuck, a command whose pipe a child holds open no longer hanging, a slow command handed to the background while a quick one returns its output, a resumed task keeping its tool results, and interrupted (`running`) records marked failed at start.
+- Extension: `npm test` passes 43 tests, including end-to-end runs through the built runtime with mock providers, a checkpoint reload across a runtime restart, and the review-findings parser.
 - Manual checks:
   - `provider/test` against a local Ollama server
   - skill and instruction discovery on this machine (87 skills from `~/.copilot/skills`)
   - chat UI rendered in Chrome at 300 px and 500 px width
 
 **Not verified yet:**
-- The MCP HTTP transport test, and the tests that open a local port, were not run in the last session: its sandbox blocks local ports. All other runtime and extension tests passed.
+- The MCP HTTP transport test, and the tests that open a local port, now run in this session's sandbox and pass (`mcp::tests::talks_to_a_streamable_http_server`, `serves_the_tool_registry_over_mcp`, the checkpoint/restart tests); a sandbox that blocks local ports still skips them.
+- Prompt caching against the real Anthropic API: the breakpoints and the cache-token accounting are covered by unit tests, but no request was made with a key, so the cache actually being read is unproven. OpenAI's automatic caching likewise.
 - Claude Code with `sandbox.allowUnsandboxedCommands: false` in a real run
 - Real Anthropic and OpenAI streaming (no keys used)
 - The extension inside a VS Code Extension Development Host
@@ -20,13 +21,15 @@ This file records the state of the work between sessions. Mark an item done only
 - Inside VS Code: the project graph panel, the index status, the @ file menu and context chips, syntax highlighting, notifications, subagent lanes, the Team mode tab, the Compare panel (best of N), background tasks and the status bar count, and review findings in the Problems panel
 - Team mode and best of N against real models (only mock providers so far)
 - The `browser` tool against a live Chrome: only its endpoint check, argument validation, and JavaScript escaping are covered by tests; click, type, and navigation have not run against a real page
+- The token savers against real models: the lazy tool list, `summarize_file` with a real helper model, and the shortened output are covered with mock providers; whether a model actually calls `find_tool` instead of inventing a tool is not
+- In the chat UI: the running-tab timer and Stop, the token chip on tool rows, the tables in replies and in your own messages, the Refine and Helper model rows in the settings dialog, and the backtick wrapping in the input
 
 | Phase | Status | Where |
 |---|---|---|
 | 1 Foundation, providers, JSON-RPC | ✅ | `runtime/src/{rpc,server}.rs`, `runtime/src/provider/`, `extension/src/{rpc,runtime,providerDialog}.ts` |
 | 2 Project discovery and context | ✅ | `runtime/src/context/`, `docs/context.md` |
 | 3 Prompt enrichment | ✅ | `runtime/src/agent/prompt.rs` |
-| 4 Tool registry (38 tools) | ✅ | `runtime/src/tools/` |
+| 4 Tool registry (47 tools) | ✅ | `runtime/src/tools/` |
 | 5 Agent loop | ✅ | `runtime/src/agent/{mod,store}.rs` |
 | 6 VS Code experience | ✅ core | `extension/src/{chatView,editorCommands,workspace}.ts`, `extension/media/` |
 | 7 Permissions, sandbox, recovery | ✅ | `agent/policy.rs`, `tools/exec.rs` (sandbox), `tools/mod.rs` (undo, keep/revert), `docs/security.md` |
@@ -48,6 +51,7 @@ This file records the state of the work between sessions. Mark an item done only
 | 23 Release | 🟡 not run yet | `make deploy` (publishes `task-x.vsix` on the GitHub release), `make add` (installs it) |
 | 20 Safety and observability | 🟡 | `agent/policy.rs` (destructive tools need an `allow` entry), `tools/mod.rs` (`ErrorClass`, `TOOL_ATTEMPTS`, `retry_backoff`), `agent/mod.rs` (`synthesize` at the iteration and tool-call limits, retries for read-only calls, `info!` events for model and tool calls), `main.rs` (`TASK_X_LOG`) |
 | 25 Browser automation | ✅ runtime (unit tests), ✅ VS Code integrated browser (`open` checked live on VS Code 1.143), 🟡 not checked against a live Chrome or a VS Code Simple Browser over CDP | `tools/browser.rs` (CDP over a websocket), the `browser` tool: tabs, open, goto, click, type, press, screenshot, text, html, eval, wait, back, forward, close; `docs/security.md` |
+| 26 Fewer tokens per turn | ✅ runtime (unit tests), 🟡 not checked against real models | prompt caching (`provider/anthropic.rs`, `cached_tokens`, `agent/cost.rs`), `tools/logs.rs` (`read_log`), repeated reads and the 300-line read default (`agent/mod.rs`, `tools/fs.rs`), `multi_search` and multi-name `read_symbol` (`tools/{search,fs}.rs`), the lazy tool list (`task-x.agent.lazyTools`, `find_tool`), `summarize_file` with the helper model, `tools/memory.rs` (`remember`, `.task-x/memory.md`), the token chip in `media/chat.js`; `docs/protocol.md` *Token savers* |
 
 ## What each phase delivers
 
@@ -105,15 +109,15 @@ This file records the state of the work between sessions. Mark an item done only
 4. A Windows sandbox (commands run without one there).
 5. Prices for providers other than Anthropic: they need `task-x.pricing` rules; until then their tokens show as unpriced.
 6. Binary files in a worktree merge are applied by git but are not in the edit log, so undo does not restore them.
-7. Requested agent features not yet built, in build order (each needs its own design and tests). Already in place: the token and call budgets with a forced final summary (`max_total_tokens`, `synthesize`), error classes (`errors.rs`, `tools::ErrorClass`), edit-log checkpoints, and batched tool execution (`join_all` in `run_calls`).
+7. Requested agent features not yet built, in build order (each needs its own design and tests). Already in place: the token and call budgets with a forced final summary (`max_total_tokens`, `synthesize`), error classes (`errors.rs`, `tools::ErrorClass`), edit-log checkpoints, batched tool execution (`join_all` in `run_calls`), and the token savers of phase 26 (prompt caching, `read_log`, repeated reads, the lazy tool list, `summarize_file`, and project memory).
    - First: incremental re-indexing with a debounced watcher, and a persisted graph with a version check; a tool execution hook layer that unifies approval, budget, logging, and provenance; the blast-radius gate.
    - Second: query classification; graph tools as agent tools; graph-driven context loading; ranked repo map.
-   - Third: cross-session memory (SQLite or JSONL is a decision still open); BM25 fallback; retrieval provenance log; typed tool results.
+   - Third: cross-session memory as a searchable store (SQLite or JSONL is a decision still open) — `remember` and `.task-x/memory.md` now carry short facts into every task, but there is no recall, search, or pruning of old notes; BM25 fallback; retrieval provenance log; typed tool results.
    - Fourth: self-evolving skills; scheduled jobs; self-evaluation loop; edge-weighted impact scoring; schema validation and prompt versioning.
    - Last: parallel tool calls within a turn beyond the current batching; real-model tests for Team mode and the Logs panel.
    - Query classification (structural, semantic, hybrid with reciprocal rank fusion) and graph tools (`call_graph`, `module_summary`, `imports_of`, `symbol_definition`). `find_definition`, `find_references`, and `get_dependencies` already exist.
    - Token-budgeted PageRank repository map at session start; graph-driven context loading; a blast-radius gate on edits.
-   - Cross-session memory (SQLite or JSONL, recalled into the system prompt); self-evolving skill patches; agent self-evaluation.
+   - Cross-session memory recall beyond the 6,000-character `.task-x/memory.md` block (`remember`); self-evolving skill patches; agent self-evaluation.
    - Typed tool results (`Text`, `Json`, `Image`, `FileRef`, `Error`) and schema validation of tool inputs and outputs.
    - BM25 fallback when embeddings are unavailable; edge-weighted impact scoring; retrieval provenance view.
    - Scheduled jobs, a watch-mode daemon, and multi-channel output (webhook, file).

@@ -14,6 +14,34 @@ fn headers(cfg: &ResolvedConfig) -> Vec<(&'static str, String)> {
     h
 }
 
+/// Anthropic counts cache reads and cache writes apart from `input_tokens`; the prompt is all three.
+fn usage(u: &Value) -> Usage {
+    let (read, write) = (u["cache_read_input_tokens"].as_u64(), u["cache_creation_input_tokens"].as_u64());
+    let input = u["input_tokens"].as_u64().map(|i| i + read.unwrap_or(0) + write.unwrap_or(0));
+    Usage { input_tokens: input, output_tokens: u["output_tokens"].as_u64(), cached_tokens: read }
+}
+
+const CACHE: &str = r#"{"type":"ephemeral"}"#;
+
+/// Prompt caching: breakpoints on the last tool, the system prompt, and the newest message. In an
+/// agent loop each turn repeats the tools, the system prompt, and the history, so the next turn
+/// reads all of it from the cache at a fraction of the price. Prompts under the model's minimum
+/// cache size are simply not cached.
+fn add_cache_breakpoints(body: &mut Value) {
+    let mark = || serde_json::from_str::<Value>(CACHE).expect("cache control json");
+    if let Some(last) = body["tools"].as_array_mut().and_then(|t| t.last_mut()) {
+        last["cache_control"] = mark();
+    }
+    if let Some(s) = body["system"].as_str().map(str::to_owned) {
+        body["system"] = json!([{ "type": "text", "text": s, "cache_control": mark() }]);
+    }
+    let last_block =
+        body["messages"].as_array_mut().and_then(|m| m.last_mut()).and_then(|m| m["content"].as_array_mut()).and_then(|c| c.last_mut());
+    if let Some(b) = last_block {
+        b["cache_control"] = mark();
+    }
+}
+
 pub fn chat_request(cfg: &ResolvedConfig, req: &ChatRequest) -> HttpRequest {
     let messages: Vec<Value> = req
         .messages
@@ -47,6 +75,7 @@ pub fn chat_request(cfg: &ResolvedConfig, req: &ChatRequest) -> HttpRequest {
         body["tools"] =
             req.tools.iter().map(|t| json!({ "name": t.name, "description": t.description, "input_schema": t.input_schema })).collect();
     }
+    add_cache_breakpoints(&mut body);
     HttpRequest::post(cfg.endpoint("/v1/messages"), headers(cfg), body)
 }
 
@@ -116,12 +145,7 @@ impl Decoder {
         let idx = v["index"].as_u64().unwrap_or(0);
         let mut out = Vec::new();
         match v["type"].as_str().unwrap_or_default() {
-            "message_start" => {
-                let u = &v["message"]["usage"];
-                out.push(StreamEvent::Usage {
-                    usage: Usage { input_tokens: u["input_tokens"].as_u64(), output_tokens: u["output_tokens"].as_u64() },
-                });
-            }
+            "message_start" => out.push(StreamEvent::Usage { usage: usage(&v["message"]["usage"]) }),
             "content_block_start" => {
                 let b = &v["content_block"];
                 match b["type"].as_str() {
@@ -163,10 +187,8 @@ impl Decoder {
                 if let Some(r) = v["delta"]["stop_reason"].as_str() {
                     self.stop = Some(StopReason::from_provider(r));
                 }
-                if let Some(o) = v["usage"]["output_tokens"].as_u64() {
-                    out.push(StreamEvent::Usage {
-                        usage: Usage { input_tokens: v["usage"]["input_tokens"].as_u64(), output_tokens: Some(o) },
-                    });
+                if v["usage"]["output_tokens"].is_u64() {
+                    out.push(StreamEvent::Usage { usage: usage(&v["usage"]) });
                 }
             }
             "message_stop" => {
@@ -247,7 +269,7 @@ mod tests {
         let b = chat_request(&cfg(), &req).body.unwrap();
         assert_eq!(
             b["messages"][0]["content"][1],
-            json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=" } })
+            json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=" }, "cache_control": { "type": "ephemeral" } })
         );
     }
 
@@ -280,7 +302,11 @@ mod tests {
         assert_eq!(r.url, "https://api.anthropic.com/v1/messages");
         assert!(r.headers.iter().any(|(k, v)| *k == "x-api-key" && v == "sk-test"));
         let b = r.body.unwrap();
-        assert_eq!(b["system"], "be brief");
+        assert_eq!(b["system"][0]["text"], "be brief");
+        assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral", "the system prompt is a cache breakpoint");
+        assert_eq!(b["tools"].as_array().unwrap().last().unwrap()["cache_control"]["type"], "ephemeral");
+        let last = b["messages"].as_array().unwrap().last().unwrap()["content"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["cache_control"]["type"], "ephemeral", "the newest message is a cache breakpoint");
         assert_eq!(b["max_tokens"], 100);
         assert_eq!(b["stream"], true);
         assert_eq!(b["tools"][0]["input_schema"]["type"], "object");
@@ -327,7 +353,14 @@ data: {"type":"message_stop"}
         assert_eq!(out.tool_calls[0].name, "search");
         assert_eq!(out.tool_calls[0].input, json!({"q": "x"}));
         assert_eq!(out.stop_reason, StopReason::ToolUse);
-        assert_eq!(out.usage, Usage { input_tokens: Some(12), output_tokens: Some(30) });
+        assert_eq!(out.usage, Usage { input_tokens: Some(12), output_tokens: Some(30), cached_tokens: None });
+        let cached =
+            usage(&json!({ "input_tokens": 5, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 100, "output_tokens": 2 }));
+        assert_eq!(
+            cached,
+            Usage { input_tokens: Some(1_005), output_tokens: Some(2), cached_tokens: Some(900) },
+            "the prompt counts cached tokens too"
+        );
     }
 
     #[test]

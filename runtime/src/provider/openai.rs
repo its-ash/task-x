@@ -260,7 +260,12 @@ impl Decoder {
         let mut out = Vec::new();
         if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
             out.push(StreamEvent::Usage {
-                usage: Usage { input_tokens: u["prompt_tokens"].as_u64(), output_tokens: u["completion_tokens"].as_u64() },
+                usage: Usage {
+                    input_tokens: u["prompt_tokens"].as_u64(),
+                    output_tokens: u["completion_tokens"].as_u64(),
+                    // OpenAI caches long, repeated prompt prefixes by itself; this says how much hit.
+                    cached_tokens: u["prompt_tokens_details"]["cached_tokens"].as_u64(),
+                },
             });
         }
         for choice in v["choices"].as_array().into_iter().flatten().filter(|c| c["index"].as_u64().unwrap_or(0) == 0) {

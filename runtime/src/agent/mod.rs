@@ -104,6 +104,10 @@ pub struct Limits {
     /// Subagents that run at the same time in Team mode (1..=8).
     #[serde(default = "d_parallel")]
     pub max_parallel: u32,
+    /// Offer a core set of tools and load the others on first use (`find_tool`, or calling one by
+    /// name). The full list costs tokens on every turn.
+    #[serde(default)]
+    pub lazy_tools: bool,
 }
 fn d_parallel() -> u32 {
     3
@@ -132,6 +136,7 @@ impl Default for Limits {
             context_window_tokens: None,
             compact_percent: d_compact_percent(),
             max_parallel: d_parallel(),
+            lazy_tools: false,
         }
     }
 }
@@ -168,6 +173,9 @@ pub struct RunParams {
     /// A provider for subagents of one role (for example a local model for research).
     #[serde(default)]
     pub role_providers: Vec<RoleProvider>,
+    /// A small, cheap model for `summarize_file`. Unset: the task's own model.
+    #[serde(default)]
+    pub helper: Option<ProviderConfig>,
     /// Nesting level; subagents run at depth 1 and cannot start more subagents.
     #[serde(default, skip_deserializing)]
     pub depth: u32,
@@ -491,6 +499,87 @@ struct Run {
     prices: Vec<cost::PriceRule>,
     role_providers: Vec<RoleProvider>,
     background: Arc<Background>,
+    /// Read calls by name and input → (fingerprint of the result, id of the call that returned it).
+    reads: HashMap<String, (u64, String)>,
+    /// Tools not offered yet (lazy tool list); calling one by name, or `find_tool`, loads it.
+    deferred: Vec<crate::provider::ToolSpec>,
+    helper: Option<ProviderConfig>,
+}
+
+/// Tools offered from the start when the tool list is lazy: what nearly every coding task uses.
+const CORE_TOOLS: &[&str] = &[
+    "read_file",
+    "read_range",
+    "read_symbol",
+    "get_file_outline",
+    "search_text",
+    "search_regex",
+    "multi_search",
+    "find_files",
+    "find_symbol",
+    "find_references",
+    "list_files",
+    "replace_text",
+    "edit_files",
+    "create_file",
+    "apply_patch",
+    "run_command",
+    "run_tests",
+    "check_build",
+    "git_diff",
+    "read_log",
+    "remember",
+];
+const FIND_TOOL: &str = "find_tool";
+const SUMMARIZE: &str = "summarize_file";
+/// Read calls whose repeat, with the same result still in the conversation, is answered with a
+/// short note instead of the same content again.
+const REREAD_TOOLS: &[&str] = &["read_file", "read_range", "read_symbol", "get_file_outline", "read_multiple_files", "read_log"];
+/// File text sent to the helper model for one summary.
+const MAX_SUMMARY_SOURCE_CHARS: usize = 120_000;
+const SUMMARY_TOKENS: u32 = 900;
+
+fn find_tool_spec(deferred: &[crate::provider::ToolSpec]) -> crate::provider::ToolSpec {
+    let names: Vec<&str> = deferred.iter().map(|t| t.name.as_str()).collect();
+    crate::provider::ToolSpec {
+        name: FIND_TOOL.into(),
+        description: format!(
+            "Load more tools. Give names to load them, or a query to find them by name and description. Loaded tools can be called from the next step. Not loaded yet: {}.",
+            names.join(", ")
+        ),
+        input_schema: json!({ "type": "object", "properties": {
+            "names": { "type": "array", "items": { "type": "string" } },
+            "query": { "type": "string" }
+        }, "additionalProperties": false }),
+    }
+}
+
+fn summarize_spec() -> crate::provider::ToolSpec {
+    crate::provider::ToolSpec {
+        name: SUMMARIZE.into(),
+        description: "Get a short summary of a large file from a helper model instead of reading it all: its purpose, its main parts with line numbers, and the answer to question. Use it for files you need to understand, not for code you will edit (read that range).".into(),
+        input_schema: json!({ "type": "object", "properties": {
+            "path": { "type": "string" },
+            "question": { "type": "string", "description": "What you need to know from the file" }
+        }, "required": ["path"], "additionalProperties": false }),
+    }
+}
+
+/// The deferred tools that match: exact names first, else every word of the query in the name or description.
+fn match_tools(deferred: &[crate::provider::ToolSpec], input: &Value) -> Vec<String> {
+    let names: Vec<&str> = input["names"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let words: Vec<String> = input["query"].as_str().unwrap_or_default().to_lowercase().split_whitespace().map(str::to_owned).collect();
+    deferred
+        .iter()
+        .filter(|t| {
+            names.contains(&t.name.as_str()) || {
+                let hay = format!("{} {}", t.name, t.description).to_lowercase();
+                !words.is_empty() && words.iter().all(|w| hay.contains(w.as_str()))
+            }
+        })
+        .take(10)
+        .map(|t| t.name.clone())
+        .collect()
 }
 
 /// `run_command` calls with `background: true`: how many still run, and the reports of the finished ones.
@@ -527,6 +616,10 @@ enum Target {
     Plan(bool),
     /// `ask_user`: the questions to put to the user.
     Ask(Vec<Question>),
+    /// `find_tool`: loads deferred tools (in `record`, which may change the tool list).
+    FindTool,
+    /// `summarize_file`: a helper model reads the file and returns a summary.
+    Summarize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -727,7 +820,7 @@ impl Target {
         match self {
             Self::Builtin(d) => d.permission,
             Self::Mcp(..) => Permission::Network,
-            Self::Skill | Self::Ask(_) => Permission::Read,
+            Self::Skill | Self::Ask(_) | Self::FindTool | Self::Summarize => Permission::Read,
             Self::Subagent(r) => {
                 if r.writes() {
                     Permission::Write
@@ -777,6 +870,7 @@ impl Run {
         self.rec.usage = Usage {
             input_tokens: add(self.rec.usage.input_tokens, u.input_tokens),
             output_tokens: add(self.rec.usage.output_tokens, u.output_tokens),
+            cached_tokens: add(self.rec.usage.cached_tokens, u.cached_tokens),
         };
     }
 
@@ -1006,6 +1100,12 @@ impl Run {
         let blocked = |m: &str| tools::ToolError::new(ToolErrorKind::Forbidden, m);
         // The tool list is fixed for the task, so a tool that is not in it is out of reach whatever
         // the model sends: say so as Blocked rather than as a failing call it should keep trying.
+        // A deferred tool called by name is loaded on the spot: the model knew its name from the
+        // find_tool list, so making it ask first would only cost a turn.
+        if let Some(i) = self.deferred.iter().position(|s| s.name == call.name) {
+            let spec = self.deferred.remove(i);
+            self.tool_specs.push(spec);
+        }
         if !self.tool_specs.iter().any(|s| s.name == call.name) {
             return Err(blocked(&format!("Tool '{}' is not available in this mode.", call.name)));
         }
@@ -1027,6 +1127,8 @@ impl Run {
                     .any(|s| serde_json::from_value::<team::Role>(s["role"].clone()).map_or(true, |r: team::Role| r.writes())),
             ),
             None if call.name == ASK_USER => Target::Ask(parse_questions(&call.input).map_err(|e| invalid(&e))?),
+            None if call.name == FIND_TOOL => Target::FindTool,
+            None if call.name == SUMMARIZE => Target::Summarize,
             None if call.name == "worktree_apply" => Target::Worktree("worktree_apply"),
             None if call.name == "worktree_discard" => Target::Worktree("worktree_discard"),
             None => self
@@ -1122,6 +1224,8 @@ impl Run {
         let context = call.input["context"].as_str().unwrap_or_default();
         let provider = provider
             .or_else(|| self.role_providers.iter().find(|r| r.role == role).map(|r| r.provider.clone()))
+            // Research only reads and reports, so the cheap helper model does it when one is set.
+            .or_else(|| self.helper.clone().filter(|_| role == team::Role::Research))
             .unwrap_or_else(|| self.provider.clone());
         let mut host = self.host.clone();
         host.store = Store::new(None);
@@ -1164,6 +1268,7 @@ impl Run {
             fallbacks: self.fallbacks.clone(),
             prices: self.prices.clone(),
             role_providers: Vec::new(),
+            helper: self.helper.clone(),
             depth: self.depth + 1,
         };
         let child_cancel = self.cancel.child_token();
@@ -1463,6 +1568,13 @@ impl Run {
             Target::Subagent(role) => self.subagent(*role, call).await.map_err(|e| tools::ToolError::new(ToolErrorKind::Failed, e)),
             Target::Plan(_) => self.run_plan(call).await.map_err(|e| tools::ToolError::new(ToolErrorKind::Failed, e)),
             Target::Ask(qs) => Ok(self.ask(call, qs).await),
+            Target::FindTool => {
+                let found = match_tools(&self.deferred, &call.input);
+                Ok(
+                    json!({ "loaded": found, "note": if found.is_empty() { "No tool matched; check the names in the find_tool description." } else { "Call them from the next step." } }),
+                )
+            }
+            Target::Summarize => self.summarize(call).await,
             Target::Worktree(op) => {
                 let name = call.input["name"].as_str().unwrap_or_default().to_owned();
                 let (repo, cancel, op) = (self.cwd.clone(), self.cancel.clone(), *op);
@@ -1513,9 +1625,87 @@ impl Run {
         res
     }
 
+    /// A helper model (or the task's model) reads a file and returns a short summary, so the file
+    /// itself never enters this conversation.
+    async fn summarize(&self, call: &ToolCall) -> Result<Value, tools::ToolError> {
+        let fail = |m: String| tools::ToolError::new(ToolErrorKind::Failed, m);
+        let path = call.input["path"].as_str().unwrap_or_default();
+        let ctx = self.ctx().map_err(fail)?;
+        let (rel, text) = tools::fs::read_text(&ctx, path)?;
+        let numbered: String = text.lines().enumerate().map(|(n, l)| format!("{:>5} {l}\n", n + 1)).collect();
+        let cut = numbered.len() > MAX_SUMMARY_SOURCE_CHARS;
+        let source = truncate(&numbered, MAX_SUMMARY_SOURCE_CHARS);
+        let question = call.input["question"]
+            .as_str()
+            .filter(|q| !q.trim().is_empty())
+            .unwrap_or("What does this file do, and what are its main parts?");
+        let provider = self.helper.clone().unwrap_or_else(|| self.provider.clone());
+        let req = ChatRequest {
+            system: Some("You summarize one source file for a coding agent that will not read it. Be short and exact: the file's purpose, its main parts with their line numbers, and the answer to the question. Quote names exactly. If the file does not answer the question, say so.".into()),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::Text { text: format!("<file path=\"{rel}\">\n{source}</file>\n\nQuestion: {question}") }],
+            }],
+            tools: Vec::new(),
+            max_tokens: Some(SUMMARY_TOKENS),
+            temperature: None,
+            context_window: None,
+        };
+        let out = self.host.providers.stream_chat(&provider, &req, &self.cancel, |_| {}).await.map_err(|e| fail(e.message))?;
+        let t = out.usage.input_tokens.unwrap_or(0) + out.usage.output_tokens.unwrap_or(0);
+        let mut totals = self.sub_totals.lock().expect("sub totals lock");
+        totals.tokens += t;
+        match (is_local(&provider), cost::estimate(&self.prices, &provider, &out.usage)) {
+            (true, _) => {}
+            (false, Some(c)) => totals.cost_usd += c,
+            (false, None) => totals.unpriced += t,
+        }
+        Ok(json!({ "path": rel, "lines": text.lines().count(), "summary": out.text.trim(), "model": provider.model, "partial": cut }))
+    }
+
+    /// A repeated read whose earlier result is still in the conversation, unchanged: a short note
+    /// points back to it instead of sending the same content again.
+    fn unchanged_read(&mut self, call: &ToolCall, result: &str) -> Option<String> {
+        if !REREAD_TOOLS.contains(&call.name.as_str()) {
+            return None;
+        }
+        let key = format!("{}:{}", call.name, call.input);
+        let hash = tools::fingerprint(result);
+        if let Some((h, prev)) = self.reads.get(&key).filter(|(h, _)| *h == hash) {
+            let still_there = self.rec.messages.iter().flat_map(|m| m.content.iter()).any(|p| {
+                matches!(p, ContentPart::ToolResult { tool_use_id, content, .. } if tool_use_id == prev && tools::fingerprint(content) == *h)
+            });
+            if still_there {
+                return Some(
+                    json!({ "unchanged": true, "sameAs": prev, "note": "Same result as an earlier call with this input, which is still above in this conversation. Use that, or read a different range." })
+                        .to_string(),
+                );
+            }
+        }
+        self.reads.insert(key, (hash, call.id.clone()));
+        None
+    }
+
     fn record(&mut self, call: &ToolCall, res: &Result<Value, tools::ToolError>) -> ContentPart {
         let key = format!("{}:{}", call.name, call.input);
-        let (content, is_error) = match res {
+        if call.name == FIND_TOOL {
+            let loaded: Vec<String> = res
+                .as_ref()
+                .ok()
+                .and_then(|v| v["loaded"].as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            for name in &loaded {
+                if let Some(i) = self.deferred.iter().position(|s| &s.name == name) {
+                    let spec = self.deferred.remove(i);
+                    self.tool_specs.push(spec);
+                }
+            }
+        }
+        let (content, is_error, shown) = match res {
             Ok(v) => {
                 self.failures.remove(&key);
                 for ch in v["changed"].as_array().into_iter().flatten() {
@@ -1542,22 +1732,29 @@ impl Run {
                     };
                     self.rec.validations.push(ValidationRun { tool: call.name.clone(), command: cmd, success, summary });
                 }
-                (v.to_string(), false)
+                // The chat shows the whole output; the model gets the errors and the end, and
+                // read_log for the rest, so a noisy command does not ride along on every later turn.
+                let mut for_model = v.clone();
+                let shown = v.to_string();
+                if tools::logs::shorten(&mut for_model, &format!("{}-{}", self.rec.id, call.id)) {
+                    (for_model.to_string(), false, shown)
+                } else {
+                    (shown.clone(), false, shown)
+                }
             }
             Err(e) => {
                 *self.failures.entry(key).or_default() += 1;
-                (errors::Error::from_tool(&call.name, e).render(), true)
+                let r = errors::Error::from_tool(&call.name, e).render();
+                (r.clone(), true, r)
             }
         };
-        self.emit(
-            json!({ "type": "toolFinished", "callId": call.id, "tool": call.name, "ok": !is_error, "output": truncate(&content, MAX_EVENT_OUTPUT_CHARS) }),
-        );
-        ContentPart::ToolResult {
-            tool_use_id: call.id.clone(),
-            tool_name: Some(call.name.clone()),
-            content: truncate(&content, MAX_HISTORY_RESULT_CHARS),
-            is_error,
-        }
+        let content = truncate(&content, MAX_HISTORY_RESULT_CHARS);
+        let content = if is_error { content } else { self.unchanged_read(call, &content).unwrap_or(content) };
+        self.emit(json!({
+            "type": "toolFinished", "callId": call.id, "tool": call.name, "ok": !is_error,
+            "output": truncate(&shown, MAX_EVENT_OUTPUT_CHARS), "tokens": compact::chars_to_tokens(content.len()),
+        }));
+        ContentPart::ToolResult { tool_use_id: call.id.clone(), tool_name: Some(call.name.clone()), content, is_error }
     }
 
     /// Runs one response's tool calls. Consecutive read-only calls run concurrently; anything that
@@ -2011,6 +2208,33 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     if p.depth == 0 {
         tool_specs.push(ask_spec());
     }
+    if has_ws {
+        tool_specs.push(summarize_spec());
+    }
+    // Lazy tool list: the core tools, the task-x tools that are not registry tools (subagents,
+    // questions, skills, summaries), and the tools a skill needs; everything else waits behind
+    // find_tool. MCP tools wait too: their schemas are often the largest.
+    let mut deferred = Vec::new();
+    if p.limits.lazy_tools {
+        let keep = |t: &crate::provider::ToolSpec| {
+            CORE_TOOLS.contains(&t.name.as_str())
+                || (tools::find(&t.name).is_none() && !t.name.starts_with("mcp__"))
+                || skill_tools.contains(t.name.as_str())
+        };
+        let (now, later): (Vec<_>, Vec<_>) = tool_specs.into_iter().partition(keep);
+        tool_specs = now;
+        deferred = later;
+        if !deferred.is_empty() {
+            tool_specs.push(find_tool_spec(&deferred));
+        }
+    }
+    if let Some(r) = root.as_deref() {
+        let memory = tools::memory::prompt_block(r);
+        if !memory.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&memory);
+        }
+    }
     // The names and parameters in plain words, so a provider that drops `tools` (or a model that
     // ignores the schema) still knows what it may call and with which fields.
     let guide = tool_guide(&tool_specs);
@@ -2126,6 +2350,9 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         prices: p.prices,
         role_providers: p.role_providers,
         background: Arc::default(),
+        reads: HashMap::new(),
+        deferred,
+        helper: p.helper.filter(|h| h.resolve().is_ok()),
     })
 }
 
@@ -2170,6 +2397,7 @@ pub async fn best_of(host: Host, p: BestOfParams, cancel: CancellationToken) -> 
         fallbacks: Vec::new(),
         prices: p.prices,
         role_providers: Vec::new(),
+        helper: None,
         depth: 0,
     };
     let lead = prepare(host, params, cancel).await?;
@@ -2265,6 +2493,15 @@ mod tests {
         format!("data: {}\n\ndata: [DONE]\n\n", json!({ "choices": [{ "index": 0, "delta": { "content": t }, "finish_reason": "stop" }] }))
     }
 
+    /// Text with the token counts a real server reports, for the tests that check where tokens go.
+    fn sse_text_usage(t: &str, prompt: u64, completion: u64) -> String {
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({ "choices": [{ "index": 0, "delta": { "content": t }, "finish_reason": "stop" }] }),
+            json!({ "choices": [], "usage": { "prompt_tokens": prompt, "completion_tokens": completion } })
+        )
+    }
+
     fn host(root: &std::path::Path, decision: ApprovalDecision, events: Arc<Mutex<Vec<Value>>>) -> Host {
         let ws = Workspace::open(root, &[]).unwrap();
         Host {
@@ -2302,6 +2539,7 @@ mod tests {
             limits: Limits::default(),
             task_id: None,
             routes: Vec::new(),
+            helper: None,
             fallbacks: Vec::new(),
             prices: Vec::new(),
             role_providers: Vec::new(),
@@ -3170,7 +3408,8 @@ mod tests {
     #[tokio::test]
     async fn compresses_the_history_when_it_nears_the_window() {
         let root = temp_repo(&[("big.txt", &"some long line of file content\n".repeat(300))]);
-        let read = |id: &str| sse_tool(id, "read_file", json!({ "path": "big.txt" }));
+        // Different ranges each time: a repeat of the same read is answered with a short note.
+        let read = |id: &str| sse_tool(id, "read_file", json!({ "path": "big.txt", "offset": id[1..].parse::<u32>().unwrap() }));
         let (base, seen) = mock(vec![read("r1"), read("r2"), read("r3"), read("r4"), sse_text("done")]);
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut p = params(&base, ChatMode::Ask, Mode::ReadOnly);
@@ -3194,7 +3433,7 @@ mod tests {
     #[tokio::test]
     async fn compression_never_touches_the_tools() {
         let root = temp_repo(&[("big.txt", &"some long line of file content\n".repeat(300))]);
-        let read = |id: &str| sse_tool(id, "read_file", json!({ "path": "big.txt" }));
+        let read = |id: &str| sse_tool(id, "read_file", json!({ "path": "big.txt", "offset": id[1..].parse::<u32>().unwrap() }));
         let (base, seen) = mock(vec![read("r1"), read("r2"), read("r3"), read("r4"), sse_text("done")]);
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut p = params(&base, ChatMode::Ask, Mode::ReadOnly);
@@ -3215,6 +3454,114 @@ mod tests {
             let s = system(q);
             assert!(s.contains("<tools>") && s.contains("read_file("), "the tool guide survives: {s}");
         }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn find_tool_matches_names_or_every_word() {
+        let spec = |name: &str, description: &str| crate::provider::ToolSpec {
+            name: name.into(),
+            description: description.into(),
+            input_schema: json!({}),
+        };
+        let deferred =
+            vec![spec("git_log", "Show recent commits"), spec("web_fetch", "Fetch a public web page"), spec("git_show", "Show one commit")];
+        assert_eq!(match_tools(&deferred, &json!({ "names": ["web_fetch", "nope"] })), ["web_fetch"]);
+        assert_eq!(match_tools(&deferred, &json!({ "query": "git commit" })), ["git_log", "git_show"]);
+        assert!(match_tools(&deferred, &json!({ "query": "" })).is_empty());
+    }
+
+    #[tokio::test]
+    async fn lazy_tools_offer_a_core_set_and_load_the_rest_on_first_call() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        let (base, seen) = mock(vec![sse_tool("t1", "get_file_tree", json!({})), sse_text("Listed.")]);
+        let mut p = params(&base, ChatMode::Ask, Mode::ReadOnly);
+        p.limits.lazy_tools = true;
+        let r = run(host(&root, ApprovalDecision::Allow, Arc::default()), p, CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed);
+        let reqs = seen.lock().unwrap();
+        let names = |q: &Value| {
+            q["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_owned()).collect::<Vec<_>>()
+        };
+        let first = names(&reqs[0]);
+        assert!(first.contains(&"read_file".to_owned()) && first.contains(&FIND_TOOL.to_owned()), "{first:?}");
+        assert!(!first.contains(&"get_file_tree".to_owned()), "a non-core tool waits");
+        assert!(names(&reqs[1]).contains(&"get_file_tree".to_owned()), "calling it by name loads it");
+        let result = reqs[1]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap()["content"].to_string();
+        assert!(result.contains("a.txt"), "the deferred tool ran: {result}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `summarize_file`: a separate model reads the file, so its text never enters this conversation,
+    /// and its tokens count with the subagents' (the file's contents are not sent to the next turn).
+    #[tokio::test]
+    async fn summarize_file_reads_the_file_with_the_helper_model() {
+        let root = temp_repo(&[("big.txt", "line one\nline two\nline three\n")]);
+        let helper = mock(vec![sse_text_usage("Two short lines of text.", 1_000, 20)]);
+        let (base, seen) = mock(vec![
+            sse_tool("c1", SUMMARIZE, json!({ "path": "big.txt", "question": "How many lines?" })),
+            sse_text("It is a short file."),
+        ]);
+        let mut p = params(&base, ChatMode::Agent, Mode::AskBeforeEdit);
+        p.helper = Some(ProviderConfig {
+            kind: ProviderKind::OpenAiCompatible,
+            model: "small".into(),
+            base_url: Some(helper.0),
+            api_key: Some("k".into()),
+            timeout_ms: Some(5_000),
+        });
+        let r = run(host(&root, ApprovalDecision::Allow, Arc::default()), p, CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        // The helper model got the file, with line numbers, and the question.
+        let asked = helper.1.lock().unwrap()[0].to_string();
+        assert!(asked.contains("big.txt") && asked.contains("3 line three") && asked.contains("How many lines?"), "{asked}");
+        let calls = seen.lock().unwrap();
+        let result = calls[1]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap()["content"].to_string();
+        assert!(result.contains("Two short lines of text."), "the summary is the tool result: {result}");
+        assert!(!result.contains("line two"), "the file itself stays out of the conversation: {result}");
+        assert_eq!(r.metrics.subagent_tokens, 1_020, "the helper's tokens count with the subagents'");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Project memory saved by an earlier task is in the system prompt of the next one, so the agent
+    /// does not explore the repository again to learn the same facts.
+    #[tokio::test]
+    async fn project_memory_starts_the_next_task() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        std::fs::create_dir_all(root.join(".task-x")).unwrap();
+        std::fs::write(root.join(".task-x/memory.md"), "# Project memory\n\n- Tests: cargo test --workspace\n").unwrap();
+        let (base, seen) = mock(vec![sse_text("I used the saved test command.")]);
+        let r = run(
+            host(&root, ApprovalDecision::Allow, Arc::default()),
+            params(&base, ChatMode::Ask, Mode::ReadOnly),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        let system = seen.lock().unwrap()[0]["messages"][0]["content"].as_str().unwrap().to_owned();
+        assert!(system.contains("<project_memory>") && system.contains("cargo test --workspace"), "{system}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_repeated_read_is_answered_with_a_note() {
+        let root = temp_repo(&[("a.txt", "the original content\n")]);
+        let read = |id: &str| sse_tool(id, "read_file", json!({ "path": "a.txt" }));
+        let (base, seen) = mock(vec![read("r1"), read("r2"), sse_text("done")]);
+        let r = run(
+            host(&root, ApprovalDecision::Allow, Arc::default()),
+            params(&base, ChatMode::Ask, Mode::ReadOnly),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.status, Status::Completed);
+        let reqs = seen.lock().unwrap();
+        let results: Vec<String> =
+            reqs[2]["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").map(|m| m["content"].to_string()).collect();
+        assert!(results[0].contains("the original content"));
+        assert!(results[1].contains("unchanged") && !results[1].contains("the original content"), "{}", results[1]);
         std::fs::remove_dir_all(root).ok();
     }
 

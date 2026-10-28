@@ -69,8 +69,11 @@ export interface ChatRequest {
 export type StopReason = 'endTurn' | 'maxTokens' | 'toolUse' | 'stopSequence' | 'contentFilter' | 'unknown';
 
 export interface Usage {
+  /** All prompt tokens, cached ones included. */
   inputTokens: number | null;
   outputTokens: number | null;
+  /** Prompt tokens read from the provider's prompt cache. */
+  cachedTokens?: number;
 }
 
 export type StreamEvent =
@@ -378,7 +381,7 @@ export type AgentEvent =
   | { type: 'assistantMessage'; text: string; toolCalls: number }
   | { type: 'retry'; attempt: number; reason: string; waitMs: number }
   | { type: 'toolStarted'; callId: string; tool: string; input: Record<string, unknown>; permission: string }
-  | { type: 'toolFinished'; callId: string; tool: string; ok: boolean; output: string; background?: boolean }
+  | { type: 'toolFinished'; callId: string; tool: string; ok: boolean; output: string; background?: boolean; tokens?: number }
   | { type: 'approvalRequested'; callId: string; tool: string }
   | { type: 'approvalResolved'; callId: string; decision: string }
   | { type: 'fileChanged'; path: string; diff: string; operation: number | null }

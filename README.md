@@ -69,7 +69,20 @@ On Windows, commands run without an OS sandbox: task-x uses `sandbox-exec` on ma
 - **Images:** paste, drop, or attach PNG, JPEG, GIF, or WebP images (up to 8, 5 MB each). They go to the model with the message: Anthropic, OpenAI, and OpenAI-compatible endpoints, Ollama vision models, and Claude Code. The model must support images.
 - **Task history** per workspace; stop a running task, or continue it when it reaches the turn limit.
 - **Context meter** and automatic compression for long tasks.
-- **Busy indicator:** an animated border runs around the input while the agent works.
+- **Busy indicator:** an animated border runs around the input while the agent works, and the running chat's tab shows its elapsed time and a Stop button.
+- **Settings dialog models:** a *Refine model* for the sparkle button, and a *Helper model* (small and cheap) for file summaries and research subagents.
+
+### Fewer tokens
+
+- **Prompt caching:** with the Anthropic API, the tools, the system prompt, and the history are cached between turns, so repeated input costs a tenth. OpenAI caches long prompts by itself. The token note shows how many input tokens came from the cache.
+- **Short command output:** a long test or build log reaches the model as its error lines and its last lines. The chat still shows all of it, and the model reads the rest with `read_log` when it needs to.
+- **No repeated reads:** reading the same file range again, while the first result is still in the conversation, returns a short note in place of the same text.
+- **Smaller first reads:** `read_file` returns 300 lines, and a longer file also lists its symbols with line numbers, so the model reads only the part it needs.
+- **Batch tools:** `multi_search` runs up to 10 searches in one call, and `read_symbol` reads up to 10 symbols. Fewer turns means less repeated context.
+- **Lazy tool list** (`task-x.agent.lazyTools`, on by default): the model starts with the core tools and loads others (git history, the browser, MCP tools) when it needs them.
+- **Summaries from the helper model:** `summarize_file` gives the agent a short summary of a large file, so the file itself never enters the conversation.
+- **Project memory:** the agent keeps lasting facts (build and test commands, layout, conventions) in `.task-x/memory.md` with `remember`, and every new task starts with them.
+- **Tokens per tool:** each tool row in the chat shows about how many tokens its result adds; large ones are highlighted.
 
 ### Agent work
 

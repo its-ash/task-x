@@ -109,6 +109,19 @@ body {
 .chat-tab[data-status=cancelled] .tab-state { background: var(--muted); }
 .tab-close { display: inline-grid; place-items: center; flex: none; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; color: inherit; background: none; cursor: pointer; opacity: 0; transition: opacity var(--md-duration-short4) ease, background-color var(--md-duration-short4) ease; }
 .tab-close .codicon { font-size: 12px; }
+/* The running chat tab: elapsed time and a Stop button, always visible. */
+.chat-tab .tab-time { flex: none; font-size: 11px; font-weight: 600; font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--tab); }
+.tab-stop { display: inline-grid; place-items: center; flex: none; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 6px; color: var(--on-accent); background: var(--tab); cursor: pointer; transition: transform var(--md-duration-short2) ease, filter var(--md-duration-short4) ease; }
+.tab-stop .codicon { font-size: 12px; }
+.tab-stop:hover { filter: brightness(1.1); }
+.tab-stop:active { transform: scale(.92); }
+.chat-tab[data-status=running] { max-width: 220px; }
+/* Tokens a tool result adds to the conversation; large ones stand out. */
+.row .tok { flex: none; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 10px; font-family: var(--mono); line-height: 16px; color: var(--muted); background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.row .tok.big { color: var(--md-ext-on-amber-container); background: var(--md-ext-amber-container); }
+/* A model setting in the settings dialog: its value on the right. */
+.menu-item.model-setting .setting-value { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; color: var(--on-accent-container); background: var(--accent-container); }
+.menu-item.model-setting .setting-value.unset { font-weight: 500; color: var(--muted); background: color-mix(in srgb, var(--fg) 6%, transparent); }
 .chat-tab:hover .tab-close, .chat-tab[aria-selected="true"] .tab-close, .chat-tab:focus-visible .tab-close { opacity: 1; }
 .tab-close:hover { background: color-mix(in srgb, var(--fg) var(--md-state-hover), transparent); }
 @media (hover: none) { .tab-close { opacity: 1; } }
@@ -172,6 +185,17 @@ body[data-view="history"] #log, body[data-view="history"] #changes, body[data-vi
 .md .md-badge { display: inline-block; margin: 0 2px; padding: 0 7px; border-radius: 999px; font-size: .8em; font-weight: 700; letter-spacing: .02em; line-height: 1.6; vertical-align: 1px; color: var(--md-ext-on-green-container); background: var(--md-ext-green-container); }
 .md .md-ask { font-weight: 650; color: var(--c, var(--accent)); }
 .md li.md-recommended { margin: 6px 0; padding: 6px 10px; border: 1px solid color-mix(in srgb, var(--ok) 35%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--ok) 10%, var(--surface)); }
+/* Tables: a rounded card that scrolls sideways when it is wider than the chat. */
+.md .md-table-wrap { margin: 8px 0 12px; overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.md .md-table { width: 100%; border-collapse: collapse; font-size: 12.5px; line-height: 1.45; }
+.md .md-table th, .md .md-table td { padding: 7px 10px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }
+.md .md-table th + th, .md .md-table td + td { border-left: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
+.md .md-table th { font-weight: 650; white-space: nowrap; color: var(--on-surface); background: var(--surface-high); }
+.md .md-table tbody tr:last-child td { border-bottom: 0; }
+.md .md-table tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--fg) 3%, transparent); }
+.md .md-table tbody tr:hover td { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.md .md-table td:first-child { font-weight: 600; color: var(--on-surface); }
+.request-text.md > :last-child { margin-bottom: 0; }
 .md .md-quote { margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 12px; color: var(--on-surface-variant); background: var(--surface-high); }
 /* Callout cards: GitHub alerts and sections that ask the user something or flag a risk. */
 .md .md-callout { --c: var(--md-sys-color-secondary); margin: 12px 0; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--c) 28%, transparent); border-radius: 16px; background: linear-gradient(160deg, color-mix(in srgb, var(--c) 14%, var(--surface)), color-mix(in srgb, var(--c) 6%, var(--surface))); box-shadow: 0 1px 2px color-mix(in srgb, var(--shadow) 40%, transparent), 0 6px 18px -12px var(--shadow); }

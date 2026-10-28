@@ -146,7 +146,11 @@ impl StreamDecoder for Decoder {
         if v["done"].as_bool() == Some(true) {
             self.done = true;
             out.push(StreamEvent::Usage {
-                usage: Usage { input_tokens: v["prompt_eval_count"].as_u64(), output_tokens: v["eval_count"].as_u64() },
+                usage: Usage {
+                    input_tokens: v["prompt_eval_count"].as_u64(),
+                    output_tokens: v["eval_count"].as_u64(),
+                    cached_tokens: None,
+                },
             });
             let stop = match v["done_reason"].as_str() {
                 _ if self.calls > 0 => StopReason::ToolUse,
@@ -235,7 +239,7 @@ mod tests {
         assert_eq!(out.tool_calls[0].id, "call_0");
         assert_eq!(out.tool_calls[0].input, json!({"dir": "."}));
         assert_eq!(out.stop_reason, StopReason::ToolUse);
-        assert_eq!(out.usage, Usage { input_tokens: Some(3), output_tokens: Some(4) });
+        assert_eq!(out.usage, Usage { input_tokens: Some(3), output_tokens: Some(4), cached_tokens: None });
     }
 
     #[test]

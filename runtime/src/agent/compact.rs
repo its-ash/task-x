@@ -13,6 +13,11 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 pub const CHARS_PER_TOKEN: usize = 4;
+
+/// Rough tokens for a text of `chars` characters.
+pub fn chars_to_tokens(chars: usize) -> usize {
+    chars.div_ceil(CHARS_PER_TOKEN)
+}
 const KEEP_TAIL: usize = 6;
 const MAX_ERRORS: usize = 5;
 const MAX_ERROR_CHARS: usize = 1_500;

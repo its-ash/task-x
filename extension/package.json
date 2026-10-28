@@ -2,7 +2,7 @@
   "name": "task-x",
   "displayName": "task-x",
   "description": "Model-agnostic AI coding agent with a Rust runtime. Works with Claude, OpenAI, Ollama, and OpenAI-compatible endpoints.",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "publisher": "its-ash",
   "license": "MIT",
   "private": true,
@@ -479,7 +479,11 @@
         },
         "task-x.agent.editMode": {
           "type": "string",
-          "enum": ["auto", "safe", "ask"],
+          "enum": [
+            "auto",
+            "safe",
+            "ask"
+          ],
           "enumDescriptions": [
             "Every tool runs with no approval prompt: edits, deletes, commands, installs, network, git writes, and MCP tools. Commands still run in the sandbox.",
             "Free inside the project: edits, deletes, and sandboxed commands. Asks before anything that can write or delete beyond it: installs, git writes, network calls, files from outside the workspace, MCP tools, and commands when the OS sandbox is off.",
@@ -487,6 +491,11 @@
           ],
           "default": "auto",
           "markdownDescription": "How much the agent does without asking. Change it from the settings button in the chat toolbar. `task-x.agent.denyTools` always refuses a tool, and `task-x.agent.allowTools` never asks."
+        },
+        "task-x.agent.lazyTools": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Send the model a core set of tools, and load the others (git history, the browser, MCP tools, and more) when it first asks for them with `find_tool` or calls one by name. The full tool list is sent again on every turn, so this saves tokens. Turn off for a model that does not cope with a changing tool list."
         },
         "task-x.agent.approveAll": {
           "type": "boolean",

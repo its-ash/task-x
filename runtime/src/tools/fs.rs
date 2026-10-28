@@ -10,6 +10,11 @@ use std::collections::BTreeSet;
 
 const DEFAULT_LIST_LIMIT: usize = 500;
 const MAX_READ_LINES: usize = 2_000;
+/// Lines a read with no range returns. A longer file also gets its outline, so the model reads only
+/// the part it needs instead of the whole file.
+const DEFAULT_READ_LINES: usize = 300;
+const MAX_OUTLINE: usize = 80;
+const MAX_SYMBOLS: usize = 10;
 const MAX_LINE_CHARS: usize = 2_000;
 const MAX_MULTI_FILES: usize = 20;
 
@@ -65,11 +70,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool(
             "read_file",
-            "Read a text file with line numbers. Use offset/limit for large files.",
+            "Read a text file with line numbers. Without offset/limit it returns the first 300 lines, and a longer file also lists its symbols with line numbers: then read only the range you need.",
             Read,
             || {
                 object(
-                    json!({ "path": path("File path"), "offset": int("First line, 1-based (default 1)", 1), "limit": int("Max lines (default 2000)", 1) }),
+                    json!({ "path": path("File path"), "offset": int("First line, 1-based (default 1)", 1), "limit": int("Max lines (default 300, max 2000)", 1) }),
                     &["path"],
                 )
             },
@@ -96,9 +101,18 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool(
             "read_symbol",
-            "Read the source of a symbol definition by name (optionally in one file).",
+            "Read the source of symbol definitions by name (optionally in one file). Pass names to read up to 10 symbols in one call.",
             Read,
-            || object(json!({ "name": { "type": "string" }, "path": path("Limit to this file") }), &["name"]),
+            || {
+                object(
+                    json!({
+                        "name": { "type": "string" },
+                        "names": { "type": "array", "items": { "type": "string" }, "maxItems": MAX_SYMBOLS, "description": "Several symbols at once" },
+                        "path": path("Limit to this file")
+                    }),
+                    &[],
+                )
+            },
             read_symbol,
         ),
         tool(
@@ -285,12 +299,33 @@ fn read_file(c: &ToolCtx, input: Value) -> ToolResult {
     let i: In = parse(input)?;
     let (rel, text) = read_text(c, &i.path)?;
     let start = i.offset.unwrap_or(1).max(1);
+    let whole = i.end.is_none() && i.limit.is_none();
     let end = match i.end {
         Some(end) if end < start => return Err(ToolError::invalid(format!("read_file: end {end} is before start {start}"))),
         Some(end) => end,
-        None => start + i.limit.unwrap_or(MAX_READ_LINES).clamp(1, MAX_READ_LINES) - 1,
+        None => start + i.limit.unwrap_or(DEFAULT_READ_LINES).clamp(1, MAX_READ_LINES) - 1,
     };
-    range_result(&rel, &text, start, end)
+    let mut r = range_result(&rel, &text, start, end)?;
+    if whole && r["more"] == true {
+        if let Some(outline) = outline(c, &rel, &text) {
+            r["outline"] = json!(outline);
+        }
+        r["note"] = json!(format!(
+            "Showing lines {start}-{} of {}. Read only what you need next: read_range for a range, read_symbol for a definition.",
+            r["endLine"], r["totalLines"]
+        ));
+    }
+    Ok(r)
+}
+
+/// The symbols of a file in one line each (`L12-40 fn name`), for parser-supported languages.
+fn outline(c: &ToolCtx, rel: &str, text: &str) -> Option<Vec<String>> {
+    let (abs, _) = c.resolve_existing(rel).ok()?;
+    let lang = symbols::parser_lang(&abs)?;
+    let defs = symbols::extract(lang, text).definitions;
+    let lines: Vec<String> =
+        defs.iter().take(MAX_OUTLINE).map(|s| format!("L{}-{} {} {}", s.start_line, s.end_line, s.kind, s.name)).collect();
+    (!lines.is_empty()).then_some(lines)
 }
 
 fn read_range(c: &ToolCtx, input: Value) -> ToolResult {
@@ -357,32 +392,56 @@ fn read_symbol(c: &ToolCtx, input: Value) -> ToolResult {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct In {
-        name: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        names: Vec<String>,
         #[serde(default)]
         path: Option<String>,
     }
     let i: In = parse(input)?;
-    let only = i.path.as_deref().map(|p| c.resolve(p).map(|r| r.1)).transpose()?;
-    let defs: Vec<(String, u32, u32, String)> = c.with_workspace(|w| {
-        w.index
-            .definitions(&i.name)
-            .iter()
-            .filter(|(p, _)| only.as_ref().is_none_or(|o| o == p))
-            .map(|(p, s)| (p.clone(), s.start_line, s.end_line, s.kind.clone()))
-            .collect()
-    })?;
-    if defs.is_empty() {
-        return Err(ToolError::new(ToolErrorKind::NotFound, format!("no definition named '{}' in the index", i.name)));
+    let names: Vec<String> = i.name.into_iter().chain(i.names).filter(|n| !n.trim().is_empty()).collect();
+    if names.is_empty() || names.len() > MAX_SYMBOLS {
+        return Err(ToolError::invalid(format!("give name, or names with 1 to {MAX_SYMBOLS} symbols")));
     }
-    let out: Vec<Value> = defs
+    let only = i.path.as_deref().map(|p| c.resolve(p).map(|r| r.1)).transpose()?;
+    let one = |name: &str| -> ToolResult {
+        let defs: Vec<(String, u32, u32, String)> = c.with_workspace(|w| {
+            w.index
+                .definitions(name)
+                .iter()
+                .filter(|(p, _)| only.as_ref().is_none_or(|o| o == p))
+                .map(|(p, s)| (p.clone(), s.start_line, s.end_line, s.kind.clone()))
+                .collect()
+        })?;
+        if defs.is_empty() {
+            return Err(ToolError::new(ToolErrorKind::NotFound, format!("no definition named '{name}' in the index")));
+        }
+        let out: Vec<Value> = defs
+            .iter()
+            .take(10)
+            .map(|(p, s, e, k)| match read_text(c, p) {
+                Ok((rel, t)) => json!({ "path": rel, "kind": k, "startLine": s, "endLine": e, "content": numbered(&t, *s as usize, (*e as usize).min(*s as usize + 300)) }),
+                Err(err) => json!({ "path": p, "error": err }),
+            })
+            .collect();
+        Ok(json!({ "definitions": out, "total": defs.len() }))
+    };
+    if let [name] = names.as_slice() {
+        return one(name);
+    }
+    // Several symbols: one result each, and a missing one does not fail the others.
+    let symbols: Vec<Value> = names
         .iter()
-        .take(10)
-        .map(|(p, s, e, k)| match read_text(c, p) {
-            Ok((rel, t)) => json!({ "path": rel, "kind": k, "startLine": s, "endLine": e, "content": numbered(&t, *s as usize, (*e as usize).min(*s as usize + 300)) }),
-            Err(err) => json!({ "path": p, "error": err }),
+        .map(|n| match one(n) {
+            Ok(mut v) => {
+                v["name"] = json!(n);
+                v
+            }
+            Err(e) => json!({ "name": n, "error": e }),
         })
         .collect();
-    Ok(json!({ "definitions": out, "total": defs.len() }))
+    Ok(json!({ "symbols": symbols }))
 }
 
 fn get_file_outline(c: &ToolCtx, input: Value) -> ToolResult {
@@ -477,12 +536,32 @@ mod tests {
         assert_eq!((r["endLine"].as_u64(), r["more"].as_bool()), (Some(5), Some(false)));
         let s = run(&c, "read_symbol", json!({ "name": "two" })).unwrap();
         assert_eq!(s["definitions"][0]["startLine"], 3);
+        let both = run(&c, "read_symbol", json!({ "names": ["one", "two", "missing"] })).unwrap();
+        assert_eq!(both["symbols"][1]["definitions"][0]["startLine"], 3, "{both}");
+        assert_eq!(both["symbols"][2]["error"]["kind"], "notFound", "a missing symbol does not fail the others");
         let o = run(&c, "get_file_outline", json!({ "path": "lib.rs" })).unwrap();
         assert_eq!(o["symbols"].as_array().unwrap().len(), 2);
         assert!(c.seen.lock().unwrap().contains_key("lib.rs"));
         let m = run(&c, "read_multiple_files", json!({ "paths": ["lib.rs", "missing.rs"] })).unwrap();
         assert_eq!(m["files"][1]["error"]["kind"], "notFound");
         assert_eq!(run(&c, "detect_language", json!({ "path": "lib.rs" })).unwrap()["language"], "rust");
+    }
+
+    #[test]
+    fn a_long_file_reads_its_start_and_lists_its_symbols() {
+        let body: String = (0..400).map(|n| format!("fn f{n}() {{}}\n")).collect();
+        let c = ctx(&[("big.rs", body.as_str())]);
+        let r = run(&c, "read_file", json!({ "path": "big.rs" })).unwrap();
+        assert_eq!((r["endLine"].as_u64(), r["more"].as_bool()), (Some(DEFAULT_READ_LINES as u64), Some(true)));
+        assert!(
+            r["outline"].as_array().is_some_and(|o| o.len() == MAX_OUTLINE && o[MAX_OUTLINE - 1].as_str().unwrap().contains("f79")),
+            "{}",
+            r["outline"]
+        );
+        assert!(r["note"].as_str().unwrap().contains("read_range"));
+        let all = run(&c, "read_file", json!({ "path": "big.rs", "limit": 2000 })).unwrap();
+        assert_eq!(all["endLine"], 400, "an explicit limit reads more");
+        assert!(all.get("outline").is_none());
     }
 
     #[test]

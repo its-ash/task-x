@@ -4,7 +4,6 @@
   const $ = (id) => document.getElementById(id);
   const log = $('log'), input = $('input'), send = $('send'), progress = $('progress');
   const modelBtn = $('modelBtn'), settingsBtn = $('settingsBtn');
-  const runBar = $('runbar'), runTimer = $('runTimer');
   const nightPlanBtn = $('nightPlanBtn'), nightLoopBtn = $('nightLoopBtn');
   const refineBtn = $('refineBtn');
 
@@ -19,6 +18,7 @@
     delete_file: 'Deleted', git_status: 'Git status', git_diff: 'Git diff', git_log: 'Git log', git_show: 'Git show', get_changed_files: 'Changed files',
     get_file_history: 'File history', format_code: 'Formatted', run_linter: 'Linted', run_tests: 'Ran tests', check_build: 'Built',
     get_diagnostics: 'Checked problems', run_command: 'Ran', read_skill: 'Loaded skill', web_fetch: 'Fetched',
+    multi_search: 'Searched', read_log: 'Read log', remember: 'Remembered', find_tool: 'Loaded tools', summarize_file: 'Summarized',
     Read: 'Read', Write: 'Wrote', Edit: 'Edited', MultiEdit: 'Edited', NotebookEdit: 'Edited notebook', Bash: 'Ran', BashOutput: 'Read output',
     KillShell: 'Stopped shell', Grep: 'Searched', Glob: 'Found files', LS: 'Listed', TodoWrite: 'Updated todos', WebFetch: 'Fetched',
     WebSearch: 'Searched web', Task: 'Subagent', ExitPlanMode: 'Finished plan', run_subagent: 'Subagent', worktree_apply: 'Applied worktree', worktree_discard: 'Discarded worktree',
@@ -139,10 +139,13 @@
   };
   // The picker is refilled when the model lists, the query, or the provider page change.
   let modelMenu = null;
-  // The model menu sets the chat model, or a Loop Mode model: 'planner' (Think) or 'worker' (Loop, provider models only).
+  // The model menu sets the chat model, a Loop Mode model ('planner' Think, 'worker' Loop), or a tool
+  // model from the settings dialog ('refine', 'helper'). Loop, Refine, and Helper take provider models only.
   const menuTarget = () => modelMenu?.target ?? 'main';
-  const targetModel = (t) => (t === 'planner' ? state.nightPlanner : t === 'worker' ? state.nightWorker : state.active);
-  const menuGroups = () => (menuTarget() === 'worker' ? state.modelGroups.filter((g) => g.kind !== 'claudeCode') : state.modelGroups);
+  const TARGET_MODEL = { planner: 'nightPlanner', worker: 'nightWorker', refine: 'refineModel', helper: 'helperModel' };
+  const targetModel = (t) => (TARGET_MODEL[t] ? state[TARGET_MODEL[t]] : state.active);
+  const providerOnly = (t) => t === 'worker' || t === 'refine' || t === 'helper';
+  const menuGroups = () => (providerOnly(menuTarget()) ? state.modelGroups.filter((g) => g.kind !== 'claudeCode') : state.modelGroups);
   // The same model: an Ollama name without a tag means `:latest`.
   const sameModel = (a, b) => !!a && !!b && (a === b || a === `${b}:latest` || b === `${a}:latest`);
   const isCurrent = (current, g, m) => current?.kind === g.kind && sameModel(current?.model, m.id);
@@ -206,6 +209,14 @@
     const all = modelMenu.tab === 'all';
     const groups = all ? menuGroups() : menuGroups().filter((g) => g.kind === modelMenu.tab);
     let shown = 0;
+    // Refine and Helper can go back to their default.
+    if ((target === 'refine' || target === 'helper') && all && !query) {
+      menuItem(list, {
+        icon: 'discard', title: target === 'refine' ? 'Routed or chat model (default)' : 'Chat model (default)',
+        desc: target === 'refine' ? 'Refine with the task-x.routing model for the prompt, else the chat model.' : 'Summaries and research subagents use the chat model.',
+        checked: !current, onSelect: () => vscode.postMessage({ type: 'selectNightModel', role: target, kind: '', model: '' }),
+      });
+    }
     if (all && !query) {
       const recent = recentModels()
         .map((r) => { const g = groups.find((x) => x.kind === r.kind); const m = g?.models.find((x) => x.id === r.model); return g && m ? { g, m } : null; })
@@ -232,7 +243,7 @@
     // A model id the list does not have can still be set, for the open provider page or the current provider.
     const raw = q.value.trim();
     const base = all ? (current ?? state.active) : { kind: modelMenu.tab };
-    if (raw && base && !(target === 'worker' && base.kind === 'claudeCode') && !menuGroups().some((g) => g.kind === base.kind && g.models.some((m) => sameModel(m.id, raw)))) {
+    if (raw && base && !(providerOnly(target) && base.kind === 'claudeCode') && !menuGroups().some((g) => g.kind === base.kind && g.models.some((m) => sameModel(m.id, raw)))) {
       menuItem(list, { icon: 'add', title: `Use "${raw}"`, desc: `Set this model id for ${menuGroups().find((g) => g.kind === base.kind)?.label ?? 'the current provider'}.`, onSelect: () => pick(base.kind, raw) });
     }
     if (focused) q.focus();
@@ -294,6 +305,21 @@
     b.addEventListener('click', () => onToggle(!on));
     menu.append(b);
   }
+  // A setting that is a model: opens the model picker for that role.
+  function modelRowSetting(menu, target, ic, title, desc, fallback) {
+    const picked = targetModel(target);
+    const b = el('button', 'menu-item setting-row model-setting');
+    b.type = 'button';
+    b.dataset.key = `model-${target}`;
+    b.setAttribute('aria-haspopup', 'menu');
+    const text = el('span', 'setting-text');
+    text.append(el('span', 'title', title), el('span', 'desc', desc));
+    const value = el('span', `setting-value${picked ? '' : ' unset'}`, picked?.model || fallback);
+    value.title = picked ? `${picked.model} (${picked.kind})` : `Not set: ${fallback}`;
+    b.append(icon(ic, 'setting-icon'), text, value);
+    b.addEventListener('click', () => openModelMenu(settingsBtn, target));
+    menu.append(b);
+  }
   function fillSettings() {
     if (!settingsMenu) return;
     const menu = settingsMenu;
@@ -323,6 +349,9 @@
       seg.append(b);
     }
     menu.append(seg, el('div', `settings-desc ${cur}`, EDIT_MODES[cur][2]));
+    menuHeader(menu, 'Models');
+    modelRowSetting(menu, 'refine', 'sparkle', 'Refine model', 'Rewrites your prompt with the sparkle button.', 'routed or chat model');
+    modelRowSetting(menu, 'helper', 'zap', 'Helper model', 'A small, cheap model for file summaries and research subagents.', 'chat model');
     menuHeader(menu, 'Options');
     toggleRow(menu, {
       key: 'loop', ic: 'sync', title: 'Loop Mode', on: state.night,
@@ -446,6 +475,32 @@
         out.append(wrap);
         continue;
       }
+      // A table: a row of cells, then a line of dashes (`|---|:--:|`) that also sets each column's alignment.
+      if (line.includes('|') && i + 1 < lines.length && isTableRule(lines[i + 1])) {
+        flush(); list = null;
+        const align = cells(lines[i + 1]).map((c) => (/^:-+:$/.test(c) ? 'center' : /-:$/.test(c) ? 'right' : /^:/.test(c) ? 'left' : ''));
+        const wrap = el('div', 'md-table-wrap');
+        const table = el('table', 'md-table');
+        const row = (text, tag) => {
+          const tr = el('tr');
+          cells(text).forEach((c, k) => {
+            const td = el(tag);
+            if (align[k]) td.style.textAlign = align[k];
+            renderInline(td, c);
+            tr.append(td);
+          });
+          return tr;
+        };
+        const thead = el('thead');
+        thead.append(row(line, 'th'));
+        const tbody = el('tbody');
+        for (i += 2; i < lines.length && lines[i].includes('|') && lines[i].trim(); i++) tbody.append(row(lines[i], 'td'));
+        i--;
+        table.append(thead, tbody);
+        wrap.append(table);
+        out.append(wrap);
+        continue;
+      }
       // A heading, or a line that is only bold text, starts a section; a section that asks the
       // user something or flags a risk becomes a card until the next heading.
       const h = line.match(/^(#{1,4})\s+(.*)$/) || line.match(/^\s*()\*\*([^*\n]{2,80})\*\*:?\s*$/);
@@ -476,6 +531,22 @@
     }
     flush();
   }
+  // The cells of a table row: split at | outside `code`, without the outer pipes. \| is a literal pipe.
+  function cells(line) {
+    const out = [];
+    let cur = '', code = false;
+    const s = line.trim().replace(/^\|/, '').replace(/(?<!\\)\|$/, '');
+    for (let k = 0; k < s.length; k++) {
+      const c = s[k];
+      if (c === '\\' && s[k + 1] === '|') { cur += '|'; k++; continue; }
+      if (c === '`') code = !code;
+      if (c === '|' && !code) { out.push(cur.trim()); cur = ''; continue; }
+      cur += c;
+    }
+    out.push(cur.trim());
+    return out;
+  }
+  const isTableRule = (line) => line.includes('|') && /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(line);
   // Marks the opening question of a rendered paragraph or item (alert cards render their body first).
   function markAsk(node) {
     const first = node.firstChild;
@@ -654,7 +725,10 @@
         turn = { el: el('div', 'turn'), response: null };
         turnFiles = null;
         const req = enter(el('div', 'request'));
-        req.append(el('div', 'request-text', it.text), button('action copy-msg', icon('copy'), () => copyText(it.text), 'Copy message'));
+        // Your message keeps its line breaks and shows `code`, ``` blocks, and tables like a reply.
+        const body = el('div', 'request-text md');
+        renderMarkdown(body, it.text);
+        req.append(body, button('action copy-msg', icon('copy'), () => copyText(it.text), 'Copy message'));
         if (it.images) {
           const n = el('div', 'request-images');
           n.append(icon('file-media'), document.createTextNode(`${it.images} image${it.images > 1 ? 's' : ''} attached`));
@@ -691,6 +765,7 @@
         // The dot itself is the stop control while the call runs; `toolDone` clears it.
         if (it.stop && it.ok === undefined && state.busy) stopDot(row);
         attachOutput(row, it.id, it.tool, it.ok !== false, it.output, it.outputCut, it.ok === undefined && state.busy);
+        tokenChip(row, it.tokens);
         current = null;
         break;
       }
@@ -879,6 +954,15 @@
     box.append(head, body);
     if (cut) box.append(el('div', 'term-note', 'Showing the start of the output. Open in editor to see all of it.'));
     return box;
+  }
+  // About how many tokens a tool result adds to the conversation (it is sent again on every later turn).
+  function tokenChip(row, tokens) {
+    row.querySelector(':scope > .tok')?.remove();
+    if (!tokens) return;
+    const chip = el('span', `tok${tokens >= 4000 ? ' big' : ''}`, `${fmtCount(tokens)} tok`);
+    chip.title = `This result adds about ${tokens.toLocaleString()} tokens to the conversation. Each later turn sends it again until the history is compressed.`;
+    const after = row.querySelector(':scope > .detail');
+    after ? after.after(chip) : row.append(chip);
   }
   // Shell commands always get a block: "Running…" until the result comes, then the output (or a note that it printed nothing).
   function attachOutput(row, id, tool, ok, output, cut, running = false) {
@@ -1160,26 +1244,11 @@
   }
 
   // ---------- Toolbar state ----------
-  // Top bar while a task runs: elapsed time and Stop.
-  let runStart = 0, runTick = 0, lastBusy = false;
-  const fmtTime = (s) => {
-    const pad = (n) => String(n).padStart(2, '0');
-    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-    return h ? `${h}:${pad(m)}:${pad(s % 60)}` : `${m}:${pad(s % 60)}`;
-  };
-  const tickRun = () => { runTimer.textContent = fmtTime(Math.floor((Date.now() - runStart) / 1000)); };
-  function syncRunBar() {
-    clearInterval(runTick);
-    runBar.hidden = !state.busy;
-    if (!state.busy) return;
-    runStart = Date.now();
-    tickRun();
-    runTick = setInterval(tickRun, 1000);
-  }
-  $('runStop').addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
+  // The running task's elapsed time and Stop sit in its tab at the top (see renderTabs).
+  let lastBusy = false;
   const fmtWindow = (n) => (n >= 1e6 ? `${+(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1000)}k`);
   function renderToolbar() {
-    if (state.busy !== lastBusy) { lastBusy = state.busy; syncRunBar(); if (!state.busy) log.querySelectorAll('.tool-stop').forEach((b) => b.remove()); }
+    if (state.busy !== lastBusy) { lastBusy = state.busy; if (!state.busy) log.querySelectorAll('.tool-stop').forEach((b) => b.remove()); }
     const model = state.active?.model || 'Pick a model';
     const win = state.active?.window;
     modelBtn.replaceChildren(el('span', 'text', model), ...(win ? [el('span', 'model-window', fmtWindow(win))] : []), icon('chevron-down'));
@@ -1280,6 +1349,15 @@
     meter.setAttribute('aria-label', meter.title);
   }
 
+  // Elapsed time as m:ss (or h:mm:ss); the running tab's timer ticks once a second.
+  const fmtTime = (s) => {
+    const pad = (n) => String(n).padStart(2, '0');
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    return h ? `${h}:${pad(m)}:${pad(s % 60)}` : `${m}:${pad(s % 60)}`;
+  };
+  setInterval(() => {
+    for (const t of document.querySelectorAll('.tab-time[data-started]')) t.textContent = fmtTime(Math.max(0, Math.floor((Date.now() - Number(t.dataset.started)) / 1000)));
+  }, 1000);
   // ---------- Tabs: chats and subagents, like browser tabs, then History ----------
   const strip = $('tabStrip'), historyTab = $('tabHistory'), historyBox = $('history');
   let tabs = [], activeTab = null;
@@ -1317,7 +1395,15 @@
       close.tabIndex = -1;
       tab.append(mark, el('span', 'tab-title', t.title));
       if (t.kind === 'subagent' && t.status && t.status !== 'running') tab.append(el('span', 'tab-state'));
-      tab.append(close);
+      // The running chat: its elapsed time, and Stop in place of Close.
+      if (t.started) {
+        const time = el('span', 'tab-time');
+        time.dataset.started = String(t.started);
+        time.textContent = fmtTime(Math.max(0, Math.floor((Date.now() - t.started) / 1000)));
+        const stop = button('tab-stop', icon('debug-stop'), (e) => { e.stopPropagation(); vscode.postMessage({ type: 'cancel' }); }, 'Stop the running task');
+        stop.tabIndex = -1;
+        tab.append(time, stop);
+      } else tab.append(close);
       tab.addEventListener('click', () => selectTab(t.id));
       tab.addEventListener('auxclick', (e) => { if (e.button === 1) { e.preventDefault(); closeTab(t.id); } });
       return tab;
@@ -1712,15 +1798,34 @@
     $('form').requestSubmit();
   });
   input.addEventListener('input', autosize);
-  input.addEventListener('input', (e) => {
-    if (e.inputType !== 'insertText') return;
-    const caret = input.selectionStart;
-    const head = input.value.slice(0, caret - FENCE.length);
-    if (!input.value.slice(0, caret).endsWith(FENCE) || fenceOpen(head) || (head && !head.endsWith('\n'))) return;
-    const caretAt = head.length + FENCE.length + 1;
-    input.value = `${head}${FENCE}\n\n${FENCE}${input.value.slice(caret)}`;
-    input.setSelectionRange(caretAt, caretAt);
+  // Backticks: ` wraps the selection or adds a closing `; typing ` before a closing ` steps over it;
+  // a third ` at a line start opens a ``` block with its closing fence. A selection of several
+  // lines becomes a block. Edits go through insertText, so Ctrl+Z (Cmd+Z) undoes them.
+  const insert = (text, caretFrom, caretTo = caretFrom) => {
+    const start = input.selectionStart;
+    if (!document.execCommand('insertText', false, text)) input.setRangeText(text, start, input.selectionEnd, 'end');
+    input.setSelectionRange(start + caretFrom, start + caretTo);
     autosize();
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key !== '`' || e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
+    const { value: v, selectionStart: s, selectionEnd: t } = input;
+    const sel = v.slice(s, t);
+    const lineHead = v.slice(v.lastIndexOf('\n', s - 1) + 1, s);
+    e.preventDefault();
+    if (sel) {
+      if (sel.includes('\n')) return insert(`${lineHead ? '\n' : ''}${FENCE}\n${sel.replace(/\n$/, '')}\n${FENCE}\n`, (lineHead ? 1 : 0) + FENCE.length);
+      return insert(`\`${sel}\``, 1, 1 + sel.length);
+    }
+    // The third backtick at a line start: a code block, with the caret on its empty line.
+    if (lineHead === '``' && !fenceOpen(v.slice(0, s - 2))) {
+      input.setSelectionRange(s - 2, v[s] === '`' ? s + 1 : s);
+      return insert(`${FENCE}\n\n${FENCE}`, FENCE.length + 1);
+    }
+    // Inside a code block, or after a word character, a backtick is just a backtick.
+    if (fenceOpen(v.slice(0, s)) || /\w$/.test(lineHead)) return insert('`', 1);
+    if (v[s] === '`') return input.setSelectionRange(s + 1, s + 1);
+    insert('``', 1);
   });
 
   // ---------- Messages from the extension ----------
@@ -1738,7 +1843,7 @@
         scroll(true);
         break;
       case 'status':
-        state = { ...state, busy: m.busy, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker };
+        state = { ...state, busy: m.busy, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker, refineModel: 'refineModel' in m ? m.refineModel : state.refineModel, helperModel: 'helperModel' in m ? m.helperModel : state.helperModel };
         renderToolbar();
         fillSettings();
         break;
@@ -1759,6 +1864,7 @@
           row.classList.toggle('quiet', Boolean(row.dataset.edit) && m.ok);
           if (row.dataset.edit && !m.ok) row.querySelector('.label').textContent = 'Edit failed';
           attachOutput(row, m.id, row.querySelector('.label')?.dataset.tool || '', m.ok, m.output, m.outputCut);
+          tokenChip(row, m.tokens);
           scroll();
         }
         break;
@@ -1793,8 +1899,10 @@
       case 'contextUsage': renderMeter(m.used, m.window); break;
       case 'usage': {
         // The running total for the task, from the runtime: input and output tokens, never a price.
-        const t = `↑${fmtCount(m.input)} ↓${fmtCount(m.output)} tokens`;
-        response().append(el('div', 'usage-note', t));
+        const cached = m.cached ? ` (${fmtCount(m.cached)} cached)` : '';
+        const note = el('div', 'usage-note', `↑${fmtCount(m.input)}${cached} ↓${fmtCount(m.output)} tokens`);
+        if (m.cached) note.title = `${Math.round((m.cached / Math.max(1, m.input)) * 100)}% of the prompt came from the provider's prompt cache, which costs less.`;
+        response().append(note);
         scroll();
         break;
       }

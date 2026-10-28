@@ -47,10 +47,19 @@ pub fn price(rules: &[PriceRule], provider: &ProviderConfig) -> Option<(f64, f64
     })
 }
 
+/// Share of the input price a cache read costs: a tenth on Anthropic, half elsewhere (OpenAI's
+/// lowest published discount). Cache writes are counted at the full input price.
+fn cached_share(kind: ProviderKind) -> f64 {
+    if kind == ProviderKind::Anthropic { 0.1 } else { 0.5 }
+}
+
 /// Dollar cost of one response, or None when the model has no price.
 pub fn estimate(rules: &[PriceRule], provider: &ProviderConfig, u: &Usage) -> Option<f64> {
     let (i, o) = price(rules, provider)?;
-    Some((u.input_tokens.unwrap_or(0) as f64 * i + u.output_tokens.unwrap_or(0) as f64 * o) / 1_000_000.0)
+    let input = u.input_tokens.unwrap_or(0) as f64;
+    let cached = (u.cached_tokens.unwrap_or(0) as f64).min(input);
+    let input_cost = (input - cached) * i + cached * i * cached_share(provider.kind);
+    Some((input_cost + u.output_tokens.unwrap_or(0) as f64 * o) / 1_000_000.0)
 }
 
 #[cfg(test)]
@@ -63,10 +72,13 @@ mod tests {
 
     #[test]
     fn longest_prefix_and_user_rules_win() {
-        let u = Usage { input_tokens: Some(1_000_000), output_tokens: Some(100_000) };
+        let u = Usage { input_tokens: Some(1_000_000), output_tokens: Some(100_000), cached_tokens: None };
         assert_eq!(estimate(&[], &p(ProviderKind::Anthropic, "claude-opus-5-5"), &u), Some(6.0));
         assert_eq!(estimate(&[], &p(ProviderKind::Anthropic, "claude-opus-5"), &u), Some(7.5));
         assert_eq!(estimate(&[], &p(ProviderKind::OpenAi, "gpt-5"), &u), None, "no guessed prices");
+        let cached = Usage { cached_tokens: Some(1_000_000), ..u };
+        let c = estimate(&[], &p(ProviderKind::Anthropic, "claude-opus-5-5"), &cached).unwrap();
+        assert!((c - 2.4).abs() < 1e-9, "cache reads cost a tenth of the input price: {c}");
         let rules = [
             PriceRule { model: "gpt".into(), input_per_mtok: 9.0, output_per_mtok: 9.0 },
             PriceRule { model: "gpt-5".into(), input_per_mtok: 1.0, output_per_mtok: 10.0 },

@@ -112,7 +112,12 @@ impl McpServer {
         });
         let input = if args.is_null() { json!({}) } else { args };
         match tools::call(def, ctx, input).await {
-            Ok(v) => json!({ "content": [{ "type": "text", "text": v.to_string() }], "isError": false }),
+            Ok(mut v) => {
+                // Long command output reaches Claude as its errors and last lines; read_log has the rest.
+                let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+                tools::logs::shorten(&mut v, &format!("mcp-{name}-{stamp}"));
+                json!({ "content": [{ "type": "text", "text": v.to_string() }], "isError": false })
+            }
             Err(e) => json!({ "content": [{ "type": "text", "text": json!({ "error": e }).to_string() }], "isError": true }),
         }
     }

@@ -6,6 +6,8 @@ pub mod edit;
 pub mod exec;
 pub mod fs;
 pub mod git;
+pub mod logs;
+pub mod memory;
 pub mod patch;
 pub mod search;
 pub mod shell_search;
@@ -556,10 +558,20 @@ pub const fn tool(
 pub fn registry() -> &'static [ToolDef] {
     static R: std::sync::OnceLock<Vec<ToolDef>> = std::sync::OnceLock::new();
     R.get_or_init(|| {
-        [fs::tools(), search::tools(), edit::tools(), git::tools(), validate::tools(), web::tools(), browser::tools()]
-            .into_iter()
-            .flatten()
-            .collect()
+        [
+            fs::tools(),
+            search::tools(),
+            edit::tools(),
+            git::tools(),
+            validate::tools(),
+            logs::tools(),
+            memory::tools(),
+            web::tools(),
+            browser::tools(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     })
 }
 

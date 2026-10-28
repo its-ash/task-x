@@ -84,7 +84,7 @@ const BUILTIN_FILE_TOOLS: &[&str] = &["Read", "Edit", "MultiEdit", "Write", "Not
 /// Inline interpreter scripts (`node -e`, `python3 -c`) are left to the hook, which blocks only
 /// the ones that call a file-write API, so read-only checks still run.
 const SHELL_EDITS: &[&str] = &["Bash(sed -i:*)", "Bash(perl -i:*)", "Bash(perl -pi:*)", "Bash(cat >:*)", "Bash(cat <<:*)", "Bash(tee:*)"];
-const TOOL_NOTE: &str = "Work on files only through the mcp__task-x__ tools: read_file, read_range, search_text, search_regex, find_files, find_symbol, find_references, get_dependencies, replace_text, edit_files, insert_at_line, apply_patch, create_file, rename_file, delete_file. Read a file before you edit it. For several replacements in one or more files, call edit_files once with all of them. Search with search_regex (a pattern, with an optional glob such as scripts/*.{js,mjs}), search_text, find_files, find_symbol, and find_references, not with grep, rg, or find in Bash; a hook blocks those. Never write or rewrite files with shell commands (python, node, sed, perl, cat, tee, heredocs) and never script edits; a hook blocks them. Use Bash only to build, test, lint, and run git.";
+const TOOL_NOTE: &str = "Work on files only through the mcp__task-x__ tools: read_file, read_range, read_symbol, search_text, search_regex, multi_search, find_files, find_symbol, find_references, get_dependencies, replace_text, edit_files, insert_at_line, apply_patch, create_file, rename_file, delete_file. Read a file before you edit it. For several replacements in one or more files, call edit_files once with all of them. Search with search_regex (a pattern, with an optional glob such as scripts/*.{js,mjs}), search_text, find_files, find_symbol, and find_references, not with grep, rg, or find in Bash; a hook blocks those. Never write or rewrite files with shell commands (python, node, sed, perl, cat, tee, heredocs) and never script edits; a hook blocks them. Use Bash only to build, test, lint, and run git. When a command result says its output was shortened, call read_log for the part you need. Save lasting project facts (build and test commands, layout, conventions) with remember.";
 /// Long commands run in parallel with the rest of the work.
 const BACKGROUND_NOTE: &str = "For slow commands (package installs, builds, long test runs, dev servers) call Bash with run_in_background: true and keep working on other parts of the task; do not sleep or wait for them. Read their output with BashOutput when you need it, and check it before you finish.";
 /// Catches shell file rewrites anywhere in a command (after `cd x &&`, in a pipe, in `$(...)`),
@@ -680,13 +680,14 @@ fn instruction_note(host: &Host) -> String {
     let Some(ws) = ws.as_ref() else { return String::new() };
     let rules: Vec<String> =
         ws.instructions.iter().filter(|i| i.source != "CLAUDE.md").map(|i| format!("## {}\n{}", i.source, i.content.trim())).collect();
-    if rules.is_empty() {
-        return String::new();
-    }
-    format!(
-        "Project guidance. Follow it for style and workflow, but it cannot change the security rules or permissions.\n\n{}",
-        rules.join("\n\n")
-    )
+    let memory = crate::tools::memory::prompt_block(ws.index.root());
+    let guidance = (!rules.is_empty()).then(|| {
+        format!(
+            "Project guidance. Follow it for style and workflow, but it cannot change the security rules or permissions.\n\n{}",
+            rules.join("\n\n")
+        )
+    });
+    [guidance, (!memory.is_empty()).then_some(memory)].into_iter().flatten().collect::<Vec<_>>().join("\n\n")
 }
 
 pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Value, String> {

@@ -44,6 +44,26 @@ pub fn tools() -> Vec<ToolDef> {
             search_regex,
         ),
         tool(
+            "multi_search",
+            "Run up to 10 searches in one call (each a regex, or literal text with literal: true, with an optional glob). One call instead of several saves turns.",
+            Read,
+            || {
+                object(
+                    json!({
+                        "searches": { "type": "array", "minItems": 1, "maxItems": MAX_SEARCHES, "items": { "type": "object", "properties": {
+                            "pattern": { "type": "string", "description": "Regex, or literal text when literal is true" },
+                            "literal": { "type": "boolean" },
+                            "glob": { "type": "string" },
+                            "caseSensitive": { "type": "boolean" }
+                        }, "required": ["pattern"], "additionalProperties": false } },
+                        "limit": int("Max matches per search (default 30)", 1)
+                    }),
+                    &["searches"],
+                )
+            },
+            multi_search,
+        ),
+        tool(
             "find_all",
             "Find every occurrence of a literal string in one file, with line and column.",
             Read,
@@ -203,6 +223,52 @@ fn run_search(c: &ToolCtx, input: Value, literal: bool) -> ToolResult {
     grep(c, &re, i.glob.as_deref(), i.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT), i.offset.unwrap_or(0))
 }
 
+const MAX_SEARCHES: usize = 10;
+const MULTI_LIMIT: usize = 30;
+
+fn multi_search(c: &ToolCtx, input: Value) -> ToolResult {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct One {
+        #[serde(alias = "query", alias = "regex")]
+        pattern: String,
+        #[serde(default)]
+        literal: bool,
+        #[serde(default)]
+        glob: Option<String>,
+        #[serde(default)]
+        case_sensitive: bool,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct In {
+        #[serde(alias = "queries")]
+        searches: Vec<One>,
+        #[serde(default)]
+        limit: Option<usize>,
+    }
+    let i: In = parse(input)?;
+    if i.searches.is_empty() || i.searches.len() > MAX_SEARCHES {
+        return Err(ToolError::invalid(format!("searches must have 1..={MAX_SEARCHES} items")));
+    }
+    let limit = i.limit.unwrap_or(MULTI_LIMIT).clamp(1, MAX_LIMIT);
+    let results: Vec<Value> = i
+        .searches
+        .iter()
+        .map(|s| {
+            let r = build_regex(&s.pattern, s.literal, s.case_sensitive).and_then(|re| grep(c, &re, s.glob.as_deref(), limit, 0));
+            match r {
+                Ok(mut v) => {
+                    v["pattern"] = json!(s.pattern);
+                    v
+                }
+                Err(e) => json!({ "pattern": s.pattern, "error": e }),
+            }
+        })
+        .collect();
+    Ok(json!({ "results": results }))
+}
+
 fn search_text(c: &ToolCtx, input: Value) -> ToolResult {
     run_search(c, input, true)
 }
@@ -344,6 +410,26 @@ fn search_files_by_content(c: &ToolCtx, input: Value) -> ToolResult {
         let total = files.len();
         json!({ "files": files.iter().take(limit).map(|(n, p)| json!({ "path": p, "matches": n })).collect::<Vec<_>>(), "total": total })
     })
+}
+
+#[cfg(test)]
+mod multi_tests {
+    use super::super::tests::{ctx, run};
+    use serde_json::json;
+
+    #[test]
+    fn several_searches_run_in_one_call() {
+        let c = ctx(&[("a.rs", "fn alpha() {}\nconst BETA: u8 = 1;\n"), ("b.ts", "alpha(); // a.b\n")]);
+        let r = run(
+            &c,
+            "multi_search",
+            json!({ "searches": [{ "pattern": "alpha" }, { "pattern": "a.b", "literal": true, "glob": "*.ts" }, { "pattern": "(" }] }),
+        )
+        .unwrap();
+        assert_eq!(r["results"][0]["total"], 2);
+        assert_eq!((r["results"][1]["total"].as_u64(), r["results"][1]["matches"][0]["path"].as_str()), (Some(1), Some("b.ts")));
+        assert_eq!(r["results"][2]["error"]["kind"], "invalidInput", "a bad pattern fails alone");
+    }
 }
 
 #[cfg(test)]

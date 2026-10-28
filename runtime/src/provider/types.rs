@@ -431,8 +431,12 @@ impl StopReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
+    /// All prompt tokens, cached ones included.
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Prompt tokens the provider read from its prompt cache (billed at a lower rate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -470,6 +474,7 @@ impl ChatOutcome {
             StreamEvent::Usage { usage } => {
                 self.usage.input_tokens = usage.input_tokens.or(self.usage.input_tokens);
                 self.usage.output_tokens = usage.output_tokens.or(self.usage.output_tokens);
+                self.usage.cached_tokens = usage.cached_tokens.or(self.usage.cached_tokens);
             }
             StreamEvent::Done { stop_reason } => self.stop_reason = *stop_reason,
         }

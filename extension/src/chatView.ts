@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
-import { EDIT_MODES, type EditMode, activeRef, editMode, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, setEditMode, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
+import { EDIT_MODES, type EditMode, activeRef, editMode, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, setEditMode, toolModels, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
 import {
   type AgentEvent,
   type AgentEventParams,
@@ -147,7 +147,7 @@ const MAX_LANE_STEPS = 30;
 type Item =
   | { kind: 'user'; text: string; mode: ChatMode; images?: number }
   | { kind: 'assistant'; text: string }
-  | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string } }
+  | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string }; tokens?: number }
   | { kind: 'file'; path: string; operation: number | null; diffKey: string; added: number; removed: number; diff: string; diffCut: boolean; undone?: boolean; kept?: boolean }
   | { kind: 'context'; text: string }
   | { kind: 'steer'; text: string }
@@ -416,6 +416,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private runTab: string | undefined;
   /** Night mode runs again in the tab of its last run. */
   private nightTab: string | undefined;
+  /** When the running task started, for the timer in its tab. */
+  private runStarted = 0;
   /** Approval and question cards of the running task, shown again when its tab comes back on screen. */
   private readonly cards = new Map<string, object>();
   /** The changed-files list: the edit log, plus edits that arrived after it was loaded. */
@@ -596,6 +598,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       title: tabTitle(t),
       role: t.role ?? null,
       status: t.kind === 'subagent' ? t.status : this.busy && t.id === this.runTab ? 'running' : null,
+      started: t.kind === 'chat' && this.busy && t.id === this.runTab ? this.runStarted : null,
     }));
     this.post({ type: 'tabs', tabs, active: this.activeTab });
   }
@@ -631,7 +634,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   refreshStatus(): void {
     const ref = activeRef();
     const claude = engine() === 'claudeCode';
-    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.busy && this.activeTab === this.runTab, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null });
+    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.busy && this.activeTab === this.runTab, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null });
     void this.postModels();
   }
 
@@ -911,6 +914,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   private setBusy(abort: AbortController | undefined): void {
     this.abort = abort;
+    if (abort) this.runStarted = Date.now();
     void vscode.commands.executeCommand('setContext', 'task-x.busy', this.busy);
     this.onBusyChange?.(this.busy);
     this.refreshStatus();
@@ -1126,11 +1130,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.refreshStatus();
         break;
       case 'selectNightModel': {
+        // Loop Mode's Think and Loop models, and the Refine and Helper models from the settings dialog.
         const model = typeof m.model === 'string' ? m.model.trim() : '';
         const kindOk = isProviderRef(m.kind) || (m.role === 'planner' && m.kind === CLAUDE_KIND);
-        if (model && model.length <= 256 && kindOk && (m.role === 'planner' || m.role === 'worker')) {
-          await setWindowChoice(m.role === 'planner' ? { nightPlanner: { kind: m.kind, model } } : { nightWorker: { kind: m.kind, model } });
-        }
+        const key = ({ planner: 'nightPlanner', worker: 'nightWorker', refine: 'refineModel', helper: 'helperModel' } as const)[m.role as 'planner'];
+        if (key && m.kind === '' && (m.role === 'refine' || m.role === 'helper')) await setWindowChoice({ [key]: undefined });
+        else if (key && model && model.length <= 256 && kindOk) await setWindowChoice({ [key]: { kind: m.kind, model } });
         this.refreshStatus();
         break;
       }
@@ -1315,7 +1320,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (!ev.background && isBackgroundStart(ev.output)) break;
         const id = `${tab.laneTaskId}:${ev.callId}`;
         const it = tab.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === id);
-        const out = this.captureOutput(id, ev.tool, ev.ok, ev.output);
+        const out = { ...this.captureOutput(id, ev.tool, ev.ok, ev.output), tokens: ev.tokens };
         if (it) Object.assign(it, { ok: ev.ok }, out);
         else push({ kind: 'tool', id, tool: ev.tool, detail: 'not run', ok: false, ...out });
         if (it) show({ type: 'toolDone', id, ok: ev.ok, ...out });
@@ -1665,7 +1670,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // A background command answers twice: at once ("runs in the background"), then with its output. The row stays running until then.
         if (!e.background && isBackgroundStart(e.output)) break;
         const it = this.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === e.callId);
-        const out = this.captureOutput(e.callId, e.tool, e.ok, e.output);
+        // `tokens`: about how much this result adds to every later turn.
+        const out = { ...this.captureOutput(e.callId, e.tool, e.ok, e.output), tokens: e.tokens };
         if (it) {
           Object.assign(it, { ok: e.ok }, out);
           this.postChat({ type: 'toolDone', id: e.callId, ok: e.ok, ...out });
@@ -1678,7 +1684,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'usage':
         // Token counts per model turn, so the run shows its input and output as it goes. No price:
         // the chat reports what was used, not what it cost.
-        this.postChat({ type: 'usage', input: e.usage.inputTokens ?? 0, output: e.usage.outputTokens ?? 0 });
+        this.postChat({ type: 'usage', input: e.usage.inputTokens ?? 0, output: e.usage.outputTokens ?? 0, cached: e.usage.cachedTokens ?? 0 });
         break;
       case 'steered': {
         const i = this.steering.indexOf(e.text);
@@ -1787,8 +1793,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /**
-   * Rewrites the typed prompt with the routed model (`task-x.routing` for the prompt's task kind), else the
-   * active provider model. The webview puts the result in the input, where Ctrl+Z restores the original.
+   * Rewrites the typed prompt with the Refine model picked in the settings dialog, else the routed model
+   * (`task-x.routing` for the prompt's task kind), else the active provider model. The webview puts the
+   * result in the input, where Ctrl+Z restores the original.
    */
   private async refine(raw: string): Promise<void> {
     const text = raw.trim();
@@ -1797,10 +1804,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (text.length > MAX_INPUT_CHARS) return fail(`The prompt is longer than ${MAX_INPUT_CHARS} characters.`);
     try {
       const client = await this.getClient();
-      const provider = await providerConfig(this.ctx.secrets).catch(() => undefined);
+      const picked = toolModels().refine;
+      const own = picked && isProviderRef(picked.kind) ? await providerConfigWith(this.ctx.secrets, picked.kind, picked.model).catch(() => undefined) : undefined;
+      const provider = own ?? (await providerConfig(this.ctx.secrets).catch(() => undefined));
       const ed = this.editorContext(text);
       const focusPaths = [...(ed.mentions ?? []), ...(ed.activeFile ? [ed.activeFile] : [])];
-      const r = await client.request<RefineResult>('prompt/refine', { prompt: text, provider, routes: await routes(this.ctx.secrets), focusPaths });
+      const r = await client.request<RefineResult>('prompt/refine', { prompt: text, provider, routes: own ? [] : await routes(this.ctx.secrets), focusPaths });
       this.log('info', `prompt refined by ${r.model}${r.routed ? ` (route for ${r.kind})` : ''}`);
       this.post({ type: 'refined', text: r.text, model: r.model });
     } catch (e) {
@@ -2120,7 +2129,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <button type="button" role="tab" id="tabHistory" class="view-tab" aria-controls="history" title="History"><span class="codicon codicon-history" aria-hidden="true"></span><span class="view-label">History</span></button>
 </nav>
 <div id="progress" role="progressbar" aria-label="Working" aria-hidden="true"></div>
-<div id="runbar" class="runbar" role="status" hidden><span class="codicon codicon-loading codicon-modifier-spin" aria-hidden="true"></span><span class="runbar-text">Working</span><span id="runTimer" class="runbar-time">0:00</span><span class="spacer"></span><button type="button" id="runStop" class="btn small secondary"><span class="codicon codicon-debug-stop" aria-hidden="true"></span>Stop</button></div>
 <main id="log" role="log" aria-live="polite" aria-label="Chat"></main>
 <section id="history" aria-label="Task history" hidden></section>
 <section id="changes" hidden aria-label="Changed files">

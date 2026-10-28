@@ -70,6 +70,9 @@ export interface WindowChoice {
   /** Night mode: the model that writes the plan, and the free model that runs it in a loop. */
   nightPlanner?: NightModel;
   nightWorker?: NightModel;
+  /** The model that refines prompts, and the cheap helper for file summaries and research subagents. */
+  refineModel?: NightModel;
+  helperModel?: NightModel;
 }
 export interface NightModel {
   kind: string;
@@ -93,6 +96,7 @@ export async function setWindowChoice(patch: WindowChoice): Promise<void> {
 export const chosenEngine = (): string | undefined => choice.engine;
 export const chosenClaudeModel = (): string | undefined => choice.claudeModel;
 export const nightModels = (): { planner?: NightModel; worker?: NightModel } => ({ planner: choice.nightPlanner, worker: choice.nightWorker });
+export const toolModels = (): { refine?: NightModel; helper?: NightModel } => ({ refine: choice.refineModel, helper: choice.helperModel });
 
 async function updateCustom(fn: (list: CustomProvider[]) => CustomProvider[]): Promise<void> {
   await cfg().update('customProviders', fn(customProviders()), vscode.ConfigurationTarget.Global);
