@@ -520,8 +520,43 @@ impl ToolCtx {
     }
 }
 
-pub fn parse<T: DeserializeOwned>(input: Value) -> Result<T, ToolError> {
-    serde_json::from_value(input).map_err(|e| ToolError::invalid(format!("invalid input: {e}")))
+pub fn parse<T: DeserializeOwned>(mut input: Value) -> Result<T, ToolError> {
+    loop {
+        let e = match T::deserialize(&input) {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        if !coerce(&mut input, &e.to_string()) {
+            return Err(ToolError::invalid(format!("invalid input: {e}")));
+        }
+    }
+}
+
+/// Models often send numbers and booleans as strings ("396", "true"). Converts the string that the error names when it is a valid value of the expected type.
+fn coerce(v: &mut Value, err: &str) -> bool {
+    let Some((raw, want)) = err.strip_prefix("invalid type: string \"").and_then(|r| r.split_once("\", expected ")) else {
+        return false;
+    };
+    let to = if want.starts_with("a boolean") {
+        raw.trim().parse::<bool>().ok().map(Value::Bool)
+    } else if want.starts_with(['u', 'i', 'f']) {
+        serde_json::from_str::<serde_json::Number>(raw.trim()).ok().map(Value::Number)
+    } else {
+        None
+    };
+    to.is_some_and(|to| replace_str(v, raw, &to))
+}
+
+fn replace_str(v: &mut Value, raw: &str, to: &Value) -> bool {
+    match v {
+        Value::String(s) if s == raw => {
+            *v = to.clone();
+            true
+        }
+        Value::Array(a) => a.iter_mut().fold(false, |hit, x| replace_str(x, raw, to) | hit),
+        Value::Object(o) => o.values_mut().fold(false, |hit, x| replace_str(x, raw, to) | hit),
+        _ => false,
+    }
 }
 
 pub type Handler = fn(&ToolCtx, Value) -> ToolResult;

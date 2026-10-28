@@ -692,9 +692,9 @@ textarea::placeholder { color: var(--on-surface-variant); }
 .model-meta { grid-column: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 2px; color: var(--muted); }
 .model-sub { min-width: 0; font-size: 11px; overflow-wrap: anywhere; }
 .model-item:hover .model-meta, .model-item:focus-visible .model-meta { color: inherit; }
-/* Alternate row shading, and a bar on the current model, so rows are easy to tell apart. */
+/* Alternate row shading, and a ring on the current model, so rows are easy to tell apart. */
 .mp-list > .model-item:nth-of-type(even):not(:hover):not(:focus-visible) { background: color-mix(in srgb, var(--fg) 6%, transparent); }
-.model-item[aria-checked="true"]:not(:hover):not(:focus-visible) { background: color-mix(in srgb, var(--accent) 16%, transparent); box-shadow: inset 3px 0 0 var(--accent); }
+.model-item[aria-checked="true"]:not(:hover):not(:focus-visible) { background: color-mix(in srgb, var(--accent) 16%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent); }
 .model-item[aria-checked="true"] .title { font-weight: 600; }
 .model-ctx { padding: 0 5px; font-family: var(--mono); font-size: 10px; line-height: 16px; border: 1px solid var(--border); border-radius: 6px; }
 .model-cap { font-size: 13px; }
