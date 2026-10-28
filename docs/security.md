@@ -20,7 +20,7 @@ Agent mode always edits; there is no read-only switch. The runtime gets the `aut
 - Tools are classed by risk. Reads run without asking. **Destructive** tools (file deletes and installs) are refused unless the tool is named in `task-x.agent.allowTools`. A session approval does not count as that opt-in; adding the tool to the list does.
 - A refused call reaches the model as `[BLOCKED]` with the reason: a tool the mode does not offer, or one blocked by the policy. Blocked rounds never count towards "the model is stuck", because nothing it sends can change them; a denial the user chose still does.
 - `task-x.agent.allowTools` lists tools that never ask. `task-x.agent.denyTools` lists tools that are always refused.
-- The Claude Code engine runs with `acceptEdits` and Bash allowed. Its Bash runs in Claude Code's own sandbox (`sandbox.enabled` in `--settings`), and its other permission prompts go to the task-x approval card.
+- The Claude Code engine runs with `acceptEdits` and Bash allowed. Its Bash runs in Claude Code's own sandbox (`sandbox.enabled` in `--settings`), and its other permission prompts go to the task-x approval card. The sandbox network allows package registries and toolchain hosts for the common languages (crates.io, npm, PyPI, Go proxy, Maven, Gradle, pub.dev, RubyGems, Packagist, NuGet, Hex, and others), plus GitHub and GitLab for git dependencies (`sandbox.network.allowedDomains`), so dependency downloads work. Other hosts stay blocked.
 - `task-x.agent.denyTools` lists tools that are always refused.
 - **Allow for session** stops the prompts for one tool until the runtime restarts.
 - **Stop** cancels the current request immediately, including running commands.

@@ -185,6 +185,79 @@ fn task_tools_allowed(p: &Params) -> Vec<String> {
         .collect()
 }
 
+/// Package registries and toolchain hosts that sandboxed commands may reach, so builds can fetch
+/// dependencies in any language. Other hosts stay blocked by Claude Code's sandbox proxy.
+const PACKAGE_HOSTS: &[&str] = &[
+    // Rust
+    "crates.io",
+    "index.crates.io",
+    "static.crates.io",
+    "static.rust-lang.org",
+    "sh.rustup.rs",
+    // JavaScript and TypeScript
+    "registry.npmjs.org",
+    "*.npmjs.org",
+    "registry.yarnpkg.com",
+    "repo.yarnpkg.com",
+    "nodejs.org",
+    "bun.sh",
+    "jsr.io",
+    "*.jsr.io",
+    "deno.land",
+    "*.deno.land",
+    // Python
+    "pypi.org",
+    "*.pypi.org",
+    "files.pythonhosted.org",
+    "*.pythonhosted.org",
+    "conda.anaconda.org",
+    "repo.anaconda.com",
+    "astral.sh",
+    // Go
+    "proxy.golang.org",
+    "sum.golang.org",
+    "go.dev",
+    "golang.org",
+    "dl.google.com",
+    // JVM
+    "repo.maven.apache.org",
+    "repo1.maven.org",
+    "maven.google.com",
+    "plugins.gradle.org",
+    "services.gradle.org",
+    "downloads.gradle.org",
+    // Dart and Flutter
+    "pub.dev",
+    "pub.dartlang.org",
+    "storage.googleapis.com",
+    // Ruby, PHP, .NET, Swift, Elixir
+    "rubygems.org",
+    "*.rubygems.org",
+    "packagist.org",
+    "*.packagist.org",
+    "getcomposer.org",
+    "api.nuget.org",
+    "*.nuget.org",
+    "cdn.cocoapods.org",
+    "hex.pm",
+    "*.hex.pm",
+    // Haskell, OCaml, Perl, R, Julia, Lua, Zig, C and C++
+    "hackage.haskell.org",
+    "opam.ocaml.org",
+    "cpan.metacpan.org",
+    "cloud.r-project.org",
+    "pkg.julialang.org",
+    "luarocks.org",
+    "ziglang.org",
+    "center.conan.io",
+    // Git dependencies (Go modules, SwiftPM, Cargo and npm git sources)
+    "github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "gitlab.com",
+];
+
 /// `exe` and `root` start the runtime itself as the task-x MCP server for this run. With `approval`
 /// (the `APPROVAL_ENV` value), tool calls that need permission are sent to the user through it.
 pub fn args(p: &Params, task_tools: Option<(&Path, &Path)>, instructions: &str, approval: Option<&str>) -> Vec<String> {
@@ -214,7 +287,13 @@ pub fn args(p: &Params, task_tools: Option<(&Path, &Path)>, instructions: &str, 
     let mut allowed = p.allowed_tools.clone();
     // Claude Code's own Bash runs in its OS sandbox: writes stay inside the workspace.
     // `allowUnsandboxedCommands: false` removes the `dangerouslyDisableSandbox` escape: every command stays sandboxed.
-    let mut settings = json!({ "sandbox": { "enabled": true, "autoAllowBashIfSandboxed": true, "allowUnsandboxedCommands": false } });
+    // `network.allowedDomains` lets dependency downloads (cargo fetch, npm install, pip install, …) through.
+    let mut settings = json!({ "sandbox": {
+        "enabled": true,
+        "autoAllowBashIfSandboxed": true,
+        "allowUnsandboxedCommands": false,
+        "network": { "allowedDomains": PACKAGE_HOSTS },
+    } });
     let mut servers = p.mcp_servers.clone();
     if let Some((exe, root)) = task_tools.filter(|_| p.use_task_tools || approval.is_some()) {
         let mut server_args = vec!["--mcp-server".to_owned(), "--root".into(), root.to_string_lossy().into_owned()];
@@ -1022,6 +1101,13 @@ mod tests {
         assert_eq!(cfg["mcpServers"]["task-x"]["args"], json!(["--mcp-server", "--root", "/work/repo"]));
         let settings: Value = serde_json::from_str(&a[a.iter().position(|x| x == "--settings").unwrap() + 1]).unwrap();
         assert_eq!(settings["sandbox"]["allowUnsandboxedCommands"], false, "no escape from the sandbox");
+        let hosts = settings["sandbox"]["network"]["allowedDomains"].as_array().unwrap();
+        assert!(
+            ["index.crates.io", "registry.npmjs.org", "files.pythonhosted.org", "proxy.golang.org"]
+                .iter()
+                .all(|h| hosts.contains(&json!(h))),
+            "package registries are reachable"
+        );
         assert_eq!(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/opt/task-x-runtime' --hook-shell-edit");
         let disallowed = &a[a.iter().position(|x| x == "--disallowedTools").unwrap()..];
         assert!(disallowed.iter().any(|x| x == "Edit") && disallowed.iter().any(|x| x == "Bash(sed -i:*)"));
