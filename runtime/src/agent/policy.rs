@@ -19,6 +19,22 @@ pub enum Mode {
     Autonomous,
 }
 
+/// How much the agent may do without asking. When set, it replaces `allow_all` and the destructive
+/// opt-in for every mode except read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EditMode {
+    /// Every tool runs with no prompt; only `deny` refuses.
+    Auto,
+    /// Free inside the workspace: edits, deletes (both undoable through the edit log), and
+    /// sandboxed commands. Asks before anything that can write or delete beyond it: commands when
+    /// the OS sandbox is off, installs, git writes, network calls, files from outside the workspace,
+    /// and MCP tools.
+    Safe,
+    /// Asks before every write, delete, and command.
+    Ask,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Decision {
@@ -44,6 +60,11 @@ pub struct PolicyConfig {
     /// follow a read-only mode. Commands stay in the sandbox either way.
     #[serde(default)]
     pub allow_all: bool,
+    #[serde(default)]
+    pub edit_mode: Option<EditMode>,
+    /// Whether commands run in the OS sandbox; None asks the platform (tests set it).
+    #[serde(skip)]
+    pub sandboxed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,6 +102,9 @@ impl Policy {
         if self.config.deny.iter().any(|d| d == tool) {
             return Decision::Deny;
         }
+        if let Some(em) = self.config.edit_mode.filter(|_| self.config.mode != Mode::ReadOnly) {
+            return self.decide_edit(em, tool, p, listed);
+        }
         if self.config.allow_all && (tool.starts_with("mcp__") || self.config.mode != Mode::ReadOnly) {
             return Decision::Allow;
         }
@@ -92,6 +116,29 @@ impl Policy {
             d => d,
         }
     }
+
+    fn decide_edit(&self, em: EditMode, tool: &str, p: Permission, listed: bool) -> Decision {
+        use Permission as P;
+        let mcp = tool.starts_with("mcp__");
+        let free = match em {
+            EditMode::Auto => true,
+            EditMode::Safe => {
+                !mcp && match p {
+                    P::Read | P::Write | P::Delete => true,
+                    P::Execute => self.sandboxed(),
+                    P::Network | P::GitWrite | P::Install | P::External => false,
+                }
+            }
+            EditMode::Ask => p == P::Read && !mcp,
+        };
+        if free || listed || self.session_grants.contains(tool) { Decision::Allow } else { Decision::Ask }
+    }
+
+    fn sandboxed(&self) -> bool {
+        self.config.sandboxed.unwrap_or_else(|| {
+            crate::tools::exec::SANDBOX.load(std::sync::atomic::Ordering::Relaxed) && crate::tools::exec::sandbox_available()
+        })
+    }
 }
 
 #[cfg(test)]
@@ -100,6 +147,58 @@ mod tests {
 
     fn pol(mode: Mode) -> Policy {
         Policy::new(PolicyConfig { mode, ..Default::default() })
+    }
+
+    #[test]
+    fn edit_modes_ask_beyond_their_scope() {
+        use Permission as P;
+        let em = |edit_mode, sandboxed| {
+            Policy::new(PolicyConfig {
+                mode: Mode::Autonomous,
+                edit_mode: Some(edit_mode),
+                sandboxed: Some(sandboxed),
+                ..Default::default()
+            })
+        };
+        let auto = em(EditMode::Auto, false);
+        for (tool, p) in
+            [("delete_file", P::Delete), ("install_pkg", P::Install), ("run_command", P::Execute), ("mcp__figma__get", P::Network)]
+        {
+            assert_eq!(auto.decide(tool, p), Decision::Allow, "auto runs {tool}");
+        }
+        let safe = em(EditMode::Safe, true);
+        for (tool, p) in [("replace_text", P::Write), ("delete_file", P::Delete), ("run_command", P::Execute), ("read_file", P::Read)] {
+            assert_eq!(safe.decide(tool, p), Decision::Allow, "safe runs {tool} inside the workspace");
+        }
+        for (tool, p) in [
+            ("git_push", P::GitWrite),
+            ("install_pkg", P::Install),
+            ("web_fetch", P::Network),
+            ("copy_file", P::External),
+            ("mcp__figma__get", P::Network),
+        ] {
+            assert_eq!(safe.decide(tool, p), Decision::Ask, "safe asks before {tool}");
+        }
+        assert_eq!(
+            em(EditMode::Safe, false).decide("run_command", P::Execute),
+            Decision::Ask,
+            "no sandbox: a command could write anywhere"
+        );
+        let mut ask = em(EditMode::Ask, true);
+        assert_eq!(ask.decide("read_file", P::Read), Decision::Allow);
+        assert_eq!(ask.decide("replace_text", P::Write), Decision::Ask);
+        assert_eq!(ask.decide("delete_file", P::Delete), Decision::Ask, "a delete asks; it is not refused");
+        ask.grant_session("replace_text");
+        assert_eq!(ask.decide("replace_text", P::Write), Decision::Allow);
+        let denied = Policy::new(PolicyConfig {
+            mode: Mode::Autonomous,
+            edit_mode: Some(EditMode::Auto),
+            deny: vec!["run_command".into()],
+            ..Default::default()
+        });
+        assert_eq!(denied.decide("run_command", P::Execute), Decision::Deny, "deny wins in every edit mode");
+        let ro = Policy::new(PolicyConfig { mode: Mode::ReadOnly, edit_mode: Some(EditMode::Auto), ..Default::default() });
+        assert_eq!(ro.decide("replace_text", P::Write), Decision::Deny, "a read-only chat mode stays read-only");
     }
 
     #[test]

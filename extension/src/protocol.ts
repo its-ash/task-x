@@ -253,6 +253,18 @@ export interface EditorContext {
   mentions?: string[];
 }
 
+/** How much the agent may do without asking (`policy.editMode`). */
+export type EditMode = 'auto' | 'safe' | 'ask';
+
+/** `agent/run` `policy`. */
+export interface PolicyConfig {
+  mode: 'readOnly' | 'askBeforeEdit' | 'askBeforeExecution' | 'autonomous';
+  allow: string[];
+  deny: string[];
+  allowAll?: boolean;
+  editMode?: EditMode;
+}
+
 export type QuestionKind = 'radio' | 'checkbox';
 
 /** A question the agent asks, with the options to pick from. */

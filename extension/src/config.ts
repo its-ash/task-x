@@ -125,6 +125,23 @@ function cfg() {
   return vscode.workspace.getConfiguration(SECTION);
 }
 
+/** How much the agent may do without asking: everything (auto), the project only (safe), or nothing (ask). */
+export type { EditMode } from './protocol.js';
+import type { EditMode } from './protocol.js';
+export const EDIT_MODES: readonly EditMode[] = ['auto', 'safe', 'ask'];
+
+/** `task-x.agent.editMode`; before it was set, `agent.approveAll: false` meant reviewing calls (safe). */
+export function editMode(): EditMode {
+  const set = cfg().inspect<string>('agent.editMode');
+  const v = set?.workspaceFolderValue ?? set?.workspaceValue ?? set?.globalValue;
+  if (EDIT_MODES.includes(v as EditMode)) return v as EditMode;
+  return cfg().get<boolean>('agent.approveAll', true) ? 'auto' : 'safe';
+}
+
+export async function setEditMode(m: EditMode): Promise<void> {
+  await cfg().update('agent.editMode', m, vscode.ConfigurationTarget.Global);
+}
+
 export function activeRef(): ProviderRef {
   const k = choice.provider ?? cfg().get<string>('provider');
   return isProviderRef(k) ? k : 'ollama';

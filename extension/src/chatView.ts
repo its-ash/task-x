@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
-import { activeRef, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
+import { EDIT_MODES, type EditMode, activeRef, editMode, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, setEditMode, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
 import {
   type AgentEvent,
   type AgentEventParams,
@@ -73,7 +73,7 @@ const MAX_CARD_DIFF = 6_000;
 const OUTPUT_TOOLS = new Set(['Bash', 'BashOutput', 'run_command', 'run_tests', 'check_build', 'run_linter', 'format_code', 'get_diagnostics', 'git_status', 'git_diff', 'git_log', 'git_show']);
 const SEVERITY = ['error', 'warning', 'info', 'hint'];
 const CONTINUE_PROMPT = 'Continue the task from where you stopped. Check what is already done, finish the remaining work, then run the build and tests.';
-/** Night mode: the last request runs again until it completes, for free models that drop requests or stall. */
+/** Loop Mode (stored under the old "night" keys): the last request runs again until it completes, for free models that drop requests or stall. */
 const NIGHT_KEY = 'task-x.nightMode';
 const NIGHT_REQUEST_KEY = 'task-x.nightRequest';
 const NIGHT_STALL_MS = 10 * 60_000;
@@ -90,7 +90,7 @@ const TODO_ITEM = /^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$/;
 const TODO_PROMPT =
   'Split the request below into a todo list that a smaller model can finish one item at a time. Look at the code first. Make each item one small change that can be checked: name the files to change and what to change in them. Put the items in order, so each item builds on the items before it. Make the last item run the build and tests. Do not make the changes yourself. Reply only with a Markdown checklist, one item per line, like "- [ ] item".';
 const todoPrompt = (request: string, item: string, n: number, total: number) =>
-  `Night mode works through ${TODO_FILE}, one item at a time. The original request was:\n\n${request}\n\nWork only on item ${n} of ${total}:\n\n${item}\n\nFirst check what is already done. Finish this item, then run the checks it needs. Do not start other items and do not edit ${TODO_FILE}; task-x checks the item off when you finish.`;
+  `Loop Mode works through ${TODO_FILE}, one item at a time. The original request was:\n\n${request}\n\nWork only on item ${n} of ${total}:\n\n${item}\n\nFirst check what is already done. Finish this item, then run the checks it needs. Do not start other items and do not edit ${TODO_FILE}; task-x checks the item off when you finish.`;
 
 /** The items of a checklist from the Think model. Plain bullets or a numbered list also count. */
 function parseTodo(text: string): string[] {
@@ -207,6 +207,7 @@ type Inbound =
   | { type: 'selectNight'; enabled: boolean }
   | { type: 'selectNightModel'; role: string; kind: string; model: string }
   | { type: 'selectAutoCommit'; enabled: boolean }
+  | { type: 'selectEditMode'; mode: string }
   | { type: 'openSettings'; query: string }
   | { type: 'suggest'; text: string; mode: string }
   | { type: 'copyOutput'; id: string }
@@ -630,7 +631,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   refreshStatus(): void {
     const ref = activeRef();
     const claude = engine() === 'claudeCode';
-    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.busy && this.activeTab === this.runTab, mode: 'agent', autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null });
+    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.busy && this.activeTab === this.runTab, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null });
     void this.postModels();
   }
 
@@ -678,7 +679,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const uri = this.todoUri();
     if (!uri) throw new Error('open a workspace folder first');
     const title = request.trim().split('\n')[0].slice(0, 200);
-    const body = `# Todo\n\nNight mode works through this list one item at a time and checks each item off when it is done.\n\nRequest: ${title}\n\n${items.map((i) => `- [ ] ${i}`).join('\n')}\n`;
+    const body = `# Todo\n\nLoop Mode works through this list one item at a time and checks each item off when it is done.\n\nRequest: ${title}\n\n${items.map((i) => `- [ ] ${i}`).join('\n')}\n`;
     await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(body));
   }
 
@@ -718,11 +719,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const left = items.filter((i) => !i.done);
     if (!left.length) {
       await this.setNightTodo(false);
-      this.add({ kind: 'context', text: `Night mode: all ${items.length} items in ${TODO_FILE} are done.` });
+      this.add({ kind: 'context', text: `Loop Mode: all ${items.length} items in ${TODO_FILE} are done.` });
       return void this.persist();
     }
     await this.setNightTodo(true);
-    this.add({ kind: 'context', text: `Night mode: ${items.length - left.length} of ${items.length} items in ${TODO_FILE} done.` });
+    this.add({ kind: 'context', text: `Loop Mode: ${items.length - left.length} of ${items.length} items in ${TODO_FILE} done.` });
     void this.persist();
     this.scheduleNight(0);
   }
@@ -731,7 +732,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private async planTodo(request: string, taskId: string, signal: AbortSignal): Promise<string[] | undefined> {
     const planner = nightModels().planner;
     if (!planner) return undefined;
-    this.add({ kind: 'context', text: `Night mode: ${planner.model} is writing the todo list.` });
+    this.add({ kind: 'context', text: `Loop Mode: ${planner.model} is writing the todo list.` });
     const client = await this.getClient();
     this.wire(client);
     const planId = `${taskId}-plan${Date.now()}`;
@@ -747,7 +748,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const cliPath = findClaude();
         if (!cliPath) throw new Error('Claude Code CLI not found');
         const model = planner.model === 'default' ? undefined : planner.model;
-        summary = await client.request<AgentSummary>('claude/run', { prompt, taskId: planId, cliPath, chatMode: 'plan', model, approveAll: vscode.workspace.getConfiguration(SECTION).get<boolean>('agent.approveAll', true), ...claudePermissions('plan') }, { signal });
+        summary = await client.request<AgentSummary>('claude/run', { prompt, taskId: planId, cliPath, chatMode: 'plan', model, ...claudePermissions('plan') }, { signal });
       } else {
         if (!isProviderRef(planner.kind)) throw new Error(`unknown provider ${planner.kind}`);
         const provider = await providerConfigWith(this.ctx.secrets, planner.kind, planner.model);
@@ -758,11 +759,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const items = parseTodo(summary.text);
       if (!items.length) throw new Error('the reply has no todo items');
       await this.writeTodo(request, items);
-      this.add({ kind: 'context', text: `Night mode: wrote ${items.length} items to ${TODO_FILE}. The Loop model works on them one at a time.` });
+      this.add({ kind: 'context', text: `Loop Mode: wrote ${items.length} items to ${TODO_FILE}. The Loop model works on them one at a time.` });
       return items;
     } catch (e) {
       if (signal.aborted) throw e;
-      this.add({ kind: 'context', text: `Night mode: the todo list failed (${describeError(e)}). The Loop model works on the whole request.` });
+      this.add({ kind: 'context', text: `Loop Mode: the todo list failed (${describeError(e)}). The Loop model works on the whole request.` });
       return undefined;
     } finally {
       off();
@@ -784,7 +785,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       if (Date.now() - this.lastActivity < NIGHT_STALL_MS) return;
       this.stalled = true;
       this.lastActivity = Date.now();
-      this.add({ kind: 'context', text: `Night mode: no progress for ${NIGHT_STALL_MS / 60_000} minutes. Restarting the request.` });
+      this.add({ kind: 'context', text: `Loop Mode: no progress for ${NIGHT_STALL_MS / 60_000} minutes. Restarting the request.` });
       this.abort?.abort();
     }, NIGHT_CHECK_MS);
   }
@@ -800,7 +801,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (signal.aborted && !this.stalled) return;
     this.nightFailures++;
     const wait = Math.min(NIGHT_RETRY_MAX_MS, NIGHT_RETRY_BASE_MS * 2 ** Math.min(this.nightFailures - 1, 10));
-    this.add({ kind: 'context', text: `Night mode: the request did not finish. Retry ${this.nightFailures} in ${Math.round(wait / 1000)} s.` });
+    this.add({ kind: 'context', text: `Loop Mode: the request did not finish. Retry ${this.nightFailures} in ${Math.round(wait / 1000)} s.` });
     void this.persist();
     this.scheduleNight(wait);
   }
@@ -824,7 +825,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const lastDone = this.items.findLastIndex((i) => i.kind === 'summary' && i.ok);
     if (lastUser < 0) return;
     if (lastDone > lastUser) return void this.nextTodo();
-    this.add({ kind: 'context', text: 'Night mode: the last request did not finish. Starting it again.' });
+    this.add({ kind: 'context', text: 'Loop Mode: the last request did not finish. Starting it again.' });
     this.scheduleNight(0);
   }
 
@@ -1136,6 +1137,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'selectAutoCommit':
         this.autoCommit = m.enabled === true;
         await this.ctx.workspaceState.update(AUTO_COMMIT_KEY, this.autoCommit);
+        this.refreshStatus();
+        break;
+      case 'selectEditMode':
+        // Applies from the next request; a running task keeps the mode it started with.
+        if (EDIT_MODES.includes(m.mode as EditMode)) await setEditMode(m.mode as EditMode);
         this.refreshStatus();
         break;
       case 'openSettings':
@@ -1503,7 +1509,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (this.wired.has(client)) return;
     this.wired.add(client);
     client.onRequest('agent/requestApproval', (p) =>
-      vscode.workspace.getConfiguration(SECTION).get<boolean>('agent.approveAll', true) ? Promise.resolve({ decision: 'allowSession' as const }) : this.requestApproval(p as ApprovalRequest),
+      editMode() === 'auto' ? Promise.resolve({ decision: 'allowSession' as const }) : this.requestApproval(p as ApprovalRequest),
     );
     client.onRequest('agent/askUser', (p) => this.askUser(p as AskUserRequest));
   }
@@ -2077,7 +2083,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         useTaskTools: c.get<boolean>('claudeCode.useTaskXTools', true),
         images,
         mcpServers: claudeMcpServers(this.ctx),
-        approveAll: c.get<boolean>('agent.approveAll', true),
         ...claudePermissions(mode),
       },
       { signal },
@@ -2137,10 +2142,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <textarea id="input" rows="1"></textarea>
   <div class="toolbar" role="toolbar" aria-label="Chat options">
     <button type="button" id="modelBtn" class="pick"></button>
-    <label class="pick switch" title="Night Mode: the Think model splits the request into todo.md, and the Loop model works on one item at a time. A run that fails, stalls, or stops runs again until it finishes. Stop ends it."><input type="checkbox" role="switch" id="nightSwitch"><span class="text">Night Mode</span></label>
     <button type="button" id="nightPlanBtn" class="pick" hidden></button>
     <button type="button" id="nightLoopBtn" class="pick" hidden></button>
-    <label class="pick auto-commit" title="Commit the files each task changes, when the task ends"><input type="checkbox" id="autoCommit"><span class="text">Auto-commit</span></label>
+    <button type="button" id="settingsBtn" class="pick settings-pick"></button>
     <span class="spacer"></span>
     <span id="ctxMeter" class="meter" role="meter" aria-valuemin="0" aria-valuemax="100" hidden></span>
     <button type="button" id="indexBtn" class="pick index" hidden></button>

@@ -3,7 +3,7 @@ import { accessSync, constants, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
-import { SECTION, chosenClaudeModel, chosenEngine, setWindowChoice } from './config.js';
+import { type EditMode, SECTION, chosenClaudeModel, chosenEngine, editMode, setWindowChoice } from './config.js';
 import type { ChatMode } from './protocol.js';
 import { runtimeEnv } from './runtime.js';
 
@@ -38,9 +38,16 @@ export const engine = (): 'anvil' | 'claudeCode' => ((chosenEngine() ?? vscode.w
 
 export const claudeModel = () => (chosenClaudeModel() ?? vscode.workspace.getConfiguration(SECTION).get<string>('claudeCode.model', '')).trim() || 'default';
 
-/** Agent mode always edits and runs sandboxed shell commands; other chat modes only plan. Never bypassPermissions. */
-export function claudePermissions(mode: ChatMode): { permissionMode: string; allowedTools: string[] } {
-  return mode === 'agent' ? { permissionMode: 'acceptEdits', allowedTools: ['Bash', ...WEB_TOOLS] } : { permissionMode: 'plan', allowedTools: WEB_TOOLS };
+/**
+ * Agent mode edits and runs sandboxed shell commands without asking in the auto and safe edit modes
+ * (Claude Code keeps every command in its sandbox); in ask mode each edit and command goes to the
+ * user. Other chat modes only plan. `approveAll` (auto only) also lets MCP and other tools run
+ * without asking. Never bypassPermissions.
+ */
+export function claudePermissions(mode: ChatMode, em: EditMode = editMode()): { permissionMode: string; allowedTools: string[]; approveAll: boolean } {
+  const approveAll = em === 'auto';
+  if (mode !== 'agent') return { permissionMode: 'plan', allowedTools: WEB_TOOLS, approveAll };
+  return em === 'ask' ? { permissionMode: 'default', allowedTools: [], approveAll } : { permissionMode: 'acceptEdits', allowedTools: ['Bash', ...WEB_TOOLS], approveAll };
 }
 
 export async function useClaude(model: string): Promise<void> {

@@ -3,8 +3,8 @@
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
   const log = $('log'), input = $('input'), send = $('send'), progress = $('progress');
-  const modelBtn = $('modelBtn'), autoCommitBox = $('autoCommit');
-  const runBar = $('runbar'), runTimer = $('runTimer'), nightSwitch = $('nightSwitch');
+  const modelBtn = $('modelBtn'), settingsBtn = $('settingsBtn');
+  const runBar = $('runbar'), runTimer = $('runTimer');
   const nightPlanBtn = $('nightPlanBtn'), nightLoopBtn = $('nightLoopBtn');
   const refineBtn = $('refineBtn');
 
@@ -139,7 +139,7 @@
   };
   // The picker is refilled when the model lists, the query, or the provider page change.
   let modelMenu = null;
-  // The model menu sets the chat model, or a Night mode model: 'planner' (Think) or 'worker' (Loop, provider models only).
+  // The model menu sets the chat model, or a Loop Mode model: 'planner' (Think) or 'worker' (Loop, provider models only).
   const menuTarget = () => modelMenu?.target ?? 'main';
   const targetModel = (t) => (t === 'planner' ? state.nightPlanner : t === 'worker' ? state.nightWorker : state.active);
   const menuGroups = () => (menuTarget() === 'worker' ? state.modelGroups.filter((g) => g.kind !== 'claudeCode') : state.modelGroups);
@@ -272,9 +272,83 @@
   modelBtn.addEventListener('click', () => openModelMenu(modelBtn, 'main'));
   nightPlanBtn.addEventListener('click', () => openModelMenu(nightPlanBtn, 'planner'));
   nightLoopBtn.addEventListener('click', () => openModelMenu(nightLoopBtn, 'worker'));
-  // Night Mode: failed or stalled requests run again until they finish.
-  nightSwitch.addEventListener('change', () => vscode.postMessage({ type: 'selectNight', enabled: nightSwitch.checked }));
-  autoCommitBox.addEventListener('change', () => vscode.postMessage({ type: 'selectAutoCommit', enabled: autoCommitBox.checked }));
+  // ---------- Settings dialog: edit mode, Loop Mode, and auto-commit ----------
+  const EDIT_MODES = {
+    auto: ['rocket', 'Auto', 'Edits, deletes, commands, and tools run without asking. Commands stay in the sandbox.'],
+    safe: ['shield', 'Safe', 'Free inside the project. Asks before anything that can write or delete beyond it: installs, git writes, network, outside files, MCP tools, and commands without the sandbox.'],
+    ask: ['comment-discussion', 'Ask', 'Asks before every edit, delete, and command.'],
+  };
+  let settingsMenu = null;
+  function toggleRow(menu, { key, ic, title, desc, on, disabled, onToggle }) {
+    const b = el('button', 'menu-item setting-row');
+    b.type = 'button';
+    b.dataset.key = key;
+    b.setAttribute('role', 'menuitemcheckbox');
+    b.setAttribute('aria-checked', String(!!on));
+    b.disabled = !!disabled;
+    const text = el('span', 'setting-text');
+    text.append(el('span', 'title', title), el('span', 'desc', desc));
+    const sw = el('span', 'setting-switch');
+    sw.setAttribute('aria-hidden', 'true');
+    b.append(icon(ic, 'setting-icon'), text, sw);
+    b.addEventListener('click', () => onToggle(!on));
+    menu.append(b);
+  }
+  function fillSettings() {
+    if (!settingsMenu) return;
+    const menu = settingsMenu;
+    const focus = document.activeElement?.dataset.key;
+    menu.replaceChildren();
+    const head = el('div', 'settings-head');
+    head.append(icon('settings-gear'), el('span', null, 'Chat settings'));
+    menu.append(head);
+    menuHeader(menu, 'Edit mode');
+    const seg = el('div', 'seg');
+    seg.setAttribute('role', 'radiogroup');
+    seg.setAttribute('aria-label', 'Edit mode');
+    const cur = EDIT_MODES[state.editMode] ? state.editMode : 'auto';
+    for (const [key, [ic, label]] of Object.entries(EDIT_MODES)) {
+      const b = el('button', `menu-item seg-btn ${key}`);
+      b.type = 'button';
+      b.dataset.key = `mode-${key}`;
+      b.setAttribute('role', 'menuitemradio');
+      b.setAttribute('aria-checked', String(key === cur));
+      b.append(icon(ic), el('span', null, label));
+      b.addEventListener('click', () => {
+        state.editMode = key;
+        vscode.postMessage({ type: 'selectEditMode', mode: key });
+        renderToolbar();
+        fillSettings();
+      });
+      seg.append(b);
+    }
+    menu.append(seg, el('div', `settings-desc ${cur}`, EDIT_MODES[cur][2]));
+    menuHeader(menu, 'Options');
+    toggleRow(menu, {
+      key: 'loop', ic: 'sync', title: 'Loop Mode', on: state.night,
+      desc: 'A request that fails, stalls, or stops runs again until it finishes. The Think model splits it into todo.md; the Loop model works one item at a time.',
+      onToggle: (v) => { state.night = v; vscode.postMessage({ type: 'selectNight', enabled: v }); renderToolbar(); fillSettings(); },
+    });
+    toggleRow(menu, {
+      key: 'commit', ic: 'git-commit', title: 'Auto-commit', on: state.autoCommit || state.night, disabled: state.night,
+      desc: state.night ? 'Always on in Loop Mode: each todo item is committed.' : 'Commit the files each task changes when the task ends.',
+      onToggle: (v) => { state.autoCommit = v; vscode.postMessage({ type: 'selectAutoCommit', enabled: v }); fillSettings(); },
+    });
+    // Redrawing keeps focus on the control the user was on.
+    if (focus) menu.querySelector(`[data-key="${CSS.escape(focus)}"]`)?.focus();
+    menu.place?.();
+  }
+  settingsBtn.setAttribute('aria-haspopup', 'dialog');
+  settingsBtn.addEventListener('click', () => {
+    openMenu(settingsBtn, (menu) => {
+      menu.classList.add('settings-menu');
+      menu.setAttribute('role', 'dialog');
+      menu.setAttribute('aria-label', 'Chat settings');
+      menu.addEventListener('toggle', (e) => { if (e.newState === 'closed' && settingsMenu === menu) settingsMenu = null; });
+      settingsMenu = menu;
+      fillSettings();
+    });
+  });
 
   // ---------- Markdown (fenced code, inline code, bold, italic, highlights, headings, lists, callouts) ----------
   // Inline: `code`, **bold**, *italic*, ==highlight==, and (recommended) as a badge.
@@ -457,7 +531,7 @@
     'Neurons idle. Let us make something ship.',
     'Small steps, verified. Where do we start?',
     'Undo is one click away. Be bold.',
-    'I do not sleep. Unless Night Mode says retry.',
+    'I do not sleep. Loop Mode says retry.',
     'Describe the change. I will find the files.',
     'Your code, your model, my tools. Ready.',
     'Hello, human. The tests are waiting.',
@@ -1110,16 +1184,19 @@
     const win = state.active?.window;
     modelBtn.replaceChildren(el('span', 'text', model), ...(win ? [el('span', 'model-window', fmtWindow(win))] : []), icon('chevron-down'));
     modelBtn.title = win ? `Model: ${model}. Context window: ${win.toLocaleString()} tokens.` : `Model: ${model}`;
-    nightSwitch.checked = !!state.night;
-    // Night mode shows only its Think and Loop models; edits and auto-commit are always on, so their controls hide.
+    // Loop Mode shows only its Think and Loop models in place of the chat model.
     nightPlanBtn.hidden = nightLoopBtn.hidden = !state.night;
-    modelBtn.hidden = autoCommitBox.parentElement.hidden = !!state.night;
+    modelBtn.hidden = !!state.night;
     nightPlanBtn.replaceChildren(icon('lightbulb'), el('span', 'text', `Think: ${state.nightPlanner?.model || 'none'}`), icon('chevron-down'));
-    nightPlanBtn.title = `Night Mode Think model: splits each request into a todo list in todo.md. None: the Loop model works on the whole request.`;
+    nightPlanBtn.title = `Loop Mode Think model: splits each request into a todo list in todo.md. None: the Loop model works on the whole request.`;
     nightLoopBtn.replaceChildren(icon('sync'), el('span', 'text', `Loop: ${state.nightWorker?.model || 'chat model'}`), icon('chevron-down'));
-    nightLoopBtn.title = 'Night Mode Loop model: works on one todo.md item per run, checks it off, and retries until each item is done. Unset: the chat model.';
+    nightLoopBtn.title = 'Loop Mode Loop model: works on one todo.md item per run, checks it off, and retries until each item is done. Unset: the chat model.';
     nightPlanBtn.disabled = nightLoopBtn.disabled = state.busy;
-    autoCommitBox.checked = state.autoCommit;
+    const em = EDIT_MODES[state.editMode] ? state.editMode : 'auto';
+    settingsBtn.dataset.mode = em;
+    settingsBtn.replaceChildren(icon(EDIT_MODES[em][0]), el('span', 'text', EDIT_MODES[em][1]), ...(state.night ? [el('span', 'pick-badge', 'Loop')] : []), icon('chevron-down'));
+    settingsBtn.title = `Edit mode: ${EDIT_MODES[em][1]}. ${EDIT_MODES[em][2]}${state.night ? ' Loop Mode is on.' : ''}${state.autoCommit || state.night ? ' Auto-commit is on.' : ''}`;
+    settingsBtn.setAttribute('aria-label', `Chat settings. ${settingsBtn.title}`);
     modelBtn.disabled = state.busy;
     if (send.dataset.busy !== String(state.busy)) {
       send.dataset.busy = String(state.busy);
@@ -1661,8 +1738,9 @@
         scroll(true);
         break;
       case 'status':
-        state = { ...state, busy: m.busy, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker };
+        state = { ...state, busy: m.busy, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker };
         renderToolbar();
+        fillSettings();
         break;
       case 'models':
         state.modelGroups = m.groups;

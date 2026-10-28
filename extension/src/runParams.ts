@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
-import { isProviderRef, providerConfig, settings, SECTION } from './config.js';
-import { type ChatMode, type EditorContext, type ImageInput, type PriceRule, type ProviderConfig, ROLES, type Role } from './protocol.js';
+import { editMode, isProviderRef, providerConfig, settings, SECTION } from './config.js';
+import { type ChatMode, type EditorContext, type ImageInput, type PolicyConfig, type PriceRule, type ProviderConfig, ROLES, type Role } from './protocol.js';
 
 const TASK_KINDS = ['question', 'bugInvestigation', 'codeModification', 'newFeature', 'refactoring', 'testing', 'documentation', 'repositoryWide', 'architecture'];
 const MAX_PRICE_RULES = 100;
@@ -14,13 +14,15 @@ export async function configs(secrets: vscode.SecretStorage, refs: unknown[]): P
 }
 
 /**
- * The agent always edits and runs commands in the workspace without asking; commands run in the OS
- * sandbox. Deletes, installs, network, and git writes still ask, unless listed in `agent.allowTools`.
+ * The edit mode decides what asks: auto runs everything, safe asks only before what can reach beyond
+ * the workspace, ask asks before every write and command. Commands run in the OS sandbox; tools in
+ * `agent.allowTools` never ask, tools in `agent.denyTools` never run.
  */
-export function policy() {
+export function policy(): PolicyConfig {
   const strings = (k: string) => cfg().get<string[]>(k, []).filter((x) => typeof x === 'string');
-  // approveAll: no tool is held back or asked about (MCP tools such as Figma included); only the deny list refuses.
-  return { mode: 'autonomous', allow: strings('agent.allowTools'), deny: strings('agent.denyTools'), allowAll: cfg().get<boolean>('agent.approveAll', true) };
+  const em = editMode();
+  // allowAll keeps MCP tools offered in read-only chat modes when nothing asks.
+  return { mode: 'autonomous', allow: strings('agent.allowTools'), deny: strings('agent.denyTools'), allowAll: em === 'auto', editMode: em };
 }
 
 export function limits() {

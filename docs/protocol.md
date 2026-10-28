@@ -184,7 +184,9 @@ The prompt is 1..=100 000 characters. With no route and no `provider`, the reque
 | `skills/list` / `worktrees/list` | request | the skills found / the task-x worktree names |
 | `skills/resolve` | request | `{ prompt, paths? }` → `{ active: [{ name, reason, source, text }] }`: the skills that apply (a leading `/name`, a trigger word, or a file pattern), with `{{param}}` values filled in. Clients use it to give skills to another agent, such as the Claude Code CLI. |
 
-`policy` is `{ mode, allow, deny, allowAll? }`. With `allowAll: true`, every tool call runs with no `agent/requestApproval`, destructive tools included; only `deny` refuses a tool. MCP tools are then offered in every mode, and a read-only mode still refuses other writes. Commands stay in the sandbox.
+`policy` is `{ mode, allow, deny, allowAll?, editMode? }`. With `allowAll: true`, every tool call runs with no `agent/requestApproval`, destructive tools included; only `deny` refuses a tool. MCP tools are then offered in every mode, and a read-only mode still refuses other writes. Commands stay in the sandbox.
+
+`editMode` (`"auto"`, `"safe"`, or `"ask"`) replaces `allowAll` and the destructive opt-in in every mode except `readOnly`. `deny` still refuses, and `allow` and session grants still skip the question. `auto` runs every tool with no question. `safe` runs reads, writes, deletes, and commands with no question when the OS sandbox is on (all of them stay inside the workspace, and edits and deletes go to the edit log), and asks (`agent/requestApproval`) before anything that can write or delete beyond the workspace: commands when the sandbox is off, installs, git writes, network calls, files from outside the workspace (`external`), and MCP tools. `ask` asks before every call that is not a read. A client that leaves it out keeps the earlier behaviour. A runtime older than this field rejects it as unknown; the extension ships with its own runtime, so the protocol version is unchanged.
 
 `initialize` also accepts `dataDir` (an absolute path where task files are saved) and `sandbox` (a boolean, default true).
 

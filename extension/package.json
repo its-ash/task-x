@@ -477,9 +477,21 @@
           "editPresentation": "multilineText",
           "description": "System prompt sent with each chat request."
         },
+        "task-x.agent.editMode": {
+          "type": "string",
+          "enum": ["auto", "safe", "ask"],
+          "enumDescriptions": [
+            "Every tool runs with no approval prompt: edits, deletes, commands, installs, network, git writes, and MCP tools. Commands still run in the sandbox.",
+            "Free inside the project: edits, deletes, and sandboxed commands. Asks before anything that can write or delete beyond it: installs, git writes, network calls, files from outside the workspace, MCP tools, and commands when the OS sandbox is off.",
+            "Asks before every edit, delete, and command."
+          ],
+          "default": "auto",
+          "markdownDescription": "How much the agent does without asking. Change it from the settings button in the chat toolbar. `task-x.agent.denyTools` always refuses a tool, and `task-x.agent.allowTools` never asks."
+        },
         "task-x.agent.approveAll": {
           "type": "boolean",
           "default": true,
+          "markdownDeprecationMessage": "Use `task-x.agent.editMode` instead. It is read only while `task-x.agent.editMode` is not set: `false` means `safe`.",
           "description": "Let the model use every tool with no approval prompt: edits, commands, deletes, installs, network, git writes, and all MCP tools (Figma, Chrome DevTools, and others; offered in every chat mode). Only task-x.agent.denyTools refuses a tool. Commands still run in the sandbox. Turn off to review deletes, installs, network, git writes, and MCP calls one by one."
         },
         "task-x.agent.allowTools": {
@@ -535,7 +547,7 @@
         "task-x.mcpServers": {
           "type": "object",
           "default": {},
-          "markdownDescription": "MCP servers to start, keyed by name. A local server: `{ \"chrome-devtools\": { \"command\": \"npx\", \"args\": [\"-y\", \"chrome-devtools-mcp@latest\"] } }`. A remote server: `{ \"figma\": { \"type\": \"http\", \"url\": \"http://127.0.0.1:3845/mcp\" } }` (`type` is `stdio`, `http`, or `sse`; `headers` sets HTTP headers such as `Authorization`). These override servers of the same name from `task-x.mcp.import`. Their tools appear as `mcp__<server>__<tool>`. With `task-x.agent.approveAll` (the default) the model uses them with no prompt; otherwise they need approval unless listed in `task-x.agent.allowTools`. A trusted workspace can add servers in `.task-x/mcp.json`.",
+          "markdownDescription": "MCP servers to start, keyed by name. A local server: `{ \"chrome-devtools\": { \"command\": \"npx\", \"args\": [\"-y\", \"chrome-devtools-mcp@latest\"] } }`. A remote server: `{ \"figma\": { \"type\": \"http\", \"url\": \"http://127.0.0.1:3845/mcp\" } }` (`type` is `stdio`, `http`, or `sse`; `headers` sets HTTP headers such as `Authorization`). These override servers of the same name from `task-x.mcp.import`. Their tools appear as `mcp__<server>__<tool>`. With `task-x.agent.editMode` set to `auto` (the default) the model uses them with no prompt; otherwise they need approval unless listed in `task-x.agent.allowTools`. A trusted workspace can add servers in `.task-x/mcp.json`.",
           "scope": "machine-overridable"
         },
         "task-x.mcp.import": {
