@@ -80,6 +80,14 @@ pub fn chat_request(cfg: &ResolvedConfig, req: &ChatRequest) -> HttpRequest {
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
+    // Only reasoning models take `reasoning_effort`; others reject the field.
+    let name = cfg.model.rsplit('/').next().unwrap_or_default();
+    if let Some(e) = req
+        .effort
+        .filter(|_| name.starts_with("gpt-5") || name.strip_prefix('o').is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit())))
+    {
+        body["reasoning_effort"] = json!(e.three_level());
+    }
     if !req.tools.is_empty() {
         body["tools"] = json!(tool_specs(&req.tools));
     }

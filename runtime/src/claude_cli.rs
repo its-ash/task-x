@@ -67,6 +67,9 @@ pub struct Params {
     /// the client. A command that asks to leave the sandbox is still refused.
     #[serde(default)]
     pub approve_all: bool,
+    /// Reasoning effort (`--effort`). Unset: Claude Code's default.
+    #[serde(default)]
+    pub effort: Option<crate::provider::types::Effort>,
 }
 
 fn default_mode() -> String {
@@ -86,7 +89,7 @@ const BUILTIN_FILE_TOOLS: &[&str] = &["Read", "Edit", "MultiEdit", "Write", "Not
 const SHELL_EDITS: &[&str] = &["Bash(sed -i:*)", "Bash(perl -i:*)", "Bash(perl -pi:*)", "Bash(cat >:*)", "Bash(cat <<:*)", "Bash(tee:*)"];
 const TOOL_NOTE: &str = "Work on files only through the mcp__task-x__ tools: read_file, read_range, read_symbol, search_text, search_regex, multi_search, find_files, find_symbol, find_references, get_dependencies, replace_text, edit_files, insert_at_line, apply_patch, create_file, rename_file, delete_file. Read a file before you edit it. For several replacements in one or more files, call edit_files once with all of them. Search with search_regex (a pattern, with an optional glob such as scripts/*.{js,mjs}), search_text, find_files, find_symbol, and find_references, not with grep, rg, or find in Bash; a hook blocks those. Never write or rewrite files with shell commands (python, node, sed, perl, cat, tee, heredocs) and never script edits; a hook blocks them. Use Bash only to build, test, lint, and run git. When a command result says its output was shortened, call read_log for the part you need. Save lasting project facts (build and test commands, layout, conventions) with remember.";
 /// Long commands run in parallel with the rest of the work.
-const BACKGROUND_NOTE: &str = "For slow commands (package installs, builds, long test runs, dev servers) call Bash with run_in_background: true and keep working on other parts of the task; do not sleep or wait for them. Read their output with BashOutput when you need it, and check it before you finish.";
+const BACKGROUND_NOTE: &str = "For slow commands (package installs, builds, long test runs, dev servers) call Bash with run_in_background: true and keep working on other parts of the task; do not sleep or wait for them. Builds, tests, and installs are moved to the background automatically. Read their output with BashOutput when you need it, and check it before you finish.";
 /// Catches shell file rewrites anywhere in a command (after `cd x &&`, in a pipe, in `$(...)`),
 /// which the prefix rules in `SHELL_EDITS` miss.
 static SHELL_EDIT: LazyLock<Regex> = LazyLock::new(|| {
@@ -122,6 +125,32 @@ pub fn shell_edit_hook(input: &str) -> Result<(), String> {
     }
     let cwd = std::path::PathBuf::from(v["cwd"].as_str().unwrap_or("."));
     crate::tools::shell_search::suggestion(cmd, &cwd).map_or(Ok(()), Err)
+}
+
+/// The Claude Code PreToolUse hook for Bash. With `block`, it refuses shell edits and searches
+/// (`shell_edit_hook`). It starts long commands in the background: `Ok(Some(json))` is the hook
+/// output that sets `run_in_background`. With `ask`, the changed call still goes to the user for approval.
+pub fn bash_hook(input: &str, block: bool, ask: bool) -> Result<Option<String>, String> {
+    if block {
+        shell_edit_hook(input)?;
+    }
+    let v = serde_json::from_str::<Value>(input).unwrap_or_default();
+    let t = &v["tool_input"];
+    let cmd = t["command"].as_str().unwrap_or_default();
+    if t["run_in_background"] == json!(true) || t["dangerouslyDisableSandbox"] == json!(true) || !crate::tools::exec::is_long_command(cmd) {
+        return Ok(None);
+    }
+    let mut updated = t.clone();
+    updated["run_in_background"] = json!(true);
+    Ok(Some(
+        json!({ "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": if ask { "ask" } else { "allow" },
+            "permissionDecisionReason": "task-x runs builds, tests, and installs in the background.",
+            "updatedInput": updated,
+        } })
+        .to_string(),
+    ))
 }
 
 fn sh_quote(s: &str) -> String {
@@ -278,6 +307,9 @@ pub fn args(p: &Params, task_tools: Option<(&Path, &Path)>, instructions: &str, 
     if let Some(m) = &p.model {
         a.extend(["--model".into(), m.clone()]);
     }
+    if let Some(e) = p.effort {
+        a.extend(["--effort".into(), e.as_str().into()]);
+    }
     if let Some(s) = &p.session_id {
         a.extend(["--resume".into(), s.clone()]);
     }
@@ -315,8 +347,6 @@ pub fn args(p: &Params, task_tools: Option<(&Path, &Path)>, instructions: &str, 
         }
         servers.insert(crate::mcp_server::SERVER_NAME.into(), server);
         if p.use_task_tools {
-            let hook = format!("{} --hook-shell-edit", sh_quote(&exe.to_string_lossy()));
-            settings["hooks"] = json!({ "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": hook }] }] });
             a.push("--disallowedTools".into());
             a.extend(BUILTIN_FILE_TOOLS.iter().chain(SHELL_EDITS).map(|t| t.to_string()));
             allowed.extend(task_tools_allowed(p));
@@ -324,6 +354,17 @@ pub fn args(p: &Params, task_tools: Option<(&Path, &Path)>, instructions: &str, 
     }
     if !servers.is_empty() {
         a.extend(["--mcp-config".into(), json!({ "mcpServers": servers }).to_string()]);
+    }
+    // The Bash hook starts long commands in the background, and with task-x tools it blocks shell edits.
+    if let Some((exe, _)) = task_tools {
+        let mut hook = format!("{} --hook-shell-edit", sh_quote(&exe.to_string_lossy()));
+        if !p.use_task_tools {
+            hook.push_str(" --no-block");
+        }
+        if !p.allowed_tools.iter().any(|t| t == "Bash") {
+            hook.push_str(" --ask");
+        }
+        settings["hooks"] = json!({ "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": hook }] }] });
     }
     a.extend(["--settings".into(), settings.to_string()]);
     // Claude Code reads only CLAUDE.md files itself, so task-x passes the other guidance it loaded.
@@ -1066,6 +1107,7 @@ mod tests {
             images: Vec::new(),
             mcp_servers: serde_json::Map::new(),
             approve_all: false,
+            effort: Some(crate::provider::types::Effort::Xhigh),
         };
         validate(&p).unwrap();
         assert_eq!(prompt_content(&p), json!("--help me"));
@@ -1143,6 +1185,7 @@ mod tests {
         }
         assert!(!a.iter().any(|x| x.contains("help me")), "the prompt goes through stdin, not argv");
         assert!(a.windows(2).any(|w| w == ["--resume", "abc-123"]));
+        assert!(a.windows(2).any(|w| w == ["--effort", "xhigh"]));
         assert!(a.windows(2).any(|w| w == ["--input-format", "stream-json"]), "stdin stays open for steering");
         assert!(a.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
         assert!(a.windows(2).any(|w| w == ["--max-budget-usd", "1.50"]));
@@ -1294,6 +1337,28 @@ mod tests {
             assert!(hook(ok).is_ok(), "{ok}");
         }
         assert!(hook("not json").is_ok() && shell_edit_hook("{}").is_ok());
+        let bg = |c: &str, ask: bool| bash_hook(&json!({ "tool_input": { "command": c, "description": "d" } }).to_string(), true, ask);
+        for long in [
+            "export CARGO_HOME=$PWD/.cargo-home && cargo build --workspace 2>&1 | tail -5",
+            "cargo --manifest-path runtime/Cargo.toml test",
+            "npm --prefix extension install",
+            "RUST_LOG=debug cargo run",
+            "cd app && flutter build apk",
+            "pip install -r requirements.txt",
+        ] {
+            let out: Value = serde_json::from_str(&bg(long, false).unwrap().expect(long)).unwrap();
+            let o = &out["hookSpecificOutput"];
+            assert_eq!(o["updatedInput"]["run_in_background"], true, "{long}");
+            assert_eq!((o["updatedInput"]["description"].as_str(), o["permissionDecision"].as_str()), (Some("d"), Some("allow")));
+        }
+        let ask: Value = serde_json::from_str(&bg("cargo test", true).unwrap().unwrap()).unwrap();
+        assert_eq!(ask["hookSpecificOutput"]["permissionDecision"], "ask", "ask mode still asks");
+        for quick in ["git status", "ls target", "echo cargo build", "npm -v && echo test", "cat Makefile"] {
+            assert_eq!(bg(quick, false), Ok(None), "{quick}");
+        }
+        let already = json!({ "tool_input": { "command": "cargo build", "run_in_background": true } }).to_string();
+        assert_eq!(bash_hook(&already, true, false), Ok(None));
+        assert!(bash_hook(&json!({ "tool_input": { "command": "sed -i '' s/a/b/ f && cargo build" } }).to_string(), true, false).is_err());
         // Code searches go to the task-x search tools; the message names the call.
         for search in ["grep -rn tee src", "rg python3", "find . -name '*.rs'", r#"grep -rn "ROAD_END\|createRoad" scripts/*.js | sort"#] {
             let msg = hook(search).unwrap_err();

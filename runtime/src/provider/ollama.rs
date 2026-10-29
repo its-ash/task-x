@@ -61,6 +61,10 @@ pub fn chat_request(cfg: &ResolvedConfig, req: &ChatRequest) -> HttpRequest {
         options["temperature"] = json!(t);
     }
     let mut body = json!({ "model": cfg.model, "messages": messages(req), "stream": true, "options": options });
+    // gpt-oss takes a thinking level; other models only on or off, so they keep their default.
+    if let Some(e) = req.effort.filter(|_| cfg.model.starts_with("gpt-oss")) {
+        body["think"] = json!(e.three_level());
+    }
     if !req.tools.is_empty() {
         body["tools"] = json!(tool_specs(&req.tools));
     }

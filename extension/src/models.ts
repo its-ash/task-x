@@ -75,12 +75,29 @@ export function formatTokens(n: number | undefined): string {
   return n % 1024 === 0 ? `${n / 1024}K` : `${Math.round(n / 1000)}K`;
 }
 
-/** Claude Code's model aliases. The CLI picks the newest model of each family. */
+const CAPS = ['tools', 'vision', 'thinking'];
+const claude = (id: string, details: string, contextWindow = 1_000_000): ModelInfo => ({ id, contextWindow, capabilities: CAPS, details });
+
+/** Claude Code's aliases (the CLI picks the newest model of each family), then pinned models, newest first. */
 export const CLAUDE_MODEL_INFO: ModelInfo[] = [
-  { id: 'default', contextWindow: 200_000, capabilities: ['tools', 'vision', 'thinking'], details: 'Claude Code default' },
-  { id: 'opus', contextWindow: 200_000, capabilities: ['tools', 'vision', 'thinking'], details: 'Most capable' },
-  { id: 'sonnet', contextWindow: 200_000, capabilities: ['tools', 'vision', 'thinking'], details: 'Balanced' },
-  { id: 'haiku', contextWindow: 200_000, capabilities: ['tools', 'vision', 'thinking'], details: 'Fastest' },
+  claude('default', 'Claude Code default'),
+  claude('fable', 'Newest Fable · most capable'),
+  claude('opus', 'Newest Opus'),
+  claude('sonnet', 'Newest Sonnet · balanced'),
+  claude('haiku', 'Newest Haiku · fastest'),
+  claude('opusplan', 'Opus plans, Sonnet works'),
+  claude('claude-fable-5-1', 'Claude Fable 5.1'),
+  claude('claude-opus-5-5', 'Claude Opus 5.5'),
+  claude('claude-sonnet-5-5', 'Claude Sonnet 5.5'),
+  claude('claude-haiku-5-5', 'Claude Haiku 5.5'),
+  claude('claude-fable-5', 'Claude Fable 5'),
+  claude('claude-opus-5', 'Claude Opus 5'),
+  claude('claude-sonnet-5', 'Claude Sonnet 5'),
+  claude('claude-opus-4-8', 'Claude Opus 4.8'),
+  claude('claude-opus-4-7', 'Claude Opus 4.7'),
+  claude('claude-opus-4-6', 'Claude Opus 4.6'),
+  claude('claude-sonnet-4-6', 'Claude Sonnet 4.6'),
+  claude('claude-haiku-4-5', 'Claude Haiku 4.5', 200_000),
 ];
 
 /** The same model: an Ollama name without a tag means `:latest`. */

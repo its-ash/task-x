@@ -54,7 +54,7 @@ pub fn tools() -> Vec<ToolDef> {
                         },
                         "cwd": { "type": "string", "description": "Working directory relative to the workspace root (default '.')" },
                         "timeoutSecs": int("Timeout in seconds (default 120, max 600)", 1),
-                        "background": { "type": "boolean", "description": "Run in the background; do not wait or poll for it" }
+                        "background": { "type": "boolean", "description": "Run in the background; do not wait or poll for it. Builds, tests, and installs default to true" }
                     }),
                     &["command"],
                 )

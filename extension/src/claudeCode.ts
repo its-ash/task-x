@@ -9,7 +9,6 @@ import { runtimeEnv } from './runtime.js';
 
 export const CLAUDE_KIND = 'claudeCode';
 export const CLAUDE_LABEL = 'Claude Code CLI';
-export const CLAUDE_MODELS = ['default', 'sonnet', 'opus', 'haiku'];
 /** Reading the web never needs approval, in any chat mode. */
 const WEB_TOOLS = ['WebFetch', 'WebSearch'];
 

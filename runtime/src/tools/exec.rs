@@ -2,16 +2,57 @@
 //! and capped output. The whole process group is terminated on timeout or cancel (Unix).
 
 use super::{ToolError, ToolErrorKind};
+use regex::Regex;
 use serde::Serialize;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 pub const MAX_STREAM_BYTES: usize = 48 * 1024;
 const POLL: Duration = Duration::from_millis(25);
+
+/// Commands that usually take a minute or more: builds, tests, installs, fetches, and dev servers.
+/// Every engine starts them in the background. Flags may come before the subcommand
+/// (`cargo --manifest-path x test`, `npm --prefix ext install`).
+static LONG_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    let args = r"(?:[^\s;&|]+\s+)*?";
+    let tools = [
+        format!(r"cargo\s+{args}(?:build|test|run|fetch|install|bench|doc|nextest|clippy|check)\b"),
+        format!(r"(?:npm|pnpm|yarn|bun)\s+{args}(?:i|install|ci|add|update|run|test|exec|build)\b"),
+        r"npx\s".into(),
+        format!(r"(?:pip3?|uv\s+pip)\s+{args}install\b"),
+        format!(r"uv\s+{args}(?:sync|run|add)\b"),
+        format!(r"poetry\s+{args}(?:install|add|update)\b"),
+        r"pytest\b".into(),
+        format!(r"go\s+{args}(?:build|test|get|install|run|mod\s+download)\b"),
+        r"(?:mvn|\./mvnw|gradle|\./gradlew)\b".into(),
+        format!(r"(?:flutter|dart)\s+{args}(?:build|test|run|pub|create)\b"),
+        r"(?:make|ninja|xcodebuild)\b".into(),
+        r"cmake\s+--build\b".into(),
+        format!(r"docker\s+{args}(?:build|compose|run|pull)\b"),
+        format!(r"swift\s+{args}(?:build|test)\b"),
+        format!(r"dotnet\s+{args}(?:build|test|restore|run)\b"),
+        format!(r"bundle\s+{args}(?:install|exec)\b"),
+        format!(r"composer\s+{args}(?:install|update|require)\b"),
+        format!(r"mix\s+{args}(?:deps\.get|compile|test)\b"),
+        format!(r"(?:stack|cabal)\s+{args}(?:build|test)\b"),
+        format!(r"brew\s+{args}install\b"),
+        r"(?:tsc|webpack|jest|vitest|playwright)\b".into(),
+        r"(?:vite|next)\s+build\b".into(),
+    ];
+    // `sh -c "cargo build"` arrives from `run_command` as one line with the shell in front.
+    Regex::new(&format!(r#"(?:^|[;&|(\n])\s*(?:(?:ba|z)?sh\s+-[a-z]*c\s+['"]?)?(?:sudo\s+)?(?:\w+=\S*\s+)*(?:{})"#, tools.join("|")))
+        .expect("long command regex")
+});
+
+/// Whether a command line (a shell string, or argv joined with spaces) is a build, test, install, or
+/// other command that usually runs long enough to belong in the background.
+pub fn is_long_command(cmd: &str) -> bool {
+    LONG_COMMAND.is_match(cmd)
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -328,6 +369,23 @@ mod tests {
 
     fn argv(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn builds_tests_and_installs_count_as_long() {
+        for long in [
+            "cargo build --workspace",
+            "sh -c cargo test 2>&1",
+            "bash -lc 'npm ci'",
+            "cd web && CI=1 npm --prefix x run build",
+            "flutter pub get",
+            "go test ./...",
+        ] {
+            assert!(is_long_command(long), "{long}");
+        }
+        for quick in ["git status", "ls -la", "echo cargo build", "cat Cargo.toml", "npm -v && echo test", "rustc --version"] {
+            assert!(!is_long_command(quick), "{quick}");
+        }
     }
 
     /// A quick command whose output pipe is also held by a surviving child (`cmd & `, a pipeline

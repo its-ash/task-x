@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { editMode, isProviderRef, providerConfig, providerConfigWith, settings, SECTION, toolModels } from './config.js';
+import { editMode, effort, isProviderRef, providerConfig, providerConfigWith, settings, SECTION, toolModels } from './config.js';
 import { type ChatMode, type EditorContext, type ImageInput, type PolicyConfig, type PriceRule, type ProviderConfig, ROLES, type Role } from './protocol.js';
 
 const TASK_KINDS = ['question', 'bugInvestigation', 'codeModification', 'newFeature', 'refactoring', 'testing', 'documentation', 'repositoryWide', 'architecture'];
@@ -36,6 +36,7 @@ export function limits() {
     contextWindowTokens: clamp(c.get('context.windowTokens'), 0, 10_000_000, 0) || undefined,
     compactPercent: clamp(c.get('context.compactAt'), 30, 95, 85),
     lazyTools: c.get<boolean>('agent.lazyTools', true),
+    effort: effort(),
   };
 }
 

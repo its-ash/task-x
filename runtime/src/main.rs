@@ -34,12 +34,19 @@ async fn main() -> ExitCode {
         println!("task-x-runtime {} (protocol {})", env!("CARGO_PKG_VERSION"), rpc::PROTOCOL_VERSION);
         return ExitCode::SUCCESS;
     }
-    // `--hook-shell-edit`: Claude Code PreToolUse hook that blocks file writes from the shell.
+    // `--hook-shell-edit [--no-block] [--ask]`: Claude Code PreToolUse hook for Bash. It blocks file
+    // writes from the shell (unless `--no-block`) and starts long commands in the background.
     if std::env::args().nth(1).as_deref() == Some("--hook-shell-edit") {
+        let flags: Vec<String> = std::env::args().skip(2).collect();
         let mut input = String::new();
         let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
-        return match claude_cli::shell_edit_hook(&input) {
-            Ok(()) => ExitCode::SUCCESS,
+        return match claude_cli::bash_hook(&input, !flags.iter().any(|f| f == "--no-block"), flags.iter().any(|f| f == "--ask")) {
+            Ok(out) => {
+                if let Some(out) = out {
+                    println!("{out}");
+                }
+                ExitCode::SUCCESS
+            }
             Err(reason) => {
                 eprintln!("{reason}");
                 ExitCode::from(2)

@@ -108,6 +108,9 @@ pub struct Limits {
     /// name). The full list costs tokens on every turn.
     #[serde(default)]
     pub lazy_tools: bool,
+    /// Reasoning effort for every model call of the task. Unset: each model's default.
+    #[serde(default)]
+    pub effort: Option<crate::provider::types::Effort>,
 }
 fn d_parallel() -> u32 {
     3
@@ -137,6 +140,7 @@ impl Default for Limits {
             compact_percent: d_compact_percent(),
             max_parallel: d_parallel(),
             lazy_tools: false,
+            effort: None,
         }
     }
 }
@@ -951,6 +955,7 @@ impl Run {
                 max_tokens: self.limits.max_output_tokens,
                 temperature: None,
                 context_window: u32::try_from(window).ok(),
+                effort: self.limits.effort,
             };
             debug!(estimate = estimate, window = window, model = %self.provider.model, "Starting model turn");
             let started = Instant::now();
@@ -1524,7 +1529,14 @@ impl Run {
         // The blocking hooks already ran in `prepare`, before the approval prompt.
         self.emit(json!({ "type": "toolStarted", "callId": call.id, "tool": call.name, "input": call.input, "permission": permission }));
         let res = match target {
-            Target::Builtin(def) if def.name == "run_command" && call.input["background"] == true => self.start_background(def, call),
+            // Explicit background calls, and builds, tests, and installs, return at once for every provider.
+            Target::Builtin(def)
+                if def.name == "run_command"
+                    && (call.input["background"] == true
+                        || (call.input["background"] != false && tools::exec::is_long_command(&command_text(&call.input["command"])))) =>
+            {
+                self.start_background(def, call)
+            }
             // A command that keeps running is handed to the background instead of blocking the turn.
             Target::Builtin(def) if def.name == "run_command" => self.command_with(def, call, COMMAND_HANDOFF).await,
             Target::Builtin(def) => {
@@ -1650,6 +1662,7 @@ impl Run {
             max_tokens: Some(SUMMARY_TOKENS),
             temperature: None,
             context_window: None,
+            effort: None,
         };
         let out = self.host.providers.stream_chat(&provider, &req, &self.cancel, |_| {}).await.map_err(|e| fail(e.message))?;
         let t = out.usage.input_tokens.unwrap_or(0) + out.usage.output_tokens.unwrap_or(0);

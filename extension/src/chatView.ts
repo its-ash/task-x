@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
-import { EDIT_MODES, type EditMode, activeRef, editMode, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, setEditMode, toolModels, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
+import { EDIT_MODES, type EditMode, activeRef, editMode, effort, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, setEditMode, toolModels, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
 import {
   type AgentEvent,
   type AgentEventParams,
@@ -15,6 +15,8 @@ import {
   USER_MODES,
   type ChatMode,
   type ContextWindowResult,
+  EFFORTS,
+  type Effort,
   type EditorContext,
   type ImageInput,
   imagesFrom,
@@ -24,6 +26,7 @@ import {
   type ResolvedSkill,
   type SkillInfo,
 } from './protocol.js';
+import { type PluginEntry, catalog, installPlugin, newAgent, newSkill, setPlugin, viewPlugin } from './catalog.js';
 import { CLAUDE_KIND, CLAUDE_LABEL, claudeAuth, claudeModel, claudePermissions, claudeSignIn, claudeSignOut, engine, findClaude, useClaude } from './claudeCode.js';
 import { CLAUDE_MODEL_INFO, type Listed, MODEL_LIST_TTL_MS, formatTokens, listModels, missingNote, withSaved } from './models.js';
 import { type JsonRpcClient, RpcError } from './rpc.js';
@@ -145,7 +148,7 @@ const MAX_LANE_STEPS = 30;
 
 /** A rendered transcript entry; persisted per workspace. */
 type Item =
-  | { kind: 'user'; text: string; mode: ChatMode; images?: number }
+  | { kind: 'user'; text: string; mode: ChatMode; images?: number; context?: SentContext[] }
   | { kind: 'assistant'; text: string }
   | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string }; tokens?: number }
   | { kind: 'file'; path: string; operation: number | null; diffKey: string; added: number; removed: number; diff: string; diffCut: boolean; undone?: boolean; kept?: boolean }
@@ -208,6 +211,8 @@ type Inbound =
   | { type: 'selectNightModel'; role: string; kind: string; model: string }
   | { type: 'selectAutoCommit'; enabled: boolean }
   | { type: 'selectEditMode'; mode: string }
+  | { type: 'selectEffort'; effort: string }
+  | { type: 'slashAction'; action: string; key?: string; enable?: boolean }
   | { type: 'openSettings'; query: string }
   | { type: 'suggest'; text: string; mode: string }
   | { type: 'copyOutput'; id: string }
@@ -342,9 +347,36 @@ function isBackgroundStart(output: string): boolean {
   }
 }
 
+/** A file that went with a message, shown as a chip under it. */
+interface SentContext {
+  path: string;
+  lines?: string;
+}
+
+/** The open file (or its selection) and the @ mentions, in the order the chips show them. */
+function sentContext(ed: EditorContext): SentContext[] {
+  const sel = ed.selection;
+  const out: SentContext[] = sel
+    ? [{ path: sel.path, lines: sel.startLine === sel.endLine ? `L${sel.startLine}` : `L${sel.startLine}-${sel.endLine}` }]
+    : ed.activeFile
+      ? [{ path: ed.activeFile }]
+      : [];
+  for (const m of ed.mentions ?? []) if (!out.some((c) => c.path === m)) out.push({ path: m });
+  return out;
+}
+
 function toolDetail(tool: string, input: Record<string, unknown>): string {
   const s = (k: string) => (typeof input[k] === 'string' ? (input[k] as string) : Array.isArray(input[k]) ? (input[k] as unknown[]).map(String).join(' ') : '');
-  const claude = s('command') || s('file_path') || s('url') || s('notebook_path');
+  // The browser row says what the agent does there: "goto https://…", "click button.go".
+  if (tool.replace(/^mcp__task-x__/, '') === 'browser') {
+    const what = s('url') || s('selector') || s('key') || s('target');
+    const v = [s('action'), what].filter(Boolean).join(' ');
+    return v.length > 120 ? `${v.slice(0, 117)}…` : v;
+  }
+  // Commands are shown in full; the chat row wraps them.
+  const cmd = s('command');
+  if (cmd) return cmd;
+  const claude = s('file_path') || s('url') || s('notebook_path');
   if (claude) return claude.length > 120 ? `${claude.slice(0, 117)}…` : claude;
   if (tool === 'apply_patch') return [...s('patch').matchAll(/^\+\+\+ (?:b\/)?(.+)$/gm)].map((m) => m[1]).join(', ');
   const v = s('path') || s('query') || s('pattern') || s('name') || s('glob') || (s('from') && `${s('from')} → ${s('to')}`) || s('rev');
@@ -634,7 +666,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   refreshStatus(): void {
     const ref = activeRef();
     const claude = engine() === 'claudeCode';
-    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.busy && this.activeTab === this.runTab, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null });
+    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.busy && this.activeTab === this.runTab, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null });
     void this.postModels();
   }
 
@@ -1095,6 +1127,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'listSkills':
         await this.postSkills();
         break;
+      case 'slashAction':
+        await this.slashAction(m);
+        break;
       case 'signIn':
         await claudeSignIn(() => this.refreshStatus());
         break;
@@ -1139,6 +1174,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.refreshStatus();
         break;
       }
+      case 'selectEffort':
+        // An unknown value (the slider's "Default" stop) clears the choice.
+        await setWindowChoice({ effort: EFFORTS.includes(m.effort as Effort) ? (m.effort as Effort) : undefined });
+        this.refreshStatus();
+        break;
       case 'selectAutoCommit':
         this.autoCommit = m.enabled === true;
         await this.ctx.workspaceState.update(AUTO_COMMIT_KEY, this.autoCommit);
@@ -1888,7 +1928,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const mode: ChatMode = modeOverride ?? 'agent';
     const abort = new AbortController();
     this.setBusy(abort);
-    this.add({ kind: 'user', text, mode, ...(images.length ? { images: images.length } : {}) });
+    const sent = sentContext(this.editorContext(text));
+    this.add({ kind: 'user', text, mode, ...(images.length ? { images: images.length } : {}), ...(sent.length ? { context: sent } : {}) });
     const before = this.lastSummary();
     this.stalled = false;
     this.lastActivity = Date.now();
@@ -2016,14 +2057,64 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     void show(text, action).then((pick) => pick && vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`));
   }
 
-  /** Skills for the `/` menu in the input. */
+  /** Files the `/` menu may open, by the key it sent to the webview; the webview never sends a path. */
+  private slashFiles = new Map<string, string>();
+  private slashPlugins = new Map<string, PluginEntry>();
+
+  /** Skills, agents, and plugins for the `/` menu in the input. */
   private async postSkills(): Promise<void> {
+    this.slashFiles.clear();
+    this.slashPlugins.clear();
+    const file = (p: string | undefined) => {
+      if (!p || !path.isAbsolute(p)) return undefined;
+      const key = String(this.slashFiles.size);
+      this.slashFiles.set(key, p);
+      return key;
+    };
+    let skills: SkillInfo[] = [];
     try {
-      const skills = await (await this.getClient()).request<SkillInfo[]>('skills/list');
-      this.post({ type: 'skills', skills: skills.map((s) => ({ name: s.name, description: s.description, params: s.params, source: skillOrigin(s.source) })) });
+      skills = await (await this.getClient()).request<SkillInfo[]>('skills/list');
     } catch (e) {
       this.log('warn', `skills/list failed: ${describeError(e)}`);
-      this.post({ type: 'skills', skills: [] });
+    }
+    const cat = await catalog(WorkspaceSync.root());
+    const known = new Set(skills.map((s) => s.name));
+    this.post({
+      type: 'skills',
+      skills: [
+        ...skills.map((s) => ({ name: s.name, description: s.description, params: s.params, source: skillOrigin(s.source), view: file(s.source) })),
+        ...cat.pluginSkills.filter((s) => !known.has(s.name)).map((s) => ({ name: s.name, description: s.description, source: s.source, view: file(s.path) })),
+      ],
+      agents: cat.agents.map((a) => ({ name: a.name, description: a.description, source: a.source, view: file(a.path) })),
+      plugins: cat.plugins.map((p) => {
+        this.slashPlugins.set(p.id, p);
+        return { id: p.id, version: p.version, enabled: p.enabled };
+      }),
+    });
+  }
+
+  /** The `/` menu's actions: view a skill or agent, create one, and install or toggle plugins. */
+  private async slashAction(m: { action: string; key?: string; enable?: boolean }): Promise<void> {
+    const root = WorkspaceSync.root();
+    const plugin = typeof m.key === 'string' ? this.slashPlugins.get(m.key) : undefined;
+    switch (m.action) {
+      case 'view': {
+        const f = typeof m.key === 'string' ? this.slashFiles.get(m.key) : undefined;
+        if (f) await vscode.window.showTextDocument(vscode.Uri.file(f));
+        return;
+      }
+      case 'newSkill':
+        return newSkill(root);
+      case 'newAgent':
+        return newAgent(root);
+      case 'installPlugin':
+        return installPlugin();
+      case 'viewPlugin':
+        if (plugin) await viewPlugin(plugin);
+        return;
+      case 'togglePlugin':
+        if (plugin && (await setPlugin(plugin.id, m.enable === true))) await this.postSkills();
+        return;
     }
   }
 
@@ -2092,6 +2183,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         useTaskTools: c.get<boolean>('claudeCode.useTaskXTools', true),
         images,
         mcpServers: claudeMcpServers(this.ctx),
+        effort: effort(),
         ...claudePermissions(mode),
       },
       { signal },
@@ -2153,6 +2245,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     <button type="button" id="nightPlanBtn" class="pick" hidden></button>
     <button type="button" id="nightLoopBtn" class="pick" hidden></button>
     <button type="button" id="settingsBtn" class="pick settings-pick"></button>
+    <button type="button" id="effortBtn" class="pick effort-pick"></button>
     <span class="spacer"></span>
     <span id="ctxMeter" class="meter" role="meter" aria-valuemin="0" aria-valuemax="100" hidden></span>
     <button type="button" id="indexBtn" class="pick index" hidden></button>

@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import * as vscode from 'vscode';
-import { PROVIDER_KINDS, PROVIDER_LABELS, type ProviderConfig, type ProviderKind, requiresApiKey } from './protocol.js';
+import { EFFORTS, type EditMode, type Effort, PROVIDER_KINDS, PROVIDER_LABELS, type ProviderConfig, type ProviderKind, requiresApiKey } from './protocol.js';
 
 export { DEFAULT_BASE_URLS, requiresApiKey } from './protocol.js';
 
@@ -73,6 +73,8 @@ export interface WindowChoice {
   /** The model that refines prompts, and the cheap helper for file summaries and research subagents. */
   refineModel?: NightModel;
   helperModel?: NightModel;
+  /** Reasoning effort for every model; unset is each model's default. */
+  effort?: Effort;
 }
 export interface NightModel {
   kind: string;
@@ -97,6 +99,7 @@ export const chosenEngine = (): string | undefined => choice.engine;
 export const chosenClaudeModel = (): string | undefined => choice.claudeModel;
 export const nightModels = (): { planner?: NightModel; worker?: NightModel } => ({ planner: choice.nightPlanner, worker: choice.nightWorker });
 export const toolModels = (): { refine?: NightModel; helper?: NightModel } => ({ refine: choice.refineModel, helper: choice.helperModel });
+export const effort = (): Effort | undefined => (EFFORTS.includes(choice.effort as Effort) ? choice.effort : undefined);
 
 async function updateCustom(fn: (list: CustomProvider[]) => CustomProvider[]): Promise<void> {
   await cfg().update('customProviders', fn(customProviders()), vscode.ConfigurationTarget.Global);
@@ -131,7 +134,6 @@ function cfg() {
 
 /** How much the agent may do without asking: everything (auto), the project only (safe), or nothing (ask). */
 export type { EditMode } from './protocol.js';
-import type { EditMode } from './protocol.js';
 export const EDIT_MODES: readonly EditMode[] = ['auto', 'safe', 'ask'];
 
 /** `task-x.agent.editMode`; before it was set, `agent.approveAll: false` meant reviewing calls (safe). */

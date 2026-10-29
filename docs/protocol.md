@@ -231,6 +231,8 @@ With a `dataDir`, the edit log (checkpoints) is saved per workspace in `dataDir/
 
 `limits.contextWindowTokens` sets the model's window. Without it the runtime asks the provider for the model's window and caches the answer for 5 minutes: Ollama from `/api/show` (`model_info.*.context_length`), Anthropic from `/v1/models` (`max_input_tokens`), OpenAI-compatible endpoints from `/v1/models` (`context_length`, `context_window`, or `max_token_size`). When the endpoint does not report one, it falls back to the built-in estimate for the model (Anthropic: 1M for Claude 4.6 and later, otherwise 200K; OpenAI: 1M for gpt-4.1, 272K for gpt-5, otherwise 128K; Ollama and OpenAI-compatible: 32768). `ChatRequest.contextWindow` passes the window to APIs that take one (Ollama `num_ctx`).
 
+`limits.effort` (`"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`; unset is each model's default) sets the reasoning effort of every model call in the task (`ChatRequest.effort`). Each provider sends it only to models that take it: Anthropic as `output_config.effort` (Claude 4.6 and later, and Opus 4.5; a level the model lacks is lowered, `xhigh` to `high` on the 4.6 models, anything above `high` on Opus 4.5), OpenAI-compatible endpoints as `reasoning_effort` for `gpt-5*` and `o<digit>*` models, and Ollama as `think` for `gpt-oss`. The two upper levels become `high` where the API has only three. Other models ignore it.
+
 Before each model call, the runtime estimates the prompt size (characters ÷ 4, calibrated by the real `inputTokens` of the last response). Above `limits.compactPercent` (default 85, 30 to 95) of the window it compresses in stages and stops as soon as the prompt fits. Repository excerpts from the first request are removed last, and only while the prompt is still above that limit:
 
 1. **Prune** old tool results (all but the last 6 messages; errors are kept): a file read that a later read or edit of the same file replaced, and a result repeated later, become short stubs; an output over 2000 characters keeps its first 1200 and last 400 characters.
@@ -241,7 +243,7 @@ Compressed content starts with `[context compressed]`. Events: `compacted` `{ fo
 
 ### Claude Code engine and the task-x tools
 
-`claude/run` also takes `approveAll` (default false; when true, every tool Claude Code asks about, MCP tools included, is allowed with no `agent/requestApproval`), `images` (`ImageInput[]`, sent with the prompt as image content blocks), and `mcpServers` (more servers in Claude Code's `mcpServers` format, added to `--mcp-config`; the name `task-x` is reserved).
+`claude/run` also takes `approveAll` (default false; when true, every tool Claude Code asks about, MCP tools included, is allowed with no `agent/requestApproval`), `images` (`ImageInput[]`, sent with the prompt as image content blocks), `mcpServers` (more servers in Claude Code's `mcpServers` format, added to `--mcp-config`; the name `task-x` is reserved), and `effort` (the same levels as `limits.effort`, passed as `--effort`).
 
 Claude Code always runs with `sandbox.allowUnsandboxedCommands: false`, so a command cannot leave the sandbox. A `Bash` call with `dangerouslyDisableSandbox: true` is denied at once, without asking the user.
 

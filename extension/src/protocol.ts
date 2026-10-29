@@ -259,6 +259,10 @@ export interface EditorContext {
 /** How much the agent may do without asking (`policy.editMode`). */
 export type EditMode = 'auto' | 'safe' | 'ask';
 
+/** Reasoning effort, lowest to highest (`limits.effort`, `claude/run` `effort`). */
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type Effort = (typeof EFFORTS)[number];
+
 /** `agent/run` `policy`. */
 export interface PolicyConfig {
   mode: 'readOnly' | 'askBeforeEdit' | 'askBeforeExecution' | 'autonomous';

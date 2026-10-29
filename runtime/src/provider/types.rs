@@ -293,6 +293,37 @@ pub struct ChatRequest {
     /// Context window to ask the server for, where the API takes one (Ollama `num_ctx`).
     #[serde(default)]
     pub context_window: Option<u32>,
+    /// How hard the model thinks, for models that take a level. Unset: the model's default.
+    #[serde(default)]
+    pub effort: Option<Effort>,
+}
+
+/// Reasoning effort, lowest to highest. Each provider maps it to what the model takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// The three-level scale most APIs use (`low`, `medium`, `high`): higher levels become `high`.
+    pub fn three_level(self) -> &'static str {
+        self.min(Self::High).as_str()
+    }
 }
 
 impl ChatRequest {

@@ -3,7 +3,7 @@
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
   const log = $('log'), input = $('input'), send = $('send'), progress = $('progress');
-  const modelBtn = $('modelBtn'), settingsBtn = $('settingsBtn');
+  const modelBtn = $('modelBtn'), settingsBtn = $('settingsBtn'), effortBtn = $('effortBtn');
   const nightPlanBtn = $('nightPlanBtn'), nightLoopBtn = $('nightLoopBtn');
   const refineBtn = $('refineBtn');
 
@@ -21,7 +21,7 @@
     multi_search: 'Searched', read_log: 'Read log', remember: 'Remembered', find_tool: 'Loaded tools', summarize_file: 'Summarized',
     Read: 'Read', Write: 'Wrote', Edit: 'Edited', MultiEdit: 'Edited', NotebookEdit: 'Edited notebook', Bash: 'Ran', BashOutput: 'Read output',
     KillShell: 'Stopped shell', Grep: 'Searched', Glob: 'Found files', LS: 'Listed', TodoWrite: 'Updated todos', WebFetch: 'Fetched',
-    WebSearch: 'Searched web', Task: 'Subagent', ExitPlanMode: 'Finished plan', run_subagent: 'Subagent', worktree_apply: 'Applied worktree', worktree_discard: 'Discarded worktree',
+    WebSearch: 'Searched web', browser: 'VS Code browser', Skill: 'Used skill', Task: 'Subagent', ExitPlanMode: 'Finished plan', run_subagent: 'Subagent', worktree_apply: 'Applied worktree', worktree_discard: 'Discarded worktree',
   };
 
   // A successful edit tool shows as its edit card, not as a row (a failed edit still shows as a row).
@@ -87,7 +87,8 @@
       const items = visible();
       const i = items.indexOf(document.activeElement);
       const go = (n) => { e.preventDefault(); items[(n + items.length) % items.length]?.focus(); };
-      const inSearch = e.target === search;
+      // Home and End stay with a text field or a slider.
+      const inSearch = e.target === search || e.target.type === 'range';
       if (e.key === 'ArrowDown') go(i + 1);
       else if (e.key === 'ArrowUp') i <= 0 && search ? (e.preventDefault(), search.focus()) : go(i - 1);
       else if (e.key === 'Home' && !inSearch) go(0);
@@ -289,6 +290,66 @@
     safe: ['shield', 'Safe', 'Free inside the project. Asks before anything that can write or delete beyond it: installs, git writes, network, outside files, MCP tools, and commands without the sandbox.'],
     ask: ['comment-discussion', 'Ask', 'Asks before every edit, delete, and command.'],
   };
+  // Reasoning effort, lowest to highest; the first stop leaves each model at its own default.
+  const EFFORTS = [
+    ['', 'Default', 'Each model uses its own default effort.', 'circle-large-outline'],
+    ['low', 'Low', 'Fastest and cheapest. For simple edits, questions, and subagents.', 'zap'],
+    ['medium', 'Medium', 'Less thinking and fewer tokens. Good for routine work.', 'dashboard'],
+    ['high', 'High', 'Deeper thinking for most coding work.', 'lightbulb'],
+    ['xhigh', 'Extra high', 'More thinking for hard coding and long agent tasks.', 'flame'],
+    ['max', 'Max', 'The most thinking, when correctness matters more than cost.', 'rocket'],
+  ];
+  const effortAt = () => Math.max(0, EFFORTS.findIndex(([k]) => k === (state.effort || '')));
+  // A slider for the effort. It sends the value when the user lets go, and the label follows the drag.
+  function effortRow(menu) {
+    const at = effortAt();
+    const row = el('div', 'effort-row');
+    const value = el('span', 'effort-value', EFFORTS[at][1]);
+    const head = el('div', 'effort-head');
+    const lead = icon(EFFORTS[at][3], 'setting-icon effort-icon');
+    head.append(lead, el('span', 'title', 'Effort'), value);
+    const range = el('input', 'effort-range');
+    Object.assign(range, { type: 'range', min: '0', max: String(EFFORTS.length - 1), step: '1', value: String(at) });
+    range.dataset.key = 'effort';
+    range.setAttribute('aria-label', 'Effort');
+    const ticks = el('div', 'effort-ticks');
+    ticks.setAttribute('aria-hidden', 'true');
+    EFFORTS.forEach(([, label, , ic], i) => {
+      const t = el('span', i === at ? 'on' : null);
+      t.title = label;
+      t.append(icon(ic));
+      ticks.append(t);
+    });
+    const desc = el('div', 'desc effort-desc', EFFORTS[at][2]);
+    const show = (i) => {
+      value.textContent = EFFORTS[i][1];
+      desc.textContent = EFFORTS[i][2];
+      lead.className = `codicon codicon-${EFFORTS[i][3]} setting-icon effort-icon`;
+      range.style.setProperty('--fill', `${(i / (EFFORTS.length - 1)) * 100}%`);
+      range.setAttribute('aria-valuetext', EFFORTS[i][1]);
+      [...ticks.children].forEach((t, j) => t.classList.toggle('on', j === i));
+    };
+    show(at);
+    range.addEventListener('input', () => show(+range.value));
+    range.addEventListener('change', () => {
+      state.effort = EFFORTS[+range.value][0] || null;
+      vscode.postMessage({ type: 'selectEffort', effort: EFFORTS[+range.value][0] });
+      renderToolbar();
+    });
+    row.append(head, range, ticks, desc);
+    menu.append(row);
+    return range;
+  }
+  effortBtn.setAttribute('aria-haspopup', 'dialog');
+  effortBtn.addEventListener('click', () => {
+    openMenu(effortBtn, (menu) => {
+      menu.classList.add('settings-menu', 'effort-menu');
+      menu.setAttribute('role', 'dialog');
+      menu.setAttribute('aria-label', 'Effort');
+      effortRow(menu);
+    });
+    document.querySelector('.effort-menu .effort-range')?.focus();
+  });
   let settingsMenu = null;
   function toggleRow(menu, { key, ic, title, desc, on, disabled, onToggle }) {
     const b = el('button', 'menu-item setting-row');
@@ -734,6 +795,17 @@
           n.append(icon('file-media'), document.createTextNode(`${it.images} image${it.images > 1 ? 's' : ''} attached`));
           req.append(n);
         }
+        // The files that went with the message: the open file (or its selection) and @ mentions.
+        if (it.context?.length) {
+          const n = el('div', 'request-ctx');
+          n.setAttribute('aria-label', 'Sent with the message');
+          for (const c of it.context) {
+            const name = c.path.replace(/\/$/, '').split('/').pop() + (c.path.endsWith('/') ? '/' : '');
+            const chip = button('ctx-chip sent', [icon(c.lines ? 'selection' : c.path.endsWith('/') ? 'folder' : 'file'), el('span', 'ctx-name', name), ...(c.lines ? [el('span', 'ctx-lines', c.lines)] : [])], () => vscode.postMessage({ type: 'openFile', path: c.path.replace(/\/$/, '') }), `${c.path}${c.lines ? ` ${c.lines}` : ''}: sent with this message`);
+            n.append(chip);
+          }
+          req.append(n);
+        }
         turn.el.append(req);
         log.append(turn.el);
         current = null;
@@ -753,14 +825,18 @@
         row.dataset.id = it.id;
         const st = it.ok === undefined ? 'run' : it.ok ? 'ok' : 'fail';
         row.dataset.state = st;
-        const [owner, tool] = it.tool.includes(' › ') ? it.tool.split(' › ') : [null, it.tool];
+        const [owner, full] = it.tool.includes(' › ') ? it.tool.split(' › ') : [null, it.tool];
+        // The task-x tools that Claude Code calls over MCP show like the built-in ones.
+        const tool = full.replace(/^mcp__task-x__/, '');
         const plain = TOOL_LABELS[tool] || tool.replace(/^mcp__([^_]+)__/, '$1: ');
+        if (tool === 'browser') row.classList.add('browser');
         const label = (owner ? owner + ' › ' : '') + (EDIT_TOOLS.has(tool) ? { run: 'Editing', fail: 'Edit failed' }[st] || plain : plain);
         // A running or failed edit shows as a row; once it succeeds, its edit card replaces the row.
         if (EDIT_TOOLS.has(tool)) { row.dataset.edit = '1'; if (it.ok === true) row.classList.add('quiet'); }
         const lab = el('span', 'label', label);
         lab.dataset.tool = it.tool;
-        row.append(lab, el('span', 'detail', it.detail || ''));
+        if (tool === 'browser') row.append(icon('globe', 'browser-icon'));
+        row.append(lab, el('span', EXPANDED.has(tool) ? 'detail cmd' : 'detail', it.detail || ''));
         step(row);
         // The dot itself is the stop control while the call runs; `toolDone` clears it.
         if (it.stop && it.ok === undefined && state.busy) stopDot(row);
@@ -911,7 +987,7 @@
       const row = el('div', 'lane-step');
       if (seen !== undefined && body.querySelectorAll('.lane-step:not(.muted)').length >= seen) row.classList.add('enter');
       row.dataset.state = st.ok === undefined ? 'run' : st.ok ? 'ok' : 'fail';
-      row.append(el('span', 'dot'), el('span', 'label', TOOL_LABELS[st.tool] || st.tool), el('span', 'detail', st.detail || ''));
+      row.append(el('span', 'dot'), el('span', 'label', TOOL_LABELS[st.tool] || st.tool), el('span', EXPANDED.has(st.tool) ? 'detail cmd' : 'detail', st.detail || ''));
       body.append(row);
     }
     if (it.steps.length || it.hidden) card.append(body);
@@ -1266,6 +1342,11 @@
     settingsBtn.replaceChildren(icon(EDIT_MODES[em][0]), el('span', 'text', EDIT_MODES[em][1]), ...(state.night ? [el('span', 'pick-badge', 'Loop')] : []), icon('chevron-down'));
     settingsBtn.title = `Edit mode: ${EDIT_MODES[em][1]}. ${EDIT_MODES[em][2]}${state.night ? ' Loop Mode is on.' : ''}${state.autoCommit || state.night ? ' Auto-commit is on.' : ''}`;
     settingsBtn.setAttribute('aria-label', `Chat settings. ${settingsBtn.title}`);
+    const ef = EFFORTS[effortAt()];
+    effortBtn.dataset.level = ef[0] || 'default';
+    effortBtn.replaceChildren(icon(ef[3]), el('span', 'text', ef[0] ? ef[1] : 'Effort'), icon('chevron-down'));
+    effortBtn.title = `Effort: ${ef[1]}. ${ef[2]}`;
+    effortBtn.setAttribute('aria-label', effortBtn.title);
     modelBtn.disabled = state.busy;
     if (send.dataset.busy !== String(state.busy)) {
       send.dataset.busy = String(state.busy);
@@ -1659,10 +1740,10 @@
   // ---------- Slash menu: "/" at the start of the input lists skills ----------
   const slash = $('slash');
   const MAX_SLASH = 50;
-  let skills = null, slashItems = [], slashActive = 0, slashOpen = false;
+  let skills = null, agents = [], plugins = [], slashItems = [], slashActive = 0, slashOpen = false;
   input.setAttribute('aria-autocomplete', 'list');
   input.setAttribute('aria-controls', 'slash');
-  const slashQuery = () => /^\/([\w.-]*)$/.exec(input.value.slice(0, input.selectionStart))?.[1];
+  const slashQuery = () => /^\/([\w.:-]*)$/.exec(input.value.slice(0, input.selectionStart))?.[1];
   // "@" at a word start opens the file menu; the query is what follows it, up to the caret.
   const atMatch = () => /(^|\s)@([\w./-]*)$/.exec(input.value.slice(0, input.selectionStart));
   let menuKind = 'skill', fileItems = null, fileQuery = null;
@@ -1691,17 +1772,22 @@
       input.focus();
       return;
     }
+    if (s.kind === 'action') { closeSlash(); input.value = ''; autosize(); return void vscode.postMessage({ type: 'slashAction', action: s.action }); }
+    if (s.kind === 'plugin') return void vscode.postMessage({ type: 'slashAction', action: 'viewPlugin', key: s.id });
     const rest = input.value.slice(input.selectionStart).replace(/^\S*/, '').trimStart();
-    input.value = `/${s.name} ${rest}`;
-    const end = s.name.length + 2;
+    // An agent is called by name in the message; a skill by its slash command.
+    const lead = s.kind === 'agent' ? `Use the ${s.name} agent to ` : `/${s.name} `;
+    input.value = lead + rest;
+    const end = lead.length;
     input.setSelectionRange(end, end);
     closeSlash();
     autosize();
     input.focus();
   }
   function markActive() {
-    [...slash.children].forEach((c, i) => c.setAttribute('aria-selected', String(i === slashActive)));
-    const a = slash.children[slashActive];
+    const opts = [...slash.querySelectorAll('.slash-item')];
+    opts.forEach((c, i) => c.setAttribute('aria-selected', String(i === slashActive)));
+    const a = opts[slashActive];
     if (a?.id) { input.setAttribute('aria-activedescendant', a.id); a.scrollIntoView({ block: 'nearest' }); }
   }
   function renderFiles(q) {
@@ -1739,32 +1825,65 @@
     const at = atMatch();
     if (at) return renderFiles(at[2]);
     menuKind = 'skill';
-    slash.setAttribute('aria-label', 'Skills');
+    slash.setAttribute('aria-label', 'Skills, agents, and plugins');
     const q = slashQuery();
     if (q === undefined) return closeSlash();
     const ql = q.toLowerCase();
-    const all = skills || [];
-    const starts = all.filter((s) => s.name.toLowerCase().startsWith(ql));
-    const rest = ql ? all.filter((s) => !starts.includes(s) && (s.name.toLowerCase().includes(ql) || s.description.toLowerCase().includes(ql))) : [];
-    slashItems = [...starts, ...rest].slice(0, MAX_SLASH);
+    // Names that start with the query first, then names or descriptions that contain it.
+    const match = (list, name) => {
+      const starts = list.filter((s) => name(s).toLowerCase().startsWith(ql));
+      const rest = ql ? list.filter((s) => !starts.includes(s) && (name(s).toLowerCase().includes(ql) || (s.description || '').toLowerCase().includes(ql))) : [];
+      return [...starts, ...rest];
+    };
+    const ACTIONS = [
+      { kind: 'action', action: 'newSkill', name: 'New skill…', description: 'Create .claude/skills/<name>/SKILL.md in this project.', ic: 'add' },
+      { kind: 'action', action: 'newAgent', name: 'New agent…', description: 'Create .claude/agents/<name>.md in this project.', ic: 'person-add' },
+      { kind: 'action', action: 'installPlugin', name: 'Install plugin…', description: 'Install a Claude Code plugin by its id (name@marketplace).', ic: 'extensions' },
+    ];
+    const groups = [
+      ['Skills', match((skills || []).map((s) => ({ ...s, kind: 'skill' })), (s) => s.name)],
+      ['Agents', match(agents.map((a) => ({ ...a, kind: 'agent' })), (a) => a.name)],
+      ['Plugins', match(plugins.map((p) => ({ ...p, kind: 'plugin', name: p.id, description: `${p.version ? `v${p.version} · ` : ''}${p.enabled ? 'enabled' : 'disabled'}` })), (p) => p.id)],
+      ['Add', match(ACTIONS, (a) => a.name)],
+    ].map(([title, list]) => [title, list.slice(0, MAX_SLASH)]).filter(([, list]) => list.length);
+    slashItems = groups.flatMap(([, list]) => list);
     slashActive = Math.min(slashActive, Math.max(0, slashItems.length - 1));
     slash.replaceChildren();
-    if (!skills) slash.append(el('div', 'slash-empty', 'Loading skills…'));
-    else if (!slashItems.length) slash.append(el('div', 'slash-empty', all.length ? `No skill matches "/${q}".` : 'No skills found. Add them under .github/skills, .claude/skills, or ~/.claude/skills.'));
-    slashItems.forEach((s, i) => {
-      const o = el('div', 'slash-item');
-      o.id = `slash-${i}`;
-      o.setAttribute('role', 'option');
-      const head = el('div', 'slash-head');
-      head.append(el('span', 'slash-name', `/${s.name}`));
-      if (s.params?.length) head.append(el('span', 'slash-params', s.params.map((p) => `${p}=`).join(' ')));
-      if (s.source) head.append(el('span', 'slash-src', s.source));
-      o.append(head);
-      if (s.description) o.append(el('div', 'slash-desc', s.description));
-      o.addEventListener('mousedown', (e) => { e.preventDefault(); acceptSlash(i); });
-      o.addEventListener('mousemove', () => { if (slashActive !== i) { slashActive = i; markActive(); } });
-      slash.append(o);
-    });
+    if (!skills) slash.append(el('div', 'slash-empty', 'Loading skills, agents, and plugins…'));
+    else if (!slashItems.length) slash.append(el('div', 'slash-empty', `Nothing matches "/${q}".`));
+    const ICONS = { skill: 'symbol-event', agent: 'hubot', plugin: 'extensions' };
+    let i = 0;
+    for (const [title, list] of groups) {
+      slash.append(el('div', 'slash-group', title));
+      for (const s of list) {
+        const at = i++;
+        const o = el('div', `slash-item ${s.kind}`);
+        o.id = `slash-${at}`;
+        o.setAttribute('role', 'option');
+        const head = el('div', 'slash-head');
+        head.append(icon(s.ic || ICONS[s.kind], 'slash-icon'), el('span', 'slash-name', s.kind === 'skill' ? `/${s.name}` : s.name));
+        if (s.params?.length) head.append(el('span', 'slash-params', s.params.map((p) => `${p}=`).join(' ')));
+        if (s.source) head.append(el('span', 'slash-src', s.source));
+        const tools = el('span', 'slash-tools');
+        const tool = (ic, title, fn) => {
+          const b = button('slash-tool', icon(ic), fn, title);
+          b.tabIndex = -1;
+          b.addEventListener('mousedown', (e) => { e.preventDefault(); e.stopPropagation(); });
+          tools.append(b);
+        };
+        if (s.view != null) tool('go-to-file', 'View', () => vscode.postMessage({ type: 'slashAction', action: 'view', key: s.view }));
+        if (s.kind === 'plugin') {
+          tool('book', 'View', () => vscode.postMessage({ type: 'slashAction', action: 'viewPlugin', key: s.id }));
+          tool(s.enabled ? 'circle-slash' : 'check', s.enabled ? 'Disable' : 'Enable', () => vscode.postMessage({ type: 'slashAction', action: 'togglePlugin', key: s.id, enable: !s.enabled }));
+        }
+        if (tools.childElementCount) head.append(tools);
+        o.append(head);
+        if (s.description) o.append(el('div', 'slash-desc', s.description));
+        o.addEventListener('mousedown', (e) => { e.preventDefault(); acceptSlash(at); });
+        o.addEventListener('mousemove', () => { if (slashActive !== at) { slashActive = at; markActive(); } });
+        slash.append(o);
+      }
+    }
     if (!slashOpen || !skills) vscode.postMessage({ type: 'listSkills' });
     slashOpen = true;
     slash.hidden = false;
@@ -1843,7 +1962,7 @@
         scroll(true);
         break;
       case 'status':
-        state = { ...state, busy: m.busy, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker, refineModel: 'refineModel' in m ? m.refineModel : state.refineModel, helperModel: 'helperModel' in m ? m.helperModel : state.helperModel };
+        state = { ...state, busy: m.busy, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker, refineModel: 'refineModel' in m ? m.refineModel : state.refineModel, helperModel: 'helperModel' in m ? m.helperModel : state.helperModel, effort: 'effort' in m ? m.effort : state.effort };
         renderToolbar();
         fillSettings();
         break;
@@ -1889,6 +2008,8 @@
       }
       case 'skills':
         skills = m.skills;
+        agents = m.agents || [];
+        plugins = m.plugins || [];
         if (slashOpen) renderSlash();
         break;
       case 'files':

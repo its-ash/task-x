@@ -71,12 +71,31 @@ pub fn chat_request(cfg: &ResolvedConfig, req: &ChatRequest) -> HttpRequest {
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
+    if let Some(e) = req.effort.and_then(|e| effort(&cfg.model, e)) {
+        body["output_config"] = json!({ "effort": e });
+    }
     if !req.tools.is_empty() {
         body["tools"] =
             req.tools.iter().map(|t| json!({ "name": t.name, "description": t.description, "input_schema": t.input_schema })).collect();
     }
     add_cache_breakpoints(&mut body);
     HttpRequest::post(cfg.endpoint("/v1/messages"), headers(cfg), body)
+}
+
+/// `output_config.effort` for the models that take it, else `None` (older models reject it). Opus 4.5
+/// takes `low` to `high` and the 4.6 models have no `xhigh`, so a level they lack is lowered.
+fn effort(model: &str, e: Effort) -> Option<&'static str> {
+    let m = model.trim_start_matches("anthropic.");
+    let all = ["claude-fable", "claude-mythos", "claude-opus-5", "claude-sonnet-5", "claude-haiku-5", "claude-opus-4-7", "claude-opus-4-8"];
+    if all.iter().any(|p| m.starts_with(p)) {
+        Some(e.as_str())
+    } else if m.starts_with("claude-opus-4-6") || m.starts_with("claude-sonnet-4-6") {
+        Some(if e == Effort::Xhigh { "high" } else { e.as_str() })
+    } else if m.starts_with("claude-opus-4-5") {
+        Some(e.three_level())
+    } else {
+        None
+    }
 }
 
 /// Context window in tokens: 1M for Claude 4.6 and later (Haiku 4.5: 200K), 200K for older models.
@@ -297,6 +316,7 @@ mod tests {
             max_tokens: Some(100),
             temperature: None,
             context_window: None,
+            effort: Some(Effort::Xhigh),
         };
         let r = chat_request(&cfg(), &req);
         assert_eq!(r.url, "https://api.anthropic.com/v1/messages");
@@ -313,6 +333,13 @@ mod tests {
         assert_eq!(b["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(b["messages"][2]["content"][0]["tool_use_id"], "t1");
         assert!(b.get("temperature").is_none());
+        assert!(b.get("output_config").is_none(), "an unknown model gets no effort");
+        assert_eq!(effort("claude-opus-5-5", Effort::Xhigh), Some("xhigh"));
+        assert_eq!(effort("anthropic.claude-sonnet-4-6", Effort::Xhigh), Some("high"), "4.6 has no xhigh");
+        assert_eq!(effort("claude-opus-4-5", Effort::Max), Some("high"));
+        assert_eq!(effort("claude-haiku-4-5", Effort::Low), None, "Haiku 4.5 rejects effort");
+        let opus = ResolvedConfig { model: "claude-fable-5-1".into(), ..cfg() };
+        assert_eq!(chat_request(&opus, &req).body.unwrap()["output_config"], json!({ "effort": "xhigh" }));
     }
 
     fn feed(d: &mut Decoder, raw: &str) -> Vec<StreamEvent> {

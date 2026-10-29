@@ -910,6 +910,7 @@ impl Server {
             max_tokens: Some(4096),
             temperature: Some(0.2),
             context_window: None,
+            effort: None,
         };
         let out = self.providers.stream_chat(&provider, &req, cancel, |_| {}).await.map_err(provider_error)?;
         let refined = clean_refined(&out.text);
