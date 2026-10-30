@@ -74,6 +74,15 @@ pub fn chat_request(cfg: &ResolvedConfig, req: &ChatRequest) -> HttpRequest {
 /// Window the agent asks Ollama for (`num_ctx`). Larger windows need more memory on the user's machine.
 pub const DEFAULT_CONTEXT_WINDOW: usize = 32_768;
 
+/// `POST /api/embed` for a batch of texts (an embedding model such as nomic-embed-text).
+pub fn embed_request(cfg: &ResolvedConfig, texts: &[String]) -> HttpRequest {
+    HttpRequest::post(cfg.endpoint("/api/embed"), headers(cfg), json!({ "model": cfg.model, "input": texts }))
+}
+
+pub fn parse_embeddings(v: &Value) -> Vec<Vec<f32>> {
+    v["embeddings"].as_array().into_iter().flatten().map(|e| e.as_array().into_iter().flatten().filter_map(|x| x.as_f64().map(|f| f as f32)).collect()).collect()
+}
+
 pub fn models_request(cfg: &ResolvedConfig) -> HttpRequest {
     HttpRequest::get(cfg.endpoint("/api/tags"), headers(cfg))
 }
@@ -120,7 +129,14 @@ pub fn refine_capabilities(mut caps: Capabilities, show: &Value) -> Capabilities
 pub struct Decoder {
     calls: usize,
     done: bool,
+    /// Whether any reply text came, and the `thinking` text of models that put their whole answer
+    /// there: it becomes the reply when nothing else came.
+    text_seen: bool,
+    thinking: String,
 }
+
+/// Thinking kept for the fallback reply; more is cut.
+const MAX_THINKING: usize = 60_000;
 
 impl StreamDecoder for Decoder {
     fn feed_line(&mut self, line: &str) -> Result<Vec<StreamEvent>, ProviderError> {
@@ -134,7 +150,11 @@ impl StreamDecoder for Decoder {
         let mut out = Vec::new();
         let msg = &v["message"];
         if let Some(t) = msg["content"].as_str().filter(|t| !t.is_empty()) {
+            self.text_seen = true;
             out.push(StreamEvent::TextDelta { text: t.to_owned() });
+        }
+        if let Some(t) = msg["thinking"].as_str().filter(|_| self.thinking.len() < MAX_THINKING) {
+            self.thinking.push_str(t);
         }
         for tc in msg["tool_calls"].as_array().into_iter().flatten() {
             let f = &tc["function"];
@@ -149,6 +169,10 @@ impl StreamDecoder for Decoder {
         }
         if v["done"].as_bool() == Some(true) {
             self.done = true;
+            // No reply text and no call: the answer was in the thinking, so that is the reply.
+            if !self.text_seen && self.calls == 0 && !self.thinking.trim().is_empty() {
+                out.push(StreamEvent::TextDelta { text: std::mem::take(&mut self.thinking).trim().to_owned() });
+            }
             out.push(StreamEvent::Usage {
                 usage: Usage {
                     input_tokens: v["prompt_eval_count"].as_u64(),
@@ -244,6 +268,23 @@ mod tests {
         assert_eq!(out.tool_calls[0].input, json!({"dir": "."}));
         assert_eq!(out.stop_reason, StopReason::ToolUse);
         assert_eq!(out.usage, Usage { input_tokens: Some(3), output_tokens: Some(4), cached_tokens: None });
+    }
+
+    /// A model that answers only in `thinking` still gets a reply; with any content, thinking stays out.
+    #[test]
+    fn an_answer_only_in_thinking_becomes_the_reply() {
+        let run = |lines: &[&str]| {
+            let mut d = Decoder::default();
+            let mut out = ChatOutcome::default();
+            for l in lines {
+                d.feed_line(l).unwrap().iter().for_each(|e| out.apply(e));
+            }
+            out.text
+        };
+        let only = [r#"{"message":{"content":"","thinking":"Missing: color, "},"done":false}"#, r#"{"message":{"content":"","thinking":"config."},"done":true}"#];
+        assert_eq!(run(&only), "Missing: color, config.");
+        let both = [r#"{"message":{"content":"Answer","thinking":"why"},"done":false}"#, r#"{"message":{"content":""},"done":true}"#];
+        assert_eq!(run(&both), "Answer");
     }
 
     #[test]

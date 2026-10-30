@@ -198,6 +198,30 @@ impl Providers {
         Ok(out)
     }
 
+    /// Embedding vectors for `texts`, one per text in the same order (OpenAI-compatible and Ollama).
+    pub async fn embed(&self, cfg: &ProviderConfig, texts: &[String], cancel: &CancellationToken) -> Result<Vec<Vec<f32>>, ProviderError> {
+        let cfg = cfg.resolve()?;
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        type Parse = fn(&Value) -> Vec<Vec<f32>>;
+        let (req, parse): (_, Parse) = match cfg.kind {
+            ProviderKind::Anthropic => {
+                return Err(ProviderError::new(
+                    ErrorKind::InvalidConfig,
+                    "Anthropic has no embeddings API: pick an Ollama embedding model (for example nomic-embed-text) or an OpenAI one (text-embedding-3-small)",
+                ));
+            }
+            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => (openai::embed_request(&cfg, texts), openai::parse_embeddings),
+            ProviderKind::Ollama => (ollama::embed_request(&cfg, texts), ollama::parse_embeddings),
+        };
+        let vecs = parse(&self.get_json(req, cfg.timeout, cancel).await?);
+        if vecs.len() != texts.len() || vecs.iter().any(Vec::is_empty) {
+            return Err(ProviderError::protocol(format!("the embedding model returned {} vectors for {} texts", vecs.len(), texts.len())));
+        }
+        Ok(vecs)
+    }
+
     pub async fn list_models(&self, cfg: &ProviderConfig, cancel: &CancellationToken) -> Result<Vec<String>, ProviderError> {
         let cfg = cfg.resolve()?;
         let (req, parse): (_, fn(&Value) -> Vec<String>) = match cfg.kind {

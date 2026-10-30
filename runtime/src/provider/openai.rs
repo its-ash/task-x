@@ -106,6 +106,18 @@ pub fn context_window(model: &str) -> usize {
     }
 }
 
+/// `POST /embeddings` for a batch of texts.
+pub fn embed_request(cfg: &ResolvedConfig, texts: &[String]) -> HttpRequest {
+    HttpRequest::post(cfg.endpoint("/embeddings"), headers(cfg), json!({ "model": cfg.model, "input": texts }))
+}
+
+/// The vectors of an embeddings response, in input order.
+pub fn parse_embeddings(v: &Value) -> Vec<Vec<f32>> {
+    let mut data: Vec<&Value> = v["data"].as_array().into_iter().flatten().collect();
+    data.sort_by_key(|d| d["index"].as_u64().unwrap_or(0));
+    data.iter().map(|d| d["embedding"].as_array().into_iter().flatten().filter_map(|x| x.as_f64().map(|f| f as f32)).collect()).collect()
+}
+
 pub fn models_request(cfg: &ResolvedConfig) -> HttpRequest {
     HttpRequest::get(cfg.endpoint("/models"), headers(cfg))
 }
@@ -253,7 +265,14 @@ pub struct Decoder {
     next_slot: u64,
     stop: Option<StopReason>,
     done: bool,
+    /// Whether any reply text came, and the reasoning text (`reasoning_content`, `reasoning`) of
+    /// models that put their whole answer there: it becomes the reply when nothing else came.
+    text_seen: bool,
+    reasoning: String,
 }
+
+/// Reasoning kept for the fallback reply; more is cut.
+const MAX_REASONING: usize = 60_000;
 
 impl Decoder {
     fn handle(&mut self, data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
@@ -277,9 +296,14 @@ impl Decoder {
             });
         }
         for choice in v["choices"].as_array().into_iter().flatten().filter(|c| c["index"].as_u64().unwrap_or(0) == 0) {
-            let d = &choice["delta"];
+            // Some compatible servers send the last chunk as a whole `message` instead of a `delta`.
+            let d = if choice["delta"].is_object() { &choice["delta"] } else { &choice["message"] };
             if let Some(t) = d["content"].as_str().filter(|t| !t.is_empty()) {
+                self.text_seen = true;
                 out.push(StreamEvent::TextDelta { text: t.to_owned() });
+            }
+            if let Some(r) = d["reasoning_content"].as_str().or(d["reasoning"].as_str()).filter(|_| self.reasoning.len() < MAX_REASONING) {
+                self.reasoning.push_str(r);
             }
             for tc in d["tool_calls"].as_array().into_iter().flatten() {
                 let index = tc["index"].as_u64().unwrap_or(0);
@@ -337,6 +361,10 @@ impl Decoder {
             out.push(StreamEvent::ToolCall { id, name: pc.name, input });
         }
         let stop = self.stop.unwrap_or(if out.is_empty() { StopReason::EndTurn } else { StopReason::ToolUse });
+        // No reply text and no call: the answer was in the reasoning, so that is the reply.
+        if out.is_empty() && !self.text_seen && !self.reasoning.trim().is_empty() {
+            out.push(StreamEvent::TextDelta { text: std::mem::take(&mut self.reasoning).trim().to_owned() });
+        }
         out.push(StreamEvent::Done { stop_reason: stop });
         Ok(out)
     }
@@ -484,6 +512,34 @@ mod tests {
         assert_eq!(out.tool_calls[0].input, json!({"pattern": "x"}));
         assert_eq!(out.stop_reason, StopReason::ToolUse);
         assert_eq!(out.usage.output_tokens, Some(7));
+    }
+
+    /// Reasoning-only answers (DeepSeek `reasoning_content`, OpenRouter `reasoning`) and a final
+    /// `message` chunk instead of a `delta` both reach the reply.
+    #[test]
+    fn reasoning_only_and_message_chunks_reach_the_reply() {
+        let run = |lines: &[&str]| {
+            let mut d = Decoder::default();
+            let mut out = ChatOutcome::default();
+            for l in lines {
+                d.feed_line(l).unwrap().iter().for_each(|e| out.apply(e));
+            }
+            d.finish().unwrap().iter().for_each(|e| out.apply(e));
+            out.text
+        };
+        let reasoning = [
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"Missing: "}}]}"#,
+            "",
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning":"colors."},"finish_reason":"stop"}]}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ];
+        assert_eq!(run(&reasoning), "Missing: colors.");
+        let message = [r#"data: {"choices":[{"index":0,"message":{"content":"Whole answer"},"finish_reason":"stop"}]}"#, "", "data: [DONE]", ""];
+        assert_eq!(run(&message), "Whole answer");
+        let both = [r#"data: {"choices":[{"index":0,"delta":{"content":"Real","reasoning_content":"why"},"finish_reason":"stop"}]}"#, "", "data: [DONE]", ""];
+        assert_eq!(run(&both), "Real", "reasoning stays out when there is reply text");
     }
 
     #[test]

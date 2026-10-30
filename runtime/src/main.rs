@@ -1,6 +1,7 @@
 mod agent;
 mod claude_cli;
 mod context;
+mod docs;
 mod errors;
 mod mcp;
 mod mcp_server;

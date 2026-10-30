@@ -89,6 +89,11 @@ impl Store {
         Self { dir: data_dir.map(|d| d.join("tasks")) }
     }
 
+    /// The runtime's data folder (the parent of `tasks`), for the semantic and docs indexes.
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        self.dir.as_ref().and_then(|d| d.parent()).map(Path::to_path_buf)
+    }
+
     fn path(&self, id: &str) -> Option<PathBuf> {
         valid_id(id).then(|| self.dir.as_ref().map(|d| d.join(format!("{id}.json")))).flatten()
     }

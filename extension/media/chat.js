@@ -635,10 +635,21 @@
     card.append(head, body);
     return { card, body };
   }
+  // A list item: bullets (- * +), numbers (1. 1)), letters (a. a) (a) A.), with its indent and text.
+  const LIST_ITEM = /^(\s*)([-*+]|\d{1,3}[.)]|\(\d{1,3}\)|[a-zA-Z][.)]|\([a-zA-Z]\))\s+(.*)$/;
+  // What kind of list a marker starts: tag, type, and the first number (letters count a=1).
+  function listKind(marker) {
+    const m = marker.replace(/[().]/g, '');
+    if (/^[-*+]$/.test(m)) return { tag: 'ul', type: '', start: 1 };
+    if (/^\d+$/.test(m)) return { tag: 'ol', type: '1', start: Number(m) };
+    return { tag: 'ol', type: m === m.toUpperCase() ? 'A' : 'a', start: m.toLowerCase().charCodeAt(0) - 96 };
+  }
   function renderMarkdown(container, text) {
     container.replaceChildren();
     const lines = text.split('\n');
-    let list = null, para = [];
+    // Open lists, outermost first: { indent, tag, type, el, li }. A deeper item nests in the last item.
+    const stack = [];
+    let para = [];
     // Where blocks go: the message, or the card of the section being read.
     let out = container, ask = false;
     const flush = () => { if (para.length) { const p = el('p'); renderInline(p, para.join('\n'), { ask }); out.append(p); para = []; } };
@@ -646,7 +657,7 @@
       const line = lines[i];
       const quote = line.match(/^\s*>\s?(.*)$/);
       if (quote) {
-        flush(); list = null;
+        flush(); stack.length = 0;
         const body = [quote[1]];
         for (; i + 1 < lines.length && /^\s*>/.test(lines[i + 1]); i++) body.push(lines[i + 1].replace(/^\s*>\s?/, ''));
         const alert = body[0].match(/^\[!(\w+)\][ \t]*(.*)$/);
@@ -665,7 +676,7 @@
       }
       const fence = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
       if (fence) {
-        flush(); list = null;
+        flush(); stack.length = 0;
         const body = [];
         for (i++; i < lines.length && !lines[i].trim().startsWith(fence[1]); i++) body.push(lines[i]);
         const code = body.join('\n');
@@ -684,7 +695,7 @@
       }
       // A table: a row of cells, then a line of dashes (`|---|:--:|`) that also sets each column's alignment.
       if (line.includes('|') && i + 1 < lines.length && isTableRule(lines[i + 1])) {
-        flush(); list = null;
+        flush(); stack.length = 0;
         const align = cells(lines[i + 1]).map((c) => (/^:-+:$/.test(c) ? 'center' : /-:$/.test(c) ? 'right' : /^:/.test(c) ? 'left' : ''));
         const wrap = el('div', 'md-table-wrap');
         const table = el('table', 'md-table');
@@ -711,9 +722,9 @@
       // A heading, or a line that is only bold text, starts a section; a section that asks the
       // user something or flags a risk becomes a card until the next heading.
       const h = line.match(/^(#{1,4})\s+(.*)$/) || line.match(/^\s*()\*\*([^*\n]{2,80})\*\*:?\s*$/);
-      const li = line.match(/^\s*(?:[-*]|\d+\.)\s+(.*)$/);
+      const li = line.match(LIST_ITEM);
       if (h) {
-        flush(); list = null; out = container; ask = false;
+        flush(); stack.length = 0; out = container; ask = false;
         const title = h[2].trim().replace(/:$/, '');
         const kind = ASK_HEADING.test(title) ? 'question' : WARN_HEADING.test(title) ? 'warning' : null;
         if (kind) {
@@ -728,13 +739,41 @@
         }
       } else if (li) {
         flush();
-        if (!list) { list = el(/^\s*\d+\./.test(line) ? 'ol' : 'ul'); out.append(list); }
+        const kind = listKind(li[2]);
+        let indent = li[1].replace(/\t/g, '    ').length;
+        // Letter options written at the depth of a numbered item ("1. Pages" then "a) Home") are its sub-items.
+        if ((kind.type === 'a' || kind.type === 'A') && stack.some((s) => s.indent === indent && s.type === '1')) indent += 2;
+        // Close lists deeper than this item; a different kind at the same depth starts a new list.
+        while (stack.length && stack[stack.length - 1].indent > indent) stack.pop();
+        let top = stack[stack.length - 1];
+        if (top && top.indent === indent && (top.tag !== kind.tag || top.type !== kind.type)) {
+          stack.pop();
+          top = stack[stack.length - 1];
+        }
+        if (!top || top.indent < indent) {
+          const l = el(kind.tag);
+          if (kind.type && kind.type !== '1') l.type = kind.type;
+          if (kind.tag === 'ol' && kind.start > 1) l.start = kind.start;
+          (top?.li ?? out).append(l);
+          top = { indent, tag: kind.tag, type: kind.type, el: l, li: null };
+          stack.push(top);
+        }
         const e = el('li');
-        renderInline(e, li[1], { ask });
-        if (/\((?:recommended|suggested)\)/i.test(li[1])) e.classList.add('md-recommended');
-        list.append(e);
-      } else if (!line.trim()) { flush(); list = null; }
-      else { list = null; para.push(line); }
+        renderInline(e, li[3], { ask });
+        if (/\((?:recommended|suggested)\)/i.test(li[3])) e.classList.add('md-recommended');
+        top.el.append(e);
+        top.li = e;
+      } else if (!line.trim()) {
+        flush();
+        // A blank line between items keeps the list; anything else after it ends the list.
+        const next = lines.slice(i + 1).find((l) => l.trim());
+        if (!next || !(LIST_ITEM.test(next) || (stack.length && /^\s+\S/.test(next)))) stack.length = 0;
+      } else if (stack.length && /^\s+\S/.test(line)) {
+        // An indented line under an item continues that item.
+        const last = stack[stack.length - 1].li;
+        last.append(el('br'));
+        renderInline(last, line.trim(), { ask });
+      } else { stack.length = 0; para.push(line); }
     }
     flush();
   }
@@ -792,10 +831,20 @@
     if (n) chip.append(button('link', 'Show', () => vscode.postMessage({ type: 'showProblems' })));
     return chip;
   }
+  // Replies with text not drawn yet. Each is drawn on the next frame even when another row (a tool
+  // call) arrived in between and the reply is no longer `current`; else its last text showed only
+  // after a reload.
+  const dirty = new Set();
   function scheduleRender() {
+    if (current) dirty.add(current);
     if (renderQueued) return;
     renderQueued = true;
-    requestAnimationFrame(() => { renderQueued = false; if (current) { renderMarkdown(current.body, current.text); scroll(); } });
+    requestAnimationFrame(() => {
+      renderQueued = false;
+      for (const r of dirty) if (r.body.isConnected) renderMarkdown(r.body, r.text);
+      dirty.clear();
+      scroll();
+    });
   }
 
   // ---------- Transcript ----------
@@ -1949,7 +1998,7 @@
   input.setAttribute('aria-controls', 'slash');
   const slashQuery = () => /^\/([\w.:-]*)$/.exec(input.value.slice(0, input.selectionStart))?.[1];
   // "@" at a word start opens the file menu; the query is what follows it, up to the caret.
-  const atMatch = () => /(^|\s)@([\w./-]*)$/.exec(input.value.slice(0, input.selectionStart));
+  const atMatch = () => /(^|\s)@([\w./:-]*)$/.exec(input.value.slice(0, input.selectionStart));
   // "#" at a word start opens the context menu (#9): problems, git changes, selection, terminal, codebase.
   const hashMatch = () => /(^|\s)#([\w:.-]*)$/.exec(input.value.slice(0, input.selectionStart));
   const HASH_ITEMS = [
@@ -2035,7 +2084,9 @@
       const name = dir ? s.path.slice(0, -1).split('/').pop() + '/' : s.path.split('/').pop();
       const parent = s.path.slice(0, s.path.length - name.length).replace(/\/$/, '');
       const head = el('div', 'slash-head');
-      head.append(icon(s.self ? 'folder-opened' : dir ? 'folder' : 'file'), el('span', 'slash-name', name));
+      const isDocs = s.path.startsWith('docs:');
+      head.append(icon(isDocs ? 'book' : s.self ? 'folder-opened' : dir ? 'folder' : 'file'), el('span', 'slash-name', isDocs ? s.path : name));
+      if (isDocs) head.append(el('span', 'slash-params', 'Indexed docs'));
       if (s.self) head.append(el('span', 'slash-params', 'Add this folder'));
       else if (parent) head.append(el('span', 'slash-params', parent));
       o.append(head);
@@ -2231,7 +2282,8 @@
         break;
       case 'changes': renderChanges(m.files); break;
       case 'item': renderItem(m.item); scroll(); break;
-      case 'delta': if (current) { current.text += m.text; scheduleRender(); } break;
+      // A delta with no reply on screen (a row came in between) starts one, so no text is lost.
+      case 'delta': if (!current) renderItem({ kind: 'assistant', text: '' }); current.text += m.text; scheduleRender(); scroll(); break;
       case 'toolDone': {
         const row = log.querySelector(`.row.tool[data-id="${CSS.escape(m.id)}"]`);
         if (row) {
@@ -2303,6 +2355,8 @@
       case 'editor': renderContext(m); break;
       case 'index': state.index = m.index; renderIndex(); break;
       case 'contextUsage': renderMeter(m.used, m.window); break;
+      // A new chat: no images or text left from the last one.
+      case 'clearDraft': attachments = []; renderAttachments(); input.value = ''; autosize(); break;
       case 'usage': {
         // The running total for the task, from the runtime: input and output tokens, never a price.
         const cached = m.cached ? ` (${fmtCount(m.cached)} cached)` : '';

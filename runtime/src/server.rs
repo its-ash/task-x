@@ -103,6 +103,24 @@ struct SteerParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DocsAddParams {
+    name: String,
+    url: String,
+    #[serde(default)]
+    max_pages: Option<usize>,
+    /// An embedding model; without one the docs are searched by keywords.
+    #[serde(default)]
+    embeddings: Option<ProviderConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DocsNameParams {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct McpPromptParams {
     server: String,
     name: String,
@@ -453,6 +471,9 @@ impl Server {
             | "graph/project"
             | "graph/file"
             | "mcp/catalog"
+            | "docs/add"
+            | "docs/list"
+            | "docs/remove"
             | "mcp/getPrompt"
             | "mcp/readResource"
             | "mcp/status" => self.spawn(id, key, method, msg.params),
@@ -565,6 +586,12 @@ impl Server {
                 "claude/run" => this.run_claude(p, &token).await,
                 "mcp/status" => Ok(this.mcp.read().await.status()),
                 "mcp/catalog" => Ok(this.mcp.read().await.catalog()),
+                "docs/add" => this.docs_add(p, &token).await,
+                "docs/list" => Ok(this.data_dir.read().expect("data dir lock").as_deref().map_or_else(|| json!([]), crate::docs::list)),
+                "docs/remove" => params::<DocsNameParams>(p).and_then(|p| {
+                    let d = this.data_dir.read().expect("data dir lock").clone().ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "no data folder"))?;
+                    Ok(json!({ "removed": crate::docs::remove(&d, &p.name) }))
+                }),
                 "mcp/getPrompt" => this.mcp_prompt(p, &token).await,
                 "mcp/readResource" => this.mcp_resource(p, &token).await,
                 "context/retrieve" => this.retrieve(p).await,
@@ -885,6 +912,20 @@ impl Server {
         let mut m = self.mcp.write().await;
         m.configure(servers, root).await;
         Ok(m.status())
+    }
+
+    /// `docs/add`: crawls and indexes a docs site, with `docs/progress` notifications as pages come in.
+    async fn docs_add(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
+        let p: DocsAddParams = params(p)?;
+        let data = self.data_dir.read().expect("data dir lock").clone().ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "no data folder: the client sends dataDir in initialize"))?;
+        let out = self.out.clone();
+        let name = p.name.clone();
+        let embed = p.embeddings.filter(|e| e.resolve().is_ok());
+        crate::docs::add(&self.providers, embed.as_ref(), &data, &p.name, &p.url, p.max_pages.unwrap_or(crate::docs::DEFAULT_PAGES), cancel, |done, total| {
+            let _ = out.send(rpc::notification("docs/progress", json!({ "name": name, "pages": done, "total": total })));
+        })
+        .await
+        .map_err(|e| RpcError::new(rpc::TOOL_ERROR, e))
     }
 
     /// `mcp/getPrompt`: a server's prompt template, filled in, as text for the chat input.

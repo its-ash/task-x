@@ -5,6 +5,7 @@ pub mod index;
 pub mod instructions;
 pub mod project;
 pub mod retrieve;
+pub mod semantic;
 pub mod symbols;
 
 use index::{Index, IndexStats};

@@ -426,7 +426,11 @@ fn clip(s: &str, n: usize) -> String {
 #[derive(Default)]
 pub struct Mapper {
     tool_names: HashMap<String, String>,
-    streamed_text: bool,
+    /// Reply text that already streamed in this message; the full message adds only what is missing.
+    streamed: String,
+    /// Whether any reply text reached the chat since the last `result`; without it the result's
+    /// own text is shown, so a run never ends with nothing to read.
+    text_since_result: bool,
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub tool_calls: u32,
@@ -461,11 +465,11 @@ impl Mapper {
             Some("stream_event") => {
                 let e = &v["event"];
                 if e["type"] == "message_start" {
-                    self.streamed_text = false;
+                    self.streamed.clear();
                 }
                 if e["type"] == "content_block_delta" && e["delta"]["type"] == "text_delta" {
                     if let Some(t) = e["delta"]["text"].as_str() {
-                        self.streamed_text = true;
+                        self.streamed.push_str(t);
                         out.push(json!({ "type": "textDelta", "text": t }));
                     }
                 }
@@ -473,9 +477,25 @@ impl Mapper {
             Some("assistant") => {
                 for block in v["message"]["content"].as_array().into_iter().flatten() {
                     match block["type"].as_str() {
-                        Some("text") if !self.streamed_text => {
-                            if let Some(t) = block["text"].as_str() {
-                                out.push(json!({ "type": "textDelta", "text": t }));
+                        Some("text") => {
+                            let Some(t) = block["text"].as_str() else { continue };
+                            // Streamed text is not sent twice; what the stream missed is sent now.
+                            let rest = match t.strip_prefix(self.streamed.as_str()) {
+                                Some(rest) => {
+                                    self.streamed.clear();
+                                    rest
+                                }
+                                None if self.streamed.starts_with(t) => {
+                                    self.streamed.drain(..t.len());
+                                    ""
+                                }
+                                None => {
+                                    self.streamed.clear();
+                                    t
+                                }
+                            };
+                            if !rest.is_empty() {
+                                out.push(json!({ "type": "textDelta", "text": rest }));
                             }
                         }
                         Some("tool_use") => {
@@ -490,7 +510,6 @@ impl Mapper {
                         _ => {}
                     }
                 }
-                self.streamed_text = false;
             }
             Some("user") => {
                 for block in v["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
@@ -511,9 +530,19 @@ impl Mapper {
                 self.input_tokens = add(self.input_tokens, input);
                 self.output_tokens = add(self.output_tokens, usage["output_tokens"].as_u64());
                 self.results += 1;
+                if !self.text_since_result {
+                    if let Some(t) = v["result"].as_str().filter(|t| !t.trim().is_empty()) {
+                        out.push(json!({ "type": "textDelta", "text": t }));
+                    }
+                }
+                self.text_since_result = false;
                 self.result = Some(v);
+                return out;
             }
             _ => {}
+        }
+        if out.iter().any(|e| e["type"] == "textDelta") {
+            self.text_since_result = true;
         }
         out
     }
@@ -1082,14 +1111,17 @@ mod tests {
         ];
         let evs: Vec<Value> = lines.iter().flat_map(|l| m.map(l, "agent")).collect();
         let types: Vec<&str> = evs.iter().map(|e| e["type"].as_str().unwrap()).collect();
-        assert_eq!(types, ["started", "model", "textDelta", "toolStarted", "toolFinished", "textDelta"]);
-        assert_eq!(evs[2]["text"], "Look", "streamed text is not repeated from the full message");
-        assert_eq!(evs[4]["tool"], "Bash");
-        assert_eq!(evs[4]["output"], "a.txt");
-        assert_eq!(evs[5]["text"], "Done.", "unstreamed text comes from the full message");
+        assert_eq!(types, ["started", "model", "textDelta", "textDelta", "toolStarted", "toolFinished", "textDelta"]);
+        assert_eq!(evs[2]["text"], "Look");
+        assert_eq!(evs[3]["text"], "ing", "the full message adds only what the stream missed");
+        assert_eq!(evs[5]["tool"], "Bash");
+        assert_eq!(evs[5]["output"], "a.txt");
+        assert_eq!(evs[6]["text"], "Done.", "unstreamed text comes from the full message");
         assert_eq!(m.session_id.as_deref(), Some("s1"));
         assert_eq!(m.result.as_ref().unwrap()["num_turns"], 2);
-        m.map(r#"{"type":"result","subtype":"success","result":"Also done.","usage":{"input_tokens":30,"output_tokens":7}}"#, "agent");
+        // A result whose text never reached the chat (no text since the last result) shows that text.
+        let late = m.map(r#"{"type":"result","subtype":"success","result":"Also done.","usage":{"input_tokens":30,"output_tokens":7}}"#, "agent");
+        assert_eq!(late[0]["text"], "Also done.");
         assert_eq!((m.results, m.input_tokens, m.output_tokens), (2, Some(150), Some(12)), "a steered message adds a result");
     }
 

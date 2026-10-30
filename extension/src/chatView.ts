@@ -38,12 +38,14 @@ import { claudeDisabledMcp, claudeMcpServers, disabledMcp, mcpOrigins, setMcpDis
 import { setResourceReader, withHashContext } from './hashContext.js';
 import { activeChatMode, chatModes, setChatMode, withChatMode } from './chatModes.js';
 import { elicit } from './mcpElicit.js';
+import { type DocsSource, listDocs, withDocs } from './docs.js';
 
 const TRANSCRIPT_KEY = 'task-x.transcript';
 const INCLUDE_EDITOR_KEY = 'task-x.includeEditor';
 const AUTO_COMMIT_KEY = 'task-x.autoCommit';
 /** `@path` references in a prompt: a path of letters, digits, and . _ - / after an @ at a word start. */
-const MENTION = /(?:^|\s)@((?:[\w.-]+\/)*[\w.-]+\/?)/g;
+// `@docs:<name>` is a docs set, not a file.
+const MENTION = /(?:^|\s)@(?!docs:)((?:[\w.-]+\/)*[\w.-]+\/?)/g;
 const MAX_MENTIONS = 10;
 const MAX_FILE_ITEMS = 50;
 const FILE_LIST_TTL_MS = 10_000;
@@ -601,10 +603,77 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.postTabs();
   }
 
+  /** The chat on screen as Markdown: requests, replies, tool calls, changed files, and the summary. */
+  chatMarkdown(): string {
+    const tab = this.tabs.find((t) => t.id === this.activeTab && t.kind === 'chat') ?? this.chat;
+    const fence = (s: string) => (s.includes('```') ? '~~~~' : '```');
+    const out: string[] = [`# ${tab.title || 'task-x chat'}`, '', `_Exported from task-x on ${new Date().toISOString().slice(0, 16).replace('T', ' ')}._`, ''];
+    for (const it of tab.items) {
+      switch (it.kind) {
+        case 'user':
+          out.push('## You', '', it.text, ...(it.context?.length ? ['', `_Context: ${it.context.map((c) => `\`${c.path}${c.lines ? ` ${c.lines}` : ''}\``).join(', ')}_`] : []), '');
+          break;
+        case 'assistant':
+          if (it.text.trim()) out.push('## task-x', '', it.text.trim(), '');
+          break;
+        case 'tool':
+          out.push(`- \`${it.tool}\`${it.detail ? ` ${it.detail.split('\n')[0].slice(0, 200)}` : ''}${it.ok === false ? ' (failed)' : ''}`);
+          if (it.output && /(^|__|› )(run_command|Bash)$/.test(it.tool)) {
+            const f = fence(it.output);
+            out.push('', `  ${f}`, ...it.output.slice(0, 4_000).split('\n').map((l) => `  ${l}`), `  ${f}`, '');
+          }
+          break;
+        case 'file':
+          out.push(`- Changed \`${it.path}\` (+${it.added} −${it.removed})${it.undone ? ', undone' : it.kept ? ', kept' : ''}`);
+          break;
+        case 'steer':
+          out.push('', `> Added while it ran: ${it.text}`, '');
+          break;
+        case 'summary':
+          out.push('', it.title ? `**${it.title}**${it.stats?.length ? ` · ${it.stats.join(' · ')}` : ''}${it.error ? `\n\n${it.error}` : ''}` : `**${it.text}**`, '');
+          break;
+        case 'error':
+          out.push('', `> Error: ${it.text}`, '');
+          break;
+      }
+    }
+    return `${out.join('\n').replace(/\n{3,}/g, '\n\n').trim()}\n`;
+  }
+
+  /** Exports the chat on screen: open as a Markdown document, save it to a file, or copy it. */
+  async exportChat(): Promise<void> {
+    const md = this.chatMarkdown();
+    const pick = await vscode.window.showQuickPick(
+      [
+        { label: '$(markdown) Open as Markdown', id: 'open' },
+        { label: '$(save) Save to a file…', id: 'save' },
+        { label: '$(copy) Copy to the clipboard', id: 'copy', detail: 'To paste into an issue, a pull request, or a message' },
+      ],
+      { title: 'Export chat' },
+    );
+    if (pick?.id === 'open') await vscode.window.showTextDocument(await vscode.workspace.openTextDocument({ language: 'markdown', content: md }));
+    else if (pick?.id === 'copy') {
+      await vscode.env.clipboard.writeText(md);
+      vscode.window.showInformationMessage('task-x: the chat is on the clipboard as Markdown.');
+    } else if (pick?.id === 'save') {
+      const root = WorkspaceSync.root();
+      const name = `${(this.chat.title || 'chat').replace(/[^\w.-]+/g, '-').slice(0, 60) || 'chat'}.md`;
+      const uri = await vscode.window.showSaveDialog({ defaultUri: root ? vscode.Uri.joinPath(vscode.Uri.file(root), name) : undefined, filters: { Markdown: ['md'] } });
+      if (uri) await vscode.workspace.fs.writeFile(uri, Buffer.from(md, 'utf8'));
+    }
+  }
+
   /** Opens an empty chat in a new tab, after the open tabs and before History. */
   async newChat(): Promise<void> {
     if (this.tabs.filter((t) => t.kind === 'chat').length >= MAX_CHAT_TABS) return void vscode.window.showWarningMessage(`task-x: close a chat tab first. Up to ${MAX_CHAT_TABS} chats can be open.`);
     this.showTab(this.addTab(blankTab()).id);
+    // A new chat starts clean: no conversation (a new task id), no context meter, plan, or images.
+    if (!this.busy) {
+      this.todos = [];
+      this.postTodos();
+    }
+    this.post({ type: 'contextUsage', used: 0, window: 0 });
+    this.post({ type: 'clearDraft' });
   }
 
   private addTab(tab: ChatTab): ChatTab {
@@ -1370,7 +1439,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       .sort((a, b) => a.s - b.s)
       .slice(0, MAX_FILE_ITEMS)
       .map((x) => x.p);
-    this.post({ type: 'files', query, items });
+    // Indexed docs sets come first in the @ menu, as @docs:<name>.
+    const docs = await this.getClient().then(listDocs, () => [] as DocsSource[]);
+    const docItems = docs.filter((d) => !q || `docs:${d.name}`.includes(q) || d.name.toLowerCase().includes(q)).map((d) => `docs:${d.name}`);
+    this.post({ type: 'files', query, items: [...docItems, ...items].slice(0, MAX_FILE_ITEMS) });
   }
 
   private lane(taskId: string): Lane | undefined {
@@ -1748,13 +1820,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         break;
       }
       case 'textDelta':
-        if (!state.assistant) {
+        // Text after any other row (a note, a background result) starts a new reply, so the screen
+        // and the saved chat both keep it; appending to the older reply would hide it on screen.
+        if (!state.assistant || this.items[this.items.length - 1] !== state.assistant) {
           state.assistant = { kind: 'assistant', text: '' };
           this.add(state.assistant);
         }
         state.assistant.text += e.text;
         this.postChat({ type: 'delta', text: e.text });
         break;
+      case 'assistantMessage': {
+        // The whole text of the model turn. When it did not arrive as deltas (a provider that sends
+        // it at the end), or only part of it did, the reply shows the full text now.
+        const full = typeof e.text === 'string' ? e.text : '';
+        if (!full.trim()) break;
+        const shown = state.assistant && this.items.includes(state.assistant) ? state.assistant : undefined;
+        if (!shown) {
+          state.assistant = { kind: 'assistant', text: full };
+          this.add(state.assistant);
+        } else if (shown.text !== full && full.startsWith(shown.text)) {
+          const rest = full.slice(shown.text.length);
+          shown.text = full;
+          if (this.items[this.items.length - 1] === shown) this.postChat({ type: 'delta', text: rest });
+          else this.renderChat();
+        } else if (!shown.text.trim()) {
+          shown.text = full;
+          this.renderChat();
+        }
+        break;
+      }
       case 'retry':
         if (state.assistant) {
           this.items = this.items.filter((i) => i !== state.assistant);
@@ -2021,7 +2115,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // #9 `#` items and #12 the chat mode: the model gets their context; the message shows the user's words.
     // MCP resources (`#mcp:`) are read through the runtime, so it is connected first.
     await this.getClient().then((c) => this.wire(c), () => undefined);
-    const full = await withHashContext(withChatMode(text));
+    const full = await withHashContext(withDocs(withChatMode(text)));
     if (engine() === 'claudeCode' && !worker) {
       try {
         const task = this.night ? await this.nightTask(full, retry, abort.signal) : full;
@@ -2103,7 +2197,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * files are as they were before that request. Edits the user made since stay, with a note.
    */
   private async restoreTo(id: string): Promise<void> {
-    const items = this.items;
+    // The message can be in any chat tab, not only the one a task runs in.
+    const items = this.tabs.find((t) => t.items.some((i) => i.kind === 'user' && i.id === id))?.items ?? [];
     const at = items.findIndex((i) => i.kind === 'user' && i.id === id);
     if (at < 0) return;
     const ops = items

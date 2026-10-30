@@ -48,6 +48,16 @@ export async function helperProvider(secrets: vscode.SecretStorage): Promise<Pro
   return h && isProviderRef(h.kind) ? providerConfigWith(secrets, h.kind, h.model).catch(() => undefined) : undefined;
 }
 
+/**
+ * The embedding model for semantic search and docs (`task-x.embeddings.provider` and `.model`):
+ * an Ollama model such as nomic-embed-text, or an OpenAI-compatible one. Unset: no semantic search.
+ */
+export async function embeddingsProvider(secrets: vscode.SecretStorage): Promise<ProviderConfig | undefined> {
+  const ref = cfg().get<string>('embeddings.provider', '').trim();
+  const model = cfg().get<string>('embeddings.model', '').trim();
+  return ref && model && isProviderRef(ref) ? providerConfigWith(secrets, ref, model).catch(() => undefined) : undefined;
+}
+
 /** `task-x.pricing` rules that are well formed. */
 export function prices(): PriceRule[] {
   const ok = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0;
@@ -88,6 +98,7 @@ export async function runParams(secrets: vscode.SecretStorage, o: { prompt: stri
   ).filter((r) => r.provider);
   return {
     helper: await helperProvider(secrets),
+    embeddings: await embeddingsProvider(secrets),
     prompt: o.prompt,
     images: o.images ?? [],
     provider,

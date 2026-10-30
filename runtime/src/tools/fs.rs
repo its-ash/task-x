@@ -7,6 +7,7 @@ use crate::context::symbols;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_LIST_LIMIT: usize = 500;
 const MAX_READ_LINES: usize = 2_000;
@@ -227,8 +228,34 @@ struct PathIn {
     path: String,
 }
 
+/// A file inside a user skill folder (`~/.claude/skills`, `~/.copilot/skills`, …) or a Claude Code
+/// plugin's `skills` folder, given as an absolute or `~/` path. Skills point the agent at their own
+/// reference files, which live outside the workspace; they can be read, never written.
+fn skill_file(raw: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)?;
+    let p = match raw.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None if Path::new(raw).is_absolute() => PathBuf::from(raw),
+        None => return None,
+    };
+    let real = p.canonicalize().ok().filter(|r| r.is_file())?;
+    let in_dir = |d: &Path| d.canonicalize().is_ok_and(|d| real.starts_with(d));
+    let plugins = home.join(".claude").join("plugins");
+    let in_plugin_skills = in_dir(&plugins) && real.components().any(|c| c.as_os_str() == "skills");
+    (crate::agent::skills::user_dirs().iter().any(|d| in_dir(d)) || in_plugin_skills).then_some(real)
+}
+
 /// Reads a UTF-8 text file within limits and records its fingerprint for stale-edit detection.
+/// Files of the user's skills are readable too (read-only), so a skill's reference files load.
 pub fn read_text(c: &ToolCtx, raw: &str) -> Result<(String, String), ToolError> {
+    if let Some(abs) = skill_file(raw.trim()) {
+        let bytes = std::fs::read(&abs).map_err(|e| ToolError::io(e, raw))?;
+        if bytes.len() as u64 > MAX_FILE_BYTES * 4 || bytes[..bytes.len().min(8192)].contains(&0) {
+            return Err(ToolError::invalid(format!("{raw} is too large or binary")));
+        }
+        let text = String::from_utf8(bytes).map_err(|_| ToolError::invalid(format!("{raw} is not valid UTF-8")))?;
+        return Ok((abs.display().to_string(), text));
+    }
     let (abs, rel) = c.resolve_existing(raw)?;
     let meta = std::fs::metadata(&abs).map_err(|e| ToolError::io(e, &rel))?;
     if !meta.is_file() {

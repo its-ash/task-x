@@ -111,7 +111,112 @@ pub fn tools() -> Vec<ToolDef> {
             )
         },
         web_fetch,
+    ),
+    tool(
+        "web_search",
+        "Search the web and get the top results (title, URL, snippet). Use it for current facts, error messages, library versions, or to find the docs page, then read a result with web_fetch.",
+        Permission::Network,
+        || {
+            object(
+                json!({
+                    "query": { "type": "string", "description": "What to search for" },
+                    "count": int("How many results (default 8, max 20)", 1),
+                    "site": { "type": "string", "description": "Only results from this domain, e.g. docs.rs" },
+                }),
+                &["query"],
+            )
+        },
+        web_search,
     )]
+}
+
+const SEARCH_URL: &str = "https://html.duckduckgo.com/html/";
+const DEFAULT_RESULTS: usize = 8;
+const MAX_RESULTS: usize = 20;
+const MAX_QUERY_CHARS: usize = 400;
+
+static RESULT_LINK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#).expect("regex"));
+static RESULT_SNIPPET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|td|div)>"#).expect("regex"));
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SearchInput {
+    #[serde(alias = "q")]
+    query: String,
+    #[serde(default, alias = "limit", alias = "maxResults")]
+    count: Option<usize>,
+    #[serde(default)]
+    site: Option<String>,
+}
+
+/// The real target of a DuckDuckGo result link (`//duckduckgo.com/l/?uddg=<url>`).
+fn result_url(href: &str) -> Option<String> {
+    let full = if href.starts_with("//") { format!("https:{href}") } else { href.to_owned() };
+    let u = url::Url::parse(&full).ok()?;
+    let target = if u.host_str().is_some_and(|h| h.ends_with("duckduckgo.com")) {
+        u.query_pairs().find(|(k, _)| k == "uddg").map(|(_, v)| v.into_owned())?
+    } else {
+        full
+    };
+    // Ads go through DuckDuckGo's own click tracking; they are left out.
+    let t = url::Url::parse(&target).ok()?;
+    (matches!(t.scheme(), "http" | "https") && !t.host_str().is_some_and(|h| h.ends_with("duckduckgo.com"))).then(|| t.to_string())
+}
+
+/// Search results from a DuckDuckGo HTML page.
+fn parse_results(html: &str, max: usize) -> Vec<serde_json::Value> {
+    let snippets: Vec<String> = RESULT_SNIPPET.captures_iter(html).map(|c| html_to_text(&c[1])).collect();
+    let mut out = Vec::new();
+    for (i, c) in RESULT_LINK.captures_iter(html).enumerate() {
+        let Some(url) = result_url(&c[1]) else { continue };
+        if out.iter().any(|r: &serde_json::Value| r["url"] == url.as_str()) {
+            continue;
+        }
+        out.push(json!({ "title": html_to_text(&c[2]), "url": url, "snippet": snippets.get(i).cloned().unwrap_or_default() }));
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
+}
+
+fn web_search(ctx: &ToolCtx, input: serde_json::Value) -> ToolResult {
+    let p: SearchInput = parse(input)?;
+    let query = p.query.trim();
+    if query.is_empty() || query.chars().count() > MAX_QUERY_CHARS {
+        return Err(ToolError::invalid(format!("query must be 1..={MAX_QUERY_CHARS} characters")));
+    }
+    let site = p.site.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if site.is_some_and(|s| !s.chars().all(|c| c.is_ascii_alphanumeric() || ".-".contains(c))) {
+        return Err(ToolError::invalid("site must be a domain name such as docs.rs"));
+    }
+    let q = site.map_or_else(|| query.to_owned(), |s| format!("{query} site:{s}"));
+    let max = p.count.unwrap_or(DEFAULT_RESULTS).clamp(1, MAX_RESULTS);
+    let cancel = ctx.cancel.clone();
+    let html: String = tokio::runtime::Handle::current().block_on(async {
+        let send = async {
+            let fail = |e: reqwest::Error| ToolError::new(if e.is_timeout() { ToolErrorKind::Timeout } else { ToolErrorKind::Failed }, format!("search failed: {e}"));
+            let url = url::Url::parse_with_params(SEARCH_URL, [("q", q.as_str()), ("kl", "wt-wt")]).map_err(|e| ToolError::invalid(e.to_string()))?;
+            let r = client()?.get(url).send().await.map_err(fail)?;
+            let status = r.status();
+            let body = r.text().await.map_err(fail)?;
+            if !status.is_success() {
+                return Err(ToolError::new(ToolErrorKind::Failed, format!("the search service answered HTTP {status}; try again, or fetch a known docs URL with web_fetch")));
+            }
+            Ok(body)
+        };
+        tokio::select! {
+            _ = cancel.cancelled() => Err(ToolError::new(ToolErrorKind::Cancelled, "cancelled")),
+            r = send => r,
+        }
+    })?;
+    let results = parse_results(&html, max);
+    Ok(json!({
+        "query": q,
+        "results": results,
+        "note": if results.is_empty() { "No results. Try other words, or fewer of them." } else { "Read a page with web_fetch for its full text." },
+    }))
 }
 
 #[derive(Deserialize)]
@@ -195,6 +300,38 @@ async fn fetch(url: url::Url) -> Result<(u16, String, String, String, bool), Too
     Ok((status, final_url, content_type, String::from_utf8_lossy(&buf).into_owned(), cut))
 }
 
+static TITLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("regex"));
+static HREF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)<a\b[^>]*\bhref\s*=\s*["']([^"'#]+)"#).expect("regex"));
+
+/// One page for docs indexing: its final URL, title, readable text, and the http(s) links on it.
+/// Local and private addresses are refused, as for `web_fetch`.
+pub async fn fetch_page(url: &url::Url) -> Result<(url::Url, String, String, Vec<url::Url>), ToolError> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(ToolError::invalid("only http:// and https:// URLs can be indexed"));
+    }
+    check_target(url)?;
+    let (status, final_url, content_type, body, _) = fetch(url.clone()).await?;
+    if !(200..300).contains(&status) {
+        return Err(ToolError::new(ToolErrorKind::Failed, format!("{final_url} answered HTTP {status}")));
+    }
+    let final_url = url::Url::parse(&final_url).unwrap_or_else(|_| url.clone());
+    let html = content_type.contains("html") || body.trim_start().starts_with('<');
+    if !html {
+        return Ok((final_url, String::new(), body, Vec::new()));
+    }
+    let title = TITLE.captures(&body).map(|c| html_to_text(&c[1])).unwrap_or_default();
+    let links = HREF
+        .captures_iter(&body)
+        .filter_map(|c| final_url.join(c[1].trim()).ok())
+        .filter(|u| matches!(u.scheme(), "http" | "https"))
+        .map(|mut u| {
+            u.set_fragment(None);
+            u
+        })
+        .collect();
+    Ok((final_url, title, html_to_text(&body), links))
+}
+
 static DROP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?is)<(script|style|noscript|svg|template)\b.*?</(script|style|noscript|svg|template)\s*>|<!--.*?-->").expect("regex")
 });
@@ -256,6 +393,19 @@ mod tests {
             let r = tokio::task::spawn_blocking(move || run(&c, "web_fetch", json!({ "url": bad }))).await.unwrap();
             assert_eq!(r.unwrap_err().kind, ToolErrorKind::Forbidden);
         }
+    }
+
+    #[test]
+    fn search_results_are_read_from_the_results_page() {
+        let html = r#"<div class="result"><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.rs%2Fserde&amp;rut=x">serde - <b>Rust</b></a>
+            <a class="result__snippet" href="x">A <b>serialization</b> framework.</a></div>
+            <div class="result"><a class="result__a" href="https://duckduckgo.com/y.js?ad=1">Ad</a><a class="result__snippet">ad</a></div>
+            <div class="result"><a class="result__a" href="https://serde.rs/">Serde</a><a class="result__snippet">Home</a></div>"#;
+        let r = parse_results(html, 5);
+        assert_eq!(r.len(), 2, "the ad is left out: {r:?}");
+        assert_eq!((r[0]["url"].as_str(), r[0]["title"].as_str(), r[0]["snippet"].as_str()), (Some("https://docs.rs/serde"), Some("serde - Rust"), Some("A serialization framework.")));
+        assert_eq!(r[1]["url"], "https://serde.rs/");
+        assert_eq!(parse_results(html, 1).len(), 1);
     }
 
     #[test]

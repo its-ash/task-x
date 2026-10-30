@@ -183,6 +183,9 @@ pub struct RunParams {
     /// A small, cheap model for `summarize_file`. Unset: the task's own model.
     #[serde(default)]
     pub helper: Option<ProviderConfig>,
+    /// An embedding model for `semantic_search` and docs search (Ollama or OpenAI-compatible).
+    #[serde(default)]
+    pub embeddings: Option<ProviderConfig>,
     /// Nesting level; subagents run at depth 1 and cannot start more subagents.
     #[serde(default, skip_deserializing)]
     pub depth: u32,
@@ -419,6 +422,7 @@ fn preview(name: &str, input: &Value) -> Option<String> {
             Some(format!("$ {}\n(in {})", command_text(&input["command"]), input["cwd"].as_str().unwrap_or(".")))
         }
         "web_fetch" => Some(format!("GET {}", input["url"].as_str()?)),
+        "web_search" => Some(format!("Search the web for: {}", input["query"].as_str()?)),
         "copy_file" | "move_file" => {
             Some(format!("{} {} → {}", if name == "move_file" { "move" } else { "copy" }, input["from"].as_str()?, input["to"].as_str()?))
         }
@@ -511,6 +515,7 @@ struct Run {
     /// Tools not offered yet (lazy tool list); calling one by name, or `find_tool`, loads it.
     deferred: Vec<crate::provider::ToolSpec>,
     helper: Option<ProviderConfig>,
+    embeddings: Option<ProviderConfig>,
 }
 
 /// Tools offered from the start when the tool list is lazy: what nearly every coding task uses.
@@ -540,6 +545,36 @@ const CORE_TOOLS: &[&str] = &[
 ];
 const FIND_TOOL: &str = "find_tool";
 const SUMMARIZE: &str = "summarize_file";
+const SEMANTIC: &str = "semantic_search";
+const DOCS_SEARCH: &str = "docs_search";
+/// One embedding update of a workspace at a time; the store is shared by every task.
+static SEMANTIC_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+/// Characters of one search hit given to the model.
+const MAX_HIT_CHARS: usize = 1_500;
+
+fn semantic_spec() -> crate::provider::ToolSpec {
+    crate::provider::ToolSpec {
+        name: SEMANTIC.into(),
+        description: "Search the project by meaning, not exact words: \"where is the retry logic\", \"code that parses CLI flags\". Returns the closest code chunks with file and lines. Use search_regex for exact names.".into(),
+        input_schema: json!({ "type": "object", "properties": {
+            "query": { "type": "string", "description": "What the code does, in plain words" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 20 },
+            "glob": { "type": "string", "description": "Only paths that match, e.g. src/**/*.rs" }
+        }, "required": ["query"], "additionalProperties": false }),
+    }
+}
+
+fn docs_spec() -> crate::provider::ToolSpec {
+    crate::provider::ToolSpec {
+        name: DOCS_SEARCH.into(),
+        description: "Search library documentation the user indexed (@docs). Returns the best passages with their page URL. Give source to search one docs set.".into(),
+        input_schema: json!({ "type": "object", "properties": {
+            "query": { "type": "string" },
+            "source": { "type": "string", "description": "The docs name, as in @docs:<name>" },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
+        }, "required": ["query"], "additionalProperties": false }),
+    }
+}
 /// Read calls whose repeat, with the same result still in the conversation, is answered with a
 /// short note instead of the same content again.
 const REREAD_TOOLS: &[&str] = &["read_file", "read_range", "read_symbol", "get_file_outline", "read_multiple_files", "read_log"];
@@ -628,6 +663,9 @@ enum Target {
     FindTool,
     /// `summarize_file`: a helper model reads the file and returns a summary.
     Summarize,
+    /// `semantic_search` over the project, and `docs_search` over indexed docs.
+    Semantic,
+    Docs,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -828,7 +866,7 @@ impl Target {
         match self {
             Self::Builtin(d) => d.permission,
             Self::Mcp(..) => Permission::Network,
-            Self::Skill | Self::Ask(_) | Self::FindTool | Self::Summarize => Permission::Read,
+            Self::Skill | Self::Ask(_) | Self::FindTool | Self::Summarize | Self::Semantic | Self::Docs => Permission::Read,
             Self::Subagent(r) => {
                 if r.writes() {
                     Permission::Write
@@ -1138,6 +1176,8 @@ impl Run {
             None if call.name == ASK_USER => Target::Ask(parse_questions(&call.input).map_err(|e| invalid(&e))?),
             None if call.name == FIND_TOOL => Target::FindTool,
             None if call.name == SUMMARIZE => Target::Summarize,
+            None if call.name == SEMANTIC => Target::Semantic,
+            None if call.name == DOCS_SEARCH => Target::Docs,
             None if call.name == "worktree_apply" => Target::Worktree("worktree_apply"),
             None if call.name == "worktree_discard" => Target::Worktree("worktree_discard"),
             None => self
@@ -1278,6 +1318,7 @@ impl Run {
             prices: self.prices.clone(),
             role_providers: Vec::new(),
             helper: self.helper.clone(),
+            embeddings: self.embeddings.clone(),
             depth: self.depth + 1,
         };
         let child_cancel = self.cancel.child_token();
@@ -1591,6 +1632,8 @@ impl Run {
                 )
             }
             Target::Summarize => self.summarize(call).await,
+            Target::Semantic => self.semantic_search(call).await,
+            Target::Docs => self.docs_search(call).await,
             Target::Worktree(op) => {
                 let name = call.input["name"].as_str().unwrap_or_default().to_owned();
                 let (repo, cancel, op) = (self.cwd.clone(), self.cancel.clone(), *op);
@@ -1639,6 +1682,85 @@ impl Run {
             let _ = self.hook(hooks::Event::AfterEdit, &call.name, after, None).await;
         }
         res
+    }
+
+    /// `semantic_search`: embeds the project's changed chunks (the first call embeds them all, with
+    /// progress notes), then returns the chunks closest to the query.
+    async fn semantic_search(&self, call: &ToolCall) -> Result<Value, tools::ToolError> {
+        use crate::context::semantic;
+        let fail = |m: String| tools::ToolError::new(ToolErrorKind::Failed, m);
+        let cfg = self.embeddings.clone().ok_or_else(|| fail("semantic search needs an embedding model: set task-x.embeddings.provider and task-x.embeddings.model".into()))?;
+        let query = call.input["query"].as_str().map(str::trim).filter(|q| !q.is_empty()).ok_or_else(|| tools::ToolError::invalid("query is required"))?;
+        let limit = call.input["limit"].as_u64().unwrap_or(8).clamp(1, 20) as usize;
+        let glob = match call.input["glob"].as_str().filter(|g| !g.trim().is_empty()) {
+            Some(g) => Some(globset::Glob::new(g).map_err(|e| tools::ToolError::invalid(format!("bad glob: {e}")))?.compile_matcher()),
+            None => None,
+        };
+        let data = self.host.store.data_dir().ok_or_else(|| fail("no data folder for the index".into()))?;
+        // The files, read once: (root, every chunk to embed, and each file's text for the hits).
+        let (root, pieces, texts) = {
+            let ws = self.host.workspace.read().expect("workspace lock");
+            let w = ws.as_ref().ok_or_else(|| fail("no workspace is open".into()))?;
+            let mut pieces = Vec::new();
+            let mut texts = HashMap::new();
+            for f in w.index.files() {
+                let Some(c) = f.content.clone() else { continue };
+                pieces.extend(semantic::code_pieces(&f.rel, &c));
+                texts.insert(f.rel.clone(), c);
+            }
+            (w.index.root().to_path_buf(), pieces, texts)
+        };
+        let path = semantic::code_store_path(&data, &root);
+        let model = format!("{:?}:{}", cfg.kind, cfg.model);
+        let _guard = SEMANTIC_LOCK.lock().await;
+        let mut store = semantic::Store::load(&path);
+        let todo = store.plan(&model, pieces, false);
+        if todo.len() > semantic::BATCH {
+            self.emit(json!({ "type": "warning", "message": format!("Semantic search: embedding {} code chunks with {} (later searches only embed changed files).", todo.len(), cfg.model) }));
+        }
+        for batch in todo.chunks(semantic::BATCH) {
+            let embed: Vec<String> = batch.iter().map(semantic::embed_text).collect();
+            let vecs = match self.host.providers.embed(&cfg, &embed, &self.cancel).await {
+                Ok(v) => v,
+                Err(e) => {
+                    // Keep the batches already embedded, so the next search does not repeat them.
+                    let _ = store.save(&path);
+                    return Err(fail(format!("embedding failed: {}", e.message)));
+                }
+            };
+            for (p, v) in batch.iter().zip(vecs) {
+                store.add(semantic::Piece { source: p.source.clone(), start: p.start, end: p.end, title: String::new(), text: p.text.clone() }, v, false);
+            }
+        }
+        if !todo.is_empty() {
+            let _ = store.save(&path);
+        }
+        let q = self.host.providers.embed(&cfg, &[query.to_owned()], &self.cancel).await.map_err(|e| fail(format!("embedding failed: {}", e.message)))?;
+        let hits = store.search(&q[0], limit, |c| glob.as_ref().is_none_or(|g| g.is_match(&c.source)));
+        let results: Vec<Value> = hits
+            .into_iter()
+            .map(|(score, c)| {
+                let text = texts.get(&c.source).map(|t| t.lines().skip(c.start - 1).take(c.end + 1 - c.start).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+                json!({ "path": c.source, "startLine": c.start, "endLine": c.end, "score": (score * 1000.0).round() / 1000.0, "text": truncate(&text, MAX_HIT_CHARS) })
+            })
+            .collect();
+        Ok(json!({ "query": query, "chunks": store.chunks.len(), "results": results }))
+    }
+
+    /// `docs_search`: the best passages of the indexed library docs.
+    async fn docs_search(&self, call: &ToolCall) -> Result<Value, tools::ToolError> {
+        let fail = |m: String| tools::ToolError::new(ToolErrorKind::Failed, m);
+        let query = call.input["query"].as_str().map(str::trim).filter(|q| !q.is_empty()).ok_or_else(|| tools::ToolError::invalid("query is required"))?;
+        let limit = call.input["limit"].as_u64().unwrap_or(6).clamp(1, 20) as usize;
+        let source = call.input["source"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let data = self.host.store.data_dir().ok_or_else(|| fail("no data folder for docs".into()))?;
+        let mut r = crate::docs::search(&self.host.providers, self.embeddings.as_ref(), &data, source, query, limit, &self.cancel).await.map_err(fail)?;
+        for hit in r["results"].as_array_mut().into_iter().flatten() {
+            if let Some(t) = hit["text"].as_str() {
+                hit["text"] = json!(truncate(t, MAX_HIT_CHARS));
+            }
+        }
+        Ok(r)
     }
 
     /// A helper model (or the task's model) reads a file and returns a short summary, so the file
@@ -2265,6 +2387,13 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     if has_ws {
         tool_specs.push(summarize_spec());
     }
+    let embeddings = p.embeddings.clone().filter(|e| e.resolve().is_ok());
+    if has_ws && embeddings.is_some() {
+        tool_specs.push(semantic_spec());
+    }
+    if host.store.data_dir().is_some_and(|d| d.join("docs").is_dir()) {
+        tool_specs.push(docs_spec());
+    }
     // Lazy tool list: the core tools, the task-x tools that are not registry tools (subagents,
     // questions, skills, summaries), and the tools a skill needs; everything else waits behind
     // find_tool. MCP tools wait too: their schemas are often the largest.
@@ -2407,6 +2536,7 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         reads: HashMap::new(),
         deferred,
         helper: p.helper.filter(|h| h.resolve().is_ok()),
+        embeddings,
     })
 }
 
@@ -2452,6 +2582,7 @@ pub async fn best_of(host: Host, p: BestOfParams, cancel: CancellationToken) -> 
         prices: p.prices,
         role_providers: Vec::new(),
         helper: None,
+        embeddings: None,
         depth: 0,
     };
     let lead = prepare(host, params, cancel).await?;
@@ -2594,6 +2725,7 @@ mod tests {
             task_id: None,
             routes: Vec::new(),
             helper: None,
+            embeddings: None,
             fallbacks: Vec::new(),
             prices: Vec::new(),
             role_providers: Vec::new(),

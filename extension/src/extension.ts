@@ -11,6 +11,7 @@ import { type LmToolsHost, lmToolsServer, startLmToolsHost } from './lmToolsMcp.
 import { plugins } from './catalog.js';
 import { InlineReview } from './inlineReview.js';
 import { registerVscodeFeatures } from './vscodeFeatures.js';
+import { addDocs, removeDocs } from './docs.js';
 import { registerEditorCommands } from './editorCommands.js';
 import { SECTION, type ProviderRef, activeRef, deleteApiKey, hasApiKey, initChoice, isProviderRef, migrateSettings, modelFor, providerConfig, providerRefs, refLabel, refNeedsKey, sandboxOn, setProvider, settings, storeApiKey } from './config.js';
 import { ProviderDialog } from './providerDialog.js';
@@ -401,6 +402,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('task-x.cancel', () => chat.cancel()),
     vscode.commands.registerCommand('task-x.clearChat', () => chat.clear()),
     vscode.commands.registerCommand('task-x.newChat', () => chat.newChat()),
+    vscode.commands.registerCommand('task-x.exportChat', () => chat.exportChat()),
+    vscode.commands.registerCommand('task-x.addDocs', async () => addDocs(await client(), ctx.secrets)),
+    vscode.commands.registerCommand('task-x.removeDocs', async () => removeDocs(await client())),
     vscode.commands.registerCommand('task-x.undoLast', () => chat.undoLast()),
     ...registerEditorCommands(chat, client),
     vscode.commands.registerCommand('task-x.restartRuntime', restartRuntime),
