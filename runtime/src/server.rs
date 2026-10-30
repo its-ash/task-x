@@ -43,6 +43,17 @@ struct TaskIdParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompleteParams {
+    provider: ProviderConfig,
+    #[serde(default)]
+    system: Option<String>,
+    prompt: String,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RefineParams {
     prompt: String,
     #[serde(default)]
@@ -87,6 +98,36 @@ struct CancelToolParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SteerParams {
     task_id: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpPromptParams {
+    server: String,
+    name: String,
+    #[serde(default)]
+    arguments: serde_json::Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpResourceParams {
+    server: String,
+    uri: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SandboxParams {
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EditSteerParams {
+    task_id: String,
+    old: String,
     text: String,
 }
 
@@ -364,6 +405,19 @@ impl Server {
                     agent::steer(&self.steers, &p.task_id, &p.text).map(|ok| json!(ok)).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))
                 }),
             ),
+            "config/sandbox" => self.reply(
+                &id,
+                params::<SandboxParams>(msg.params).map(|p| {
+                    tools::exec::SANDBOX.store(p.enabled, Ordering::Relaxed);
+                    json!({ "enabled": p.enabled, "available": tools::exec::sandbox_available() })
+                }),
+            ),
+            "agent/editSteer" => self.reply(
+                &id,
+                params::<EditSteerParams>(msg.params).and_then(|p| {
+                    agent::edit_steer(&self.steers, &p.task_id, &p.old, &p.text).map(|ok| json!(ok)).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))
+                }),
+            ),
             "agent/cancelTool" => self.reply(
                 &id,
                 params::<CancelToolParams>(msg.params).map(|p| agent::cancel_tool(&self.tool_cancels, &p.task_id, &p.call_id).into()),
@@ -384,6 +438,7 @@ impl Server {
             | "workspace/refresh"
             | "context/retrieve"
             | "prompt/refine"
+            | "provider/complete"
             | "context/inspect"
             | "tools/call"
             | "agent/run"
@@ -397,6 +452,9 @@ impl Server {
             | "agent/bestOf"
             | "graph/project"
             | "graph/file"
+            | "mcp/catalog"
+            | "mcp/getPrompt"
+            | "mcp/readResource"
             | "mcp/status" => self.spawn(id, key, method, msg.params),
             _ => self.reply(&id, Err(RpcError::new(rpc::METHOD_NOT_FOUND, format!("unknown method: {method}")))),
         }
@@ -446,6 +504,19 @@ impl Server {
         if let Some(on) = p.sandbox {
             tools::exec::SANDBOX.store(on, Ordering::Relaxed);
         }
+        // MCP elicitation: a server's question goes to the client (`mcp/elicit`); no answer cancels it.
+        let me = self.clone();
+        mcp::set_elicit(Arc::new(move |server, params| {
+            let me = me.clone();
+            Box::pin(async move {
+                let r = me.request_client("mcp/elicit", json!({ "server": server, "params": params }), &CancellationToken::new()).await;
+                match r {
+                    Ok(v) if v["action"] == "accept" && v["content"].is_object() => json!({ "action": "accept", "content": v["content"] }),
+                    Ok(v) if v["action"] == "decline" => json!({ "action": "decline" }),
+                    _ => json!({ "action": "cancel" }),
+                }
+            })
+        }));
         if let Some(d) = p.data_dir.filter(|d| d.is_absolute()) {
             *self.store.write().expect("store lock") = Store::new(Some(&d));
             *self.data_dir.write().expect("data dir lock") = Some(d);
@@ -493,8 +564,12 @@ impl Server {
                 "mcp/configure" => this.configure_mcp(p).await,
                 "claude/run" => this.run_claude(p, &token).await,
                 "mcp/status" => Ok(this.mcp.read().await.status()),
+                "mcp/catalog" => Ok(this.mcp.read().await.catalog()),
+                "mcp/getPrompt" => this.mcp_prompt(p, &token).await,
+                "mcp/readResource" => this.mcp_resource(p, &token).await,
                 "context/retrieve" => this.retrieve(p).await,
                 "prompt/refine" => this.refine(p, &token).await,
+                "provider/complete" => this.complete(p, &token).await,
                 "context/inspect" => this.with_workspace(|w| Ok(json!(w.summary()))).await,
                 "graph/project" => match params::<crate::context::graph::ViewOptions>(p) {
                     Ok(o) => this.with_workspace(move |w| Ok(w.graph().view(&o))).await,
@@ -812,6 +887,22 @@ impl Server {
         Ok(m.status())
     }
 
+    /// `mcp/getPrompt`: a server's prompt template, filled in, as text for the chat input.
+    async fn mcp_prompt(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
+        let p: McpPromptParams = params(p)?;
+        let c = self.mcp.read().await.client(&p.server).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, format!("MCP server '{}' is not running", p.server)))?;
+        let text = c.get_prompt(&p.name, &p.arguments, cancel).await.map_err(|e| RpcError::new(rpc::TOOL_ERROR, e))?;
+        Ok(json!({ "text": text }))
+    }
+
+    /// `mcp/readResource`: the text of a server's resource, for a message's context.
+    async fn mcp_resource(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
+        let p: McpResourceParams = params(p)?;
+        let c = self.mcp.read().await.client(&p.server).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, format!("MCP server '{}' is not running", p.server)))?;
+        let text = c.read_resource(&p.uri, cancel).await.map_err(|e| RpcError::new(rpc::TOOL_ERROR, e))?;
+        Ok(json!({ "text": text }))
+    }
+
     fn list_skills(&self) -> Value {
         json!(skills::load(self.root().as_deref(), &skills::user_dirs()))
     }
@@ -874,6 +965,29 @@ impl Server {
             Ok(json!({ "retrieval": r, "instructions": w.instructions }))
         })
         .await
+    }
+
+    /// `provider/complete`: one model call with no tools (commit messages and other short texts).
+    async fn complete(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
+        let p: CompleteParams = params(p)?;
+        let prompt = p.prompt.trim();
+        if prompt.is_empty() || prompt.chars().count() > MAX_REFINE_CHARS {
+            return Err(RpcError::new(rpc::INVALID_PARAMS, format!("prompt must be 1..={MAX_REFINE_CHARS} characters")));
+        }
+        let req = ChatRequest {
+            system: p.system.filter(|s| !s.trim().is_empty()),
+            messages: vec![Message { role: Role::User, content: vec![ContentPart::Text { text: prompt.to_owned() }] }],
+            tools: Vec::new(),
+            max_tokens: Some(p.max_tokens.unwrap_or(1024).clamp(16, 8192)),
+            temperature: None,
+            context_window: None,
+            effort: None,
+        };
+        let out = self.providers.stream_chat(&p.provider, &req, cancel, |_| {}).await.map_err(provider_error)?;
+        if out.text.trim().is_empty() {
+            return Err(RpcError::new(rpc::INTERNAL_ERROR, "the model returned no text"));
+        }
+        Ok(json!({ "text": out.text.trim(), "usage": out.usage }))
     }
 
     /// `prompt/refine`: one model call that rewrites the user's prompt, with repository excerpts when a workspace is open.

@@ -31,7 +31,13 @@ export interface PluginEntry {
   version: string;
   enabled: boolean;
   path: string;
+  /** The plugin's MCP servers, in Claude Code's `mcpServers` format. */
+  mcpServers?: unknown;
 }
+
+/** MCP servers of enabled plugins, from the last `plugins()` call; read without waiting for the CLI. */
+let pluginMcp: { plugin: string; servers: unknown }[] = [];
+export const pluginMcpServers = () => pluginMcp;
 
 export interface Catalog {
   agents: CatalogEntry[];
@@ -95,10 +101,12 @@ export async function plugins(): Promise<PluginEntry[]> {
   try {
     const list = JSON.parse(await run(cli, ['plugin', 'list', '--json'])) as unknown;
     if (!Array.isArray(list)) return [];
-    return list
-      .filter((p): p is { id: string; version?: string; enabled?: boolean; installPath?: string } => typeof p?.id === 'string' && PLUGIN_ID.test(p.id))
-      .map((p) => ({ id: p.id, version: String(p.version ?? ''), enabled: p.enabled !== false, path: typeof p.installPath === 'string' ? p.installPath : '' }))
+    const out = list
+      .filter((p): p is { id: string; version?: string; enabled?: boolean; installPath?: string; mcpServers?: unknown } => typeof p?.id === 'string' && PLUGIN_ID.test(p.id))
+      .map((p) => ({ id: p.id, version: String(p.version ?? ''), enabled: p.enabled !== false, path: typeof p.installPath === 'string' ? p.installPath : '', mcpServers: p.mcpServers }))
       .slice(0, MAX_ITEMS);
+    pluginMcp = out.filter((p) => p.enabled && p.mcpServers).map((p) => ({ plugin: p.id.split('@')[0], servers: p.mcpServers }));
+    return out;
   } catch {
     return [];
   }

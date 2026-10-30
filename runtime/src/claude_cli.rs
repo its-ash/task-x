@@ -70,6 +70,13 @@ pub struct Params {
     /// Reasoning effort (`--effort`). Unset: Claude Code's default.
     #[serde(default)]
     pub effort: Option<crate::provider::types::Effort>,
+    /// Run Claude Code's Bash in its OS sandbox (default true). Off: commands run unsandboxed.
+    #[serde(default = "yes")]
+    pub sandbox: bool,
+    /// MCP servers the user turned off. Claude Code loads its own servers (`~/.claude.json`,
+    /// `.mcp.json`, plugins), so these are denied by name: their tools never run.
+    #[serde(default)]
+    pub disabled_mcp: Vec<String>,
 }
 
 fn default_mode() -> String {
@@ -177,6 +184,9 @@ pub fn validate(p: &Params) -> Result<(), String> {
         }
     }
     crate::provider::types::image_parts(&p.images)?;
+    if p.disabled_mcp.len() > 200 || p.disabled_mcp.iter().any(|n| n.is_empty() || n.len() > 64 || !n.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))) {
+        return Err("disabledMcp: names must be 1-64 letters, digits, '.', '_', or '-'".into());
+    }
     for (name, s) in &p.mcp_servers {
         if name == crate::mcp_server::SERVER_NAME || !valid_token(name) || !s.is_object() {
             return Err(format!("mcpServers: invalid server '{name}'"));
@@ -321,12 +331,18 @@ pub fn args(p: &Params, task_tools: Option<(&Path, &Path)>, instructions: &str, 
     // `allowUnsandboxedCommands: false` removes the `dangerouslyDisableSandbox` escape: every command stays sandboxed.
     // `network.allowedDomains` lets dependency downloads (cargo fetch, npm install, pip install, …) through.
     let mut settings = json!({ "sandbox": {
-        "enabled": true,
+        "enabled": p.sandbox,
         "autoAllowBashIfSandboxed": true,
         "allowUnsandboxedCommands": false,
         "network": { "allowedDomains": PACKAGE_HOSTS },
     } });
+    // Servers the user turned off: `.mcp.json` ones are not started, and every server's tools are denied.
+    if !p.disabled_mcp.is_empty() {
+        settings["disabledMcpjsonServers"] = json!(p.disabled_mcp);
+        settings["permissions"] = json!({ "deny": p.disabled_mcp.iter().map(|n| format!("mcp__{n}")).collect::<Vec<_>>() });
+    }
     let mut servers = p.mcp_servers.clone();
+    servers.retain(|name, _| !p.disabled_mcp.contains(name));
     if let Some((exe, root)) = task_tools.filter(|_| p.use_task_tools || approval.is_some()) {
         let mut server_args = vec!["--mcp-server".to_owned(), "--root".into(), root.to_string_lossy().into_owned()];
         if !p.use_task_tools {
@@ -1108,6 +1124,8 @@ mod tests {
             mcp_servers: serde_json::Map::new(),
             approve_all: false,
             effort: Some(crate::provider::types::Effort::Xhigh),
+            sandbox: true,
+            disabled_mcp: Vec::new(),
         };
         validate(&p).unwrap();
         assert_eq!(prompt_content(&p), json!("--help me"));
@@ -1186,6 +1204,18 @@ mod tests {
         assert!(!a.iter().any(|x| x.contains("help me")), "the prompt goes through stdin, not argv");
         assert!(a.windows(2).any(|w| w == ["--resume", "abc-123"]));
         assert!(a.windows(2).any(|w| w == ["--effort", "xhigh"]));
+        let open = args(&Params { sandbox: false, ..p.clone() }, None, "", None);
+        let s: Value = serde_json::from_str(&open[open.iter().position(|x| x == "--settings").unwrap() + 1]).unwrap();
+        assert_eq!(s["sandbox"]["enabled"], false, "the user turned the sandbox off");
+        let mut off = p.clone();
+        off.disabled_mcp = vec!["firebase".into()];
+        off.mcp_servers.insert("firebase".into(), json!({ "type": "http", "url": "http://x" }));
+        validate(&off).unwrap();
+        let oa = args(&off, None, "", None);
+        let s: Value = serde_json::from_str(&oa[oa.iter().position(|x| x == "--settings").unwrap() + 1]).unwrap();
+        assert_eq!((&s["permissions"]["deny"], &s["disabledMcpjsonServers"]), (&json!(["mcp__firebase"]), &json!(["firebase"])), "Claude Code's own copy is blocked too");
+        assert!(!oa.iter().any(|x| x == "--mcp-config"), "a server the user turned off is not passed");
+        assert!(validate(&Params { disabled_mcp: vec!["bad name".into()], ..p.clone() }).is_err());
         assert!(a.windows(2).any(|w| w == ["--input-format", "stream-json"]), "stdin stays open for steering");
         assert!(a.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
         assert!(a.windows(2).any(|w| w == ["--max-budget-usd", "1.50"]));

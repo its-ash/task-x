@@ -2,7 +2,7 @@
   "name": "task-x",
   "displayName": "task-x",
   "description": "Model-agnostic AI coding agent with a Rust runtime. Works with Claude, OpenAI, Ollama, and OpenAI-compatible endpoints.",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "publisher": "its-ash",
   "license": "MIT",
   "private": true,
@@ -57,6 +57,87 @@
       {
         "command": "task-x.openChat",
         "title": "Open Chat",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.generateCommitMessage",
+        "title": "Write Commit Message",
+        "category": "task-x",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "task-x.explainTerminal",
+        "title": "Explain Last Terminal Command",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.fixTerminal",
+        "title": "Fix Last Terminal Command",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.fixTest",
+        "title": "Fix with task-x",
+        "category": "task-x",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "task-x.fixProblem",
+        "title": "Fix Problem",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.review.applyFix",
+        "title": "Apply Fix",
+        "category": "task-x",
+        "icon": "$(wand)"
+      },
+      {
+        "command": "task-x.review.dismiss",
+        "title": "Dismiss",
+        "category": "task-x",
+        "icon": "$(close)"
+      },
+      {
+        "command": "task-x.review.dismissAll",
+        "title": "Dismiss All Review Comments",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.review.keep",
+        "title": "Keep File Changes",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.review.undoFile",
+        "title": "Undo File Changes",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.review.diff",
+        "title": "Show File Changes",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.review.undoHunk",
+        "title": "Undo Change",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.fromIssue",
+        "title": "Work on GitHub Issue…",
+        "category": "task-x",
+        "icon": "$(issues)"
+      },
+      {
+        "command": "task-x.openPullRequest",
+        "title": "Open Pull Request",
+        "category": "task-x",
+        "icon": "$(git-pull-request-create)"
+      },
+      {
+        "command": "task-x.reloadMcp",
+        "title": "Reload MCP Servers",
         "category": "task-x"
       },
       {
@@ -265,16 +346,6 @@
     "menus": {
       "view/title": [
         {
-          "command": "task-x.cancel",
-          "when": "view == task-x.chat && task-x.busy",
-          "group": "navigation@1"
-        },
-        {
-          "command": "task-x.newChat",
-          "when": "view == task-x.chat",
-          "group": "navigation@2"
-        },
-        {
           "command": "task-x.addProvider",
           "when": "view == task-x.chat",
           "group": "navigation@3"
@@ -331,6 +402,77 @@
         {
           "command": "task-x.copySelection",
           "when": "false"
+        },
+        {
+          "command": "task-x.fixTest",
+          "when": "false"
+        },
+        {
+          "command": "task-x.fixProblem",
+          "when": "false"
+        },
+        {
+          "command": "task-x.review.applyFix",
+          "when": "false"
+        },
+        {
+          "command": "task-x.review.dismiss",
+          "when": "false"
+        },
+        {
+          "command": "task-x.review.keep",
+          "when": "false"
+        },
+        {
+          "command": "task-x.review.undoFile",
+          "when": "false"
+        },
+        {
+          "command": "task-x.review.diff",
+          "when": "false"
+        },
+        {
+          "command": "task-x.review.undoHunk",
+          "when": "false"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "task-x.generateCommitMessage",
+          "when": "scmProvider == git",
+          "group": "navigation@1"
+        }
+      ],
+      "testing/item/context": [
+        {
+          "command": "task-x.fixTest",
+          "group": "inline@9"
+        },
+        {
+          "command": "task-x.fixTest",
+          "group": "task-x@1"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "task-x.review.applyFix",
+          "when": "commentController == task-x-review && commentThread == finding",
+          "group": "navigation@1"
+        },
+        {
+          "command": "task-x.review.dismiss",
+          "when": "commentController == task-x-review",
+          "group": "navigation@2"
+        }
+      ],
+      "terminal/context": [
+        {
+          "command": "task-x.explainTerminal",
+          "group": "task-x@1"
+        },
+        {
+          "command": "task-x.fixTerminal",
+          "group": "task-x@2"
         }
       ],
       "editor/context": [
@@ -476,6 +618,19 @@
           "default": "You are task-x, a precise coding assistant inside VS Code.",
           "editPresentation": "multilineText",
           "description": "System prompt sent with each chat request."
+        },
+        "task-x.mcp.disabled": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "MCP servers task-x does not start, by name. The MCP chip in the chat turns them on and off."
+        },
+        "task-x.sandbox.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Run the agent's commands (builds, tests, `curl` and other HTTP fetches, scripts) in the OS sandbox: they can write only inside the workspace, temp folders, and build caches. Network stays allowed. Off: commands can write anywhere your user can, and in the Safe edit mode each command asks first. Applies to the task-x engine and to Claude Code."
         },
         "task-x.agent.editMode": {
           "type": "string",

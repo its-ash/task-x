@@ -43,6 +43,8 @@ export interface ImportOptions {
   sources: readonly ImportSource[];
   env: Record<string, string | undefined>;
   read?: (path: string) => string | undefined;
+  /** Servers of installed Claude Code plugins (`claude plugin list --json`), by plugin id. */
+  pluginServers?: { plugin: string; servers: unknown }[];
 }
 
 export interface Imported {
@@ -50,6 +52,8 @@ export interface Imported {
   servers: Record<string, McpServer>;
   /** Servers not from Claude; Claude Code loads its own, so only these are passed to it. */
   nonClaude: Record<string, McpServer>;
+  /** Where each server came from, such as "Claude Code" or "VS Code workspace". */
+  origins: Record<string, string>;
   /** One line per file read and per server skipped. */
   notes: string[];
 }
@@ -160,6 +164,7 @@ export function importServers(o: ImportOptions): Imported {
   const read = o.read ?? readText;
   const servers: Record<string, McpServer> = {};
   const nonClaude: Record<string, McpServer> = {};
+  const origins: Record<string, string> = {};
   const notes: string[] = [];
   const take = (label: string, source: ImportSource, map: unknown) => {
     const entries = Object.entries(obj(map) ?? {});
@@ -179,12 +184,15 @@ export function importServers(o: ImportOptions): Imported {
         continue;
       }
       servers[name] = s;
+      origins[name] = label;
       if (source === 'claude') delete nonClaude[name];
       else nonClaude[name] = s;
       n++;
     }
     if (n) notes.push(`${label}: ${n} server${n === 1 ? '' : 's'}`);
   };
+  // Plugin servers come first, so the user's own files override them by name. Claude Code loads them itself.
+  if (o.sources.includes('claude')) for (const p of o.pluginServers ?? []) take(`Plugin ${p.plugin}`, 'claude', p.servers);
   for (const f of configFiles(o)) {
     const text = f.path === SETTING ? JSON.stringify({ servers: o.vscodeSettingServers }) : read(f.path);
     if (text === undefined) continue;
@@ -195,7 +203,7 @@ export function importServers(o: ImportOptions): Imported {
     }
     take(f.label, f.source, f.pick(json));
   }
-  return { servers, nonClaude, notes };
+  return { servers, nonClaude, origins, notes };
 }
 
 /** A server in Claude Code's `mcpServers` format, for `claude/run`. Disabled servers are left out. */

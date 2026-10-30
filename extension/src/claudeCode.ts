@@ -3,7 +3,7 @@ import { accessSync, constants, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
-import { type EditMode, SECTION, chosenClaudeModel, chosenEngine, editMode, setWindowChoice } from './config.js';
+import { type EditMode, SECTION, chosenClaudeModel, chosenEngine, editMode, sandboxOn, setWindowChoice } from './config.js';
 import type { ChatMode } from './protocol.js';
 import { runtimeEnv } from './runtime.js';
 
@@ -43,10 +43,17 @@ export const claudeModel = () => (chosenClaudeModel() ?? vscode.workspace.getCon
  * user. Other chat modes only plan. `approveAll` (auto only) also lets MCP and other tools run
  * without asking. Never bypassPermissions.
  */
-export function claudePermissions(mode: ChatMode, em: EditMode = editMode()): { permissionMode: string; allowedTools: string[]; approveAll: boolean } {
+export function claudePermissions(
+  mode: ChatMode,
+  em: EditMode = editMode(),
+  sandbox = sandboxOn(),
+): { permissionMode: string; allowedTools: string[]; approveAll: boolean; sandbox: boolean } {
   const approveAll = em === 'auto';
-  if (mode !== 'agent') return { permissionMode: 'plan', allowedTools: WEB_TOOLS, approveAll };
-  return em === 'ask' ? { permissionMode: 'default', allowedTools: [], approveAll } : { permissionMode: 'acceptEdits', allowedTools: ['Bash', ...WEB_TOOLS], approveAll };
+  if (mode !== 'agent') return { permissionMode: 'plan', allowedTools: WEB_TOOLS, approveAll, sandbox };
+  if (em === 'ask') return { permissionMode: 'default', allowedTools: [], approveAll, sandbox };
+  // Without the sandbox a command can write anywhere, so Safe asks before each one; Auto still runs them.
+  const bash = sandbox || em === 'auto' ? ['Bash'] : [];
+  return { permissionMode: 'acceptEdits', allowedTools: [...bash, ...WEB_TOOLS], approveAll, sandbox };
 }
 
 export async function useClaude(model: string): Promise<void> {

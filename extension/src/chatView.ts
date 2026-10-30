@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
-import { EDIT_MODES, type EditMode, activeRef, editMode, effort, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, setEditMode, toolModels, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
+import { EDIT_MODES, type EditMode, activeRef, editMode, effort, sandboxOn, setSandbox, windowChoice, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, setEditMode, toolModels, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
 import {
   type AgentEvent,
   type AgentEventParams,
@@ -34,7 +34,10 @@ import { diffStats, formatOutput } from './output.js';
 import { formatCost, limits, routes, runParams } from './runParams.js';
 import { commitPaths, commitSubject } from './autoCommit.js';
 import { WorkspaceSync } from './workspace.js';
-import { claudeMcpServers } from './mcpSources.js';
+import { claudeDisabledMcp, claudeMcpServers, disabledMcp, mcpOrigins, setMcpDisabled } from './mcpSources.js';
+import { setResourceReader, withHashContext } from './hashContext.js';
+import { activeChatMode, chatModes, setChatMode, withChatMode } from './chatModes.js';
+import { elicit } from './mcpElicit.js';
 
 const TRANSCRIPT_KEY = 'task-x.transcript';
 const INCLUDE_EDITOR_KEY = 'task-x.includeEditor';
@@ -148,7 +151,7 @@ const MAX_LANE_STEPS = 30;
 
 /** A rendered transcript entry; persisted per workspace. */
 type Item =
-  | { kind: 'user'; text: string; mode: ChatMode; images?: number; context?: SentContext[] }
+  | { kind: 'user'; text: string; mode: ChatMode; images?: number; context?: SentContext[]; id?: string; operations?: number[] }
   | { kind: 'assistant'; text: string }
   | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string }; tokens?: number }
   | { kind: 'file'; path: string; operation: number | null; diffKey: string; added: number; removed: number; diff: string; diffCut: boolean; undone?: boolean; kept?: boolean }
@@ -213,6 +216,13 @@ type Inbound =
   | { type: 'selectEditMode'; mode: string }
   | { type: 'selectEffort'; effort: string }
   | { type: 'slashAction'; action: string; key?: string; enable?: boolean }
+  | { type: 'editWaiting'; kind: string; index: number; text: string }
+  | { type: 'selectSandbox'; enabled: boolean }
+  | { type: 'listMcp' }
+  | { type: 'restoreTo'; id: string }
+  | { type: 'listTools' }
+  | { type: 'toggleTool'; name: string; on: boolean }
+  | { type: 'mcpAction'; action: string; name?: string; enable?: boolean }
   | { type: 'openSettings'; query: string }
   | { type: 'suggest'; text: string; mode: string }
   | { type: 'copyOutput'; id: string }
@@ -345,6 +355,24 @@ function isBackgroundStart(output: string): boolean {
   } catch {
     return false;
   }
+}
+
+export interface Todo {
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
+}
+
+/** task-x's `todo_write` and Claude Code's `TodoWrite`, also as an MCP or subagent tool name. */
+const TODO_TOOL = /(^|__|› )(todo_write|TodoWrite)$/;
+
+/** The checklist of a `todo_write` or `TodoWrite` call, or undefined for any other tool. */
+export function todoList(tool: string, input: Record<string, unknown>): Todo[] | undefined {
+  if (!TODO_TOOL.test(tool) || !Array.isArray(input.todos)) return undefined;
+  return (input.todos as unknown[])
+    .map((t) => t as { content?: unknown; status?: unknown })
+    .filter((t) => typeof t?.content === 'string' && t.content.trim())
+    .slice(0, 30)
+    .map((t) => ({ content: String(t.content).slice(0, 300), status: t.status === 'completed' || t.status === 'in_progress' ? t.status : 'pending' }));
 }
 
 /** A file that went with a message, shown as a chip under it. */
@@ -486,6 +514,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   foreignApproval?: (req: ApprovalRequest) => Promise<{ decision: ApprovalDecision }>;
   /** Called with every finished chat task (review findings, notifications). */
   onSummary?: (s: AgentSummary) => void;
+  /** The pending edits with their original text, after each load (the editor shows them inline). */
+  onPending?: (files: { path: string; original: string | null }[]) => void;
   /** Called when the chat starts or stops working (status bar). */
   onBusyChange?: (busy: boolean) => void;
   /** Opens the project graph panel. */
@@ -666,7 +696,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   refreshStatus(): void {
     const ref = activeRef();
     const claude = engine() === 'claudeCode';
-    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.busy && this.activeTab === this.runTab, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null });
+    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.busy && this.activeTab === this.runTab, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null });
     void this.postModels();
   }
 
@@ -1130,6 +1160,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'slashAction':
         await this.slashAction(m);
         break;
+      case 'listMcp':
+        await this.postMcp();
+        break;
+      case 'restoreTo':
+        if (typeof m.id === 'string') await this.restoreTo(m.id);
+        break;
+      case 'listTools':
+        await this.postTools();
+        break;
+      case 'toggleTool': {
+        if (typeof m.name !== 'string' || !/^[\w.-]{1,64}$/.test(m.name)) break;
+        const off = new Set(windowChoice().offTools ?? []);
+        if (m.on) off.delete(m.name);
+        else off.add(m.name);
+        await setWindowChoice({ offTools: [...off].sort() });
+        await this.postTools();
+        break;
+      }
+      case 'mcpAction':
+        await this.mcpAction(m);
+        break;
+      case 'selectSandbox':
+        await setSandbox(m.enabled === true);
+        this.refreshStatus();
+        break;
+      case 'editWaiting':
+        if (Number.isInteger(m.index) && typeof m.text === 'string') await this.editWaiting(m.kind === 'steer' ? 'steer' : 'queue', m.index, m.text);
+        break;
       case 'signIn':
         await claudeSignIn(() => this.refreshStatus());
         break;
@@ -1423,6 +1481,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const files = await client.request<PendingFile[]>('edits/pending');
       if (gen !== this.changesGen) return;
       for (const f of files) this.originals.set(f.path, f.original);
+      this.onPending?.(files);
       next = new Map(files.map((f) => [f.path, { path: f.path, added: f.added, removed: f.removed, status: f.original === null ? 'added' : f.current === null ? 'deleted' : 'modified', seq }]));
       for (const [p, row] of this.changes) if (row.seq > seq && !next.has(p)) next.set(p, row);
     } catch {
@@ -1557,6 +1616,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       editMode() === 'auto' ? Promise.resolve({ decision: 'allowSession' as const }) : this.requestApproval(p as ApprovalRequest),
     );
     client.onRequest('agent/askUser', (p) => this.askUser(p as AskUserRequest));
+    // #15: an MCP server asks the user something while it works.
+    client.onRequest('mcp/elicit', (p) => elicit(p));
+    setResourceReader(async (server, uri) => (await client.request<{ text: string }>('mcp/readResource', { server, uri })).text);
   }
 
   /** Shows the agent's questions in the chat and resolves with the answers, or null when dismissed. */
@@ -1701,12 +1763,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         this.add({ kind: 'context', text: `Retrying (${e.attempt}) after: ${e.reason}` });
         break;
-      case 'toolStarted':
+      case 'toolStarted': {
         state.assistant = undefined;
+        // #7: the plan checklist (task-x `todo_write`, Claude Code `TodoWrite`) shows above the input, not as a row.
+        const todos = todoList(e.tool, e.input);
+        if (todos) {
+          this.todos = todos;
+          this.postTodos();
+          break;
+        }
         this.add({ kind: 'tool', id: e.callId, tool: e.tool, detail: toolDetail(e.tool, e.input), stop: this.stoppable(e.permission, this.taskId, e.callId, e.tool) });
         break;
+      }
       case 'toolFinished': {
         state.assistant = undefined;
+        if (TODO_TOOL.test(e.tool)) break;
         // A background command answers twice: at once ("runs in the background"), then with its output. The row stays running until then.
         if (!e.background && isBackgroundStart(e.output)) break;
         const it = this.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === e.callId);
@@ -1928,8 +1999,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const mode: ChatMode = modeOverride ?? 'agent';
     const abort = new AbortController();
     this.setBusy(abort);
+    // A new request starts without the old plan.
+    this.todos = [];
+    this.postTodos();
     const sent = sentContext(this.editorContext(text));
-    this.add({ kind: 'user', text, mode, ...(images.length ? { images: images.length } : {}), ...(sent.length ? { context: sent } : {}) });
+    const request: Extract<Item, { kind: 'user' }> = { kind: 'user', text, mode, id: randomBytes(6).toString('hex'), ...(images.length ? { images: images.length } : {}), ...(sent.length ? { context: sent } : {}) };
+    this.add(request);
+    this.lastRequest = request;
     const before = this.lastSummary();
     this.stalled = false;
     this.lastActivity = Date.now();
@@ -1942,9 +2018,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     let off = () => {};
     // Night mode with a loop model runs through task-x with that model, whatever the chat engine is.
     const worker = this.night ? nightModels().worker : undefined;
+    // #9 `#` items and #12 the chat mode: the model gets their context; the message shows the user's words.
+    // MCP resources (`#mcp:`) are read through the runtime, so it is connected first.
+    await this.getClient().then((c) => this.wire(c), () => undefined);
+    const full = await withHashContext(withChatMode(text));
     if (engine() === 'claudeCode' && !worker) {
       try {
-        const task = this.night ? await this.nightTask(text, retry, abort.signal) : text;
+        const task = this.night ? await this.nightTask(full, retry, abort.signal) : full;
         await this.sendClaude(text, mode, abort.signal, (o) => (off = o), task, images);
       } catch (e) {
         this.add({ kind: 'error', text: describeError(e), retryText: e instanceof RpcError && e.cancelled ? undefined : text });
@@ -1964,7 +2044,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.wire(client);
       this.taskId ??= `c${Date.now()}${randomBytes(3).toString('hex')}`;
       const taskId = this.taskId;
-      const prompt = this.night ? await this.nightTask(text, retry, abort.signal) : text;
+      const prompt = this.night ? await this.nightTask(full, retry, abort.signal) : full;
       const provider = worker && isProviderRef(worker.kind) ? await providerConfigWith(this.ctx.secrets, worker.kind, worker.model) : undefined;
       const params = await runParams(this.ctx.secrets, { prompt, mode, taskId, editor: this.editorContext(text), provider, images });
       const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
@@ -1981,6 +2061,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         summary = await client.request<AgentSummary>('agent/run', { ...params, prompt: CONTINUE_PROMPT, images: [] }, { signal: abort.signal });
       }
       this.add({ kind: 'summary', ...summaryText(summary) });
+      this.noteOperations(summary);
       await this.commitTask(summary, text);
       this.finished(summary, text);
       void this.refreshChanges();
@@ -2006,6 +2087,60 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
   }
 
+  /** The request that is running now, so its edits can be restored from its message (#11). */
+  private lastRequest?: Extract<Item, { kind: 'user' }>;
+
+  /** Remembers which edit operations a request made; its message then offers "Restore to here". */
+  private noteOperations(summary: AgentSummary): void {
+    const r = this.lastRequest;
+    if (!r || !summary.operations?.length) return;
+    r.operations = [...new Set([...(r.operations ?? []), ...summary.operations])];
+    this.postChat({ type: 'restorable', id: r.id });
+  }
+
+  /**
+   * Undoes the edits of one request and of every later request in the chat, newest first, so the
+   * files are as they were before that request. Edits the user made since stay, with a note.
+   */
+  private async restoreTo(id: string): Promise<void> {
+    const items = this.items;
+    const at = items.findIndex((i) => i.kind === 'user' && i.id === id);
+    if (at < 0) return;
+    const ops = items
+      .slice(at)
+      .flatMap((i) => (i.kind === 'user' ? (i.operations ?? []) : []))
+      .filter((op, k, all) => all.indexOf(op) === k)
+      .sort((a, b) => b - a);
+    if (!ops.length) return void vscode.window.showInformationMessage('task-x: this request and the ones after it made no edits.');
+    const pick = await vscode.window.showWarningMessage(`Undo the edits of this request and every later one (${ops.length} edit${ops.length > 1 ? 's' : ''})?`, { modal: true }, 'Restore');
+    if (pick !== 'Restore') return;
+    const client = await this.getClient();
+    const restored = new Set<string>();
+    const kept: string[] = [];
+    for (const op of ops) {
+      try {
+        const r = await client.request<{ restored: string[]; conflicts: { path: string }[] }>('edits/undo', { operation: op });
+        for (const p of r.restored) restored.add(p);
+        kept.push(...r.conflicts.map((c) => c.path));
+        for (const it of this.allItems()) if (it.kind === 'file' && it.operation === op && r.restored.includes(it.path)) it.undone = true;
+      } catch {
+        // Already undone or no longer in the edit log.
+      }
+    }
+    for (const i of items.slice(at)) if (i.kind === 'user') i.operations = undefined;
+    await this.persist();
+    this.renderTab();
+    void this.refreshChanges();
+    const msg = `Restored ${restored.size} file${restored.size === 1 ? '' : 's'} to before this request.${kept.length ? ` Kept ${[...new Set(kept)].join(', ')}: changed after the agent's edit.` : ''}`;
+    (kept.length ? vscode.window.showWarningMessage : vscode.window.showInformationMessage)(msg);
+  }
+
+  /** The newest plan checklist of the running (or last) task. */
+  private todos: Todo[] = [];
+  private postTodos(): void {
+    this.post({ type: 'todos', todos: this.todos });
+  }
+
   /** Shows the messages waiting in the tab on screen: steers of its running task first, then its queued messages. */
   private postQueue(): void {
     const tab = this.activeTab;
@@ -2025,6 +2160,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     if (!accepted) return this.send(text);
     this.steering.push(t);
+    this.postQueue();
+  }
+
+  /**
+   * Changes a message that still waits: a steer the agent has not read yet, or a queued message.
+   * Empty text removes it. A steer the agent read in the meantime stays as it was, with a note.
+   */
+  private async editWaiting(kind: 'steer' | 'queue', index: number, raw: string): Promise<void> {
+    const text = raw.trim().slice(0, MAX_INPUT_CHARS);
+    if (kind === 'queue') {
+      const mine = this.queue.filter((q) => (q.tab ?? this.runTab) === this.activeTab);
+      const item = mine[index];
+      if (item) {
+        if (text) item.text = text;
+        else this.queue.splice(this.queue.indexOf(item), 1);
+      }
+      return this.postQueue();
+    }
+    const old = this.steering[index];
+    if (old === undefined || !this.taskId) return this.postQueue();
+    let ok = false;
+    try {
+      ok = await (await this.getClient()).request<boolean>('agent/editSteer', { taskId: this.taskId, old, text });
+    } catch (e) {
+      this.log('warn', `editSteer failed: ${describeError(e)}`);
+    }
+    const at = this.steering.indexOf(old);
+    if (ok && at >= 0) {
+      if (text) this.steering[at] = text;
+      else this.steering.splice(at, 1);
+    } else if (!ok) vscode.window.showInformationMessage('task-x: the agent already read that message, so it can no longer change.');
     this.postQueue();
   }
 
@@ -2059,6 +2225,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /** Files the `/` menu may open, by the key it sent to the webview; the webview never sends a path. */
   private slashFiles = new Map<string, string>();
+  private mcpPrompts: { server: string; name: string; description: string; arguments: string[] }[] = [];
   private slashPlugins = new Map<string, PluginEntry>();
 
   /** Skills, agents, and plugins for the `/` menu in the input. */
@@ -2079,6 +2246,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     const cat = await catalog(WorkspaceSync.root());
     const known = new Set(skills.map((s) => s.name));
+    // #15: prompt templates and resources from the running MCP servers.
+    let mcp: { prompts: { server: string; name: string; description: string; arguments: string[] }[]; resources: { server: string; uri: string; name: string; description: string }[] } = { prompts: [], resources: [] };
+    try {
+      mcp = await (await this.getClient()).request('mcp/catalog');
+    } catch (e) {
+      this.log('warn', `mcp/catalog failed: ${describeError(e)}`);
+    }
+    this.mcpPrompts = mcp.prompts;
     this.post({
       type: 'skills',
       skills: [
@@ -2086,11 +2261,69 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         ...cat.pluginSkills.filter((s) => !known.has(s.name)).map((s) => ({ name: s.name, description: s.description, source: s.source, view: file(s.path) })),
       ],
       agents: cat.agents.map((a) => ({ name: a.name, description: a.description, source: a.source, view: file(a.path) })),
+      modes: chatModes().map((m) => ({ name: m.name, description: m.description, view: file(m.path), active: m.name === activeChatMode()?.name })),
+      mcpPrompts: mcp.prompts.map((p, i) => ({ key: String(i), name: `${p.server}:${p.name}`, description: p.description, params: p.arguments })),
+      mcpResources: mcp.resources.map((r) => ({ name: `${r.server}:${r.name}`, token: `mcp:${r.server}:${r.uri}`, description: r.description || r.uri })),
       plugins: cat.plugins.map((p) => {
         this.slashPlugins.set(p.id, p);
         return { id: p.id, version: p.version, enabled: p.enabled };
       }),
     });
+  }
+
+  /** The built-in tools for the Tools chip (#10), with the ones turned off for this window's chats. */
+  private async postTools(): Promise<void> {
+    const off = new Set(windowChoice().offTools ?? []);
+    try {
+      const list = await (await this.getClient()).request<{ name: string; description: string; permission: string }[]>('tools/list');
+      this.post({ type: 'tools', tools: list.map((t) => ({ name: t.name, description: t.description.split('. ')[0], permission: t.permission, on: !off.has(t.name) })) });
+    } catch (e) {
+      this.log('warn', `tools/list failed: ${describeError(e)}`);
+      this.post({ type: 'tools', tools: [] });
+    }
+  }
+
+  /**
+   * MCP servers for the chip: every server task-x found (Claude Code and its plugins, Claude Desktop,
+   * VS Code, Copilot CLI, task-x settings), with where it came from and what the runtime reports.
+   */
+  private async postMcp(): Promise<void> {
+    const origins = mcpOrigins(this.ctx);
+    const off = new Set(disabledMcp());
+    let status: { name: string; running: boolean; tools: string[]; error?: string }[] = [];
+    try {
+      status = (await (await this.getClient()).request<{ servers: typeof status }>('mcp/status')).servers;
+    } catch (e) {
+      this.log('warn', `mcp/status failed: ${describeError(e)}`);
+    }
+    const names = [...new Set([...Object.keys(origins), ...status.map((s) => s.name)])].sort((a, b) => a.localeCompare(b));
+    this.post({
+      type: 'mcp',
+      servers: names.map((name) => {
+        const s = status.find((x) => x.name === name);
+        return { name, origin: origins[name] ?? 'task-x', enabled: !off.has(name), running: !!s?.running, tools: s?.tools.length ?? 0, error: s?.error ?? null };
+      }),
+    });
+  }
+
+  /** The MCP chip's actions: turn a server on or off, reload all, add one, or show the details. */
+  private async mcpAction(m: { action: string; name?: string; enable?: boolean }): Promise<void> {
+    switch (m.action) {
+      case 'toggle':
+        if (typeof m.name === 'string' && /^[\w.-]{1,64}$/.test(m.name)) await setMcpDisabled(m.name, m.enable !== true);
+        // The settings change restarts the servers; the list shows the new state at once.
+        setTimeout(() => void this.postMcp(), 1500);
+        return this.postMcp();
+      case 'reload':
+        await vscode.commands.executeCommand('task-x.reloadMcp');
+        return this.postMcp();
+      case 'add':
+        await vscode.commands.executeCommand('workbench.action.openSettingsJson', { revealSetting: { key: 'task-x.mcpServers', edit: true } });
+        return;
+      case 'details':
+        await vscode.commands.executeCommand('task-x.mcpStatus');
+        return;
+    }
   }
 
   /** The `/` menu's actions: view a skill or agent, create one, and install or toggle plugins. */
@@ -2103,6 +2336,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (f) await vscode.window.showTextDocument(vscode.Uri.file(f));
         return;
       }
+      case 'mcpPrompt': {
+        // Fills in the prompt's arguments, then puts its text in the input to edit and send.
+        const p = this.mcpPrompts[Number(m.key)];
+        if (!p) return;
+        const args: Record<string, string> = {};
+        for (const a of p.arguments) {
+          const v = await vscode.window.showInputBox({ title: `${p.server}:${p.name}`, prompt: a, ignoreFocusOut: true });
+          if (v === undefined) return;
+          if (v) args[a] = v;
+        }
+        try {
+          const r = await (await this.getClient()).request<{ text: string }>('mcp/getPrompt', { server: p.server, name: p.name, arguments: args });
+          this.post({ type: 'setInput', text: r.text });
+        } catch (e) {
+          vscode.window.showErrorMessage(`task-x: ${p.server}:${p.name}: ${describeError(e)}`);
+        }
+        return;
+      }
+      case 'mode':
+        await setChatMode(m.key || undefined);
+        this.refreshStatus();
+        return this.postSkills();
       case 'newSkill':
         return newSkill(root);
       case 'newAgent':
@@ -2183,6 +2438,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         useTaskTools: c.get<boolean>('claudeCode.useTaskXTools', true),
         images,
         mcpServers: claudeMcpServers(this.ctx),
+        // MCP servers turned off, and task-x tools turned off in the Tools chip (`mcp__task-x__<tool>`).
+        disabledMcp: [...claudeDisabledMcp(this.ctx), ...(windowChoice().offTools ?? []).map((t) => `task-x__${t}`)],
         effort: effort(),
         ...claudePermissions(mode),
       },
@@ -2190,6 +2447,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     );
     if (summary.sessionId) await this.ctx.workspaceState.update(CLAUDE_SESSIONS_KEY, { ...sessions, [taskId]: summary.sessionId });
     this.add({ kind: 'summary', ...summaryText(summary) });
+    this.noteOperations(summary);
     await this.commitTask(summary, text);
     this.finished(summary, text);
     void this.refreshChanges();
@@ -2218,6 +2476,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <div id="tabStrip" class="tab-strip" role="tablist" aria-label="Open chats"></div>
   <button type="button" id="newChat" class="action new-tab" title="New chat in a new tab" aria-label="New chat"><span class="codicon codicon-add" aria-hidden="true"></span></button>
   <span class="spacer"></span>
+  <button type="button" id="indexBtn" class="pick index" hidden></button>
   <button type="button" role="tab" id="tabHistory" class="view-tab" aria-controls="history" title="History"><span class="codicon codicon-history" aria-hidden="true"></span><span class="view-label">History</span></button>
 </nav>
 <div id="progress" role="progressbar" aria-label="Working" aria-hidden="true"></div>
@@ -2234,10 +2493,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 </section>
 <form id="form">
   <div id="slash" role="listbox" aria-label="Skills" hidden></div>
+  <div id="todos" class="todos" aria-label="The agent's plan" hidden></div>
   <div id="queue" class="queue" aria-label="Queued messages" hidden></div>
   <div id="ctx" class="ctx" aria-label="Context sent with the message"></div>
   <div id="attachments" class="attachments" aria-label="Attached images" hidden></div>
-  <input type="file" id="attachFile" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
   <label for="input" class="sr-only">Message</label>
   <textarea id="input" rows="1"></textarea>
   <div class="toolbar" role="toolbar" aria-label="Chat options">
@@ -2246,10 +2505,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     <button type="button" id="nightLoopBtn" class="pick" hidden></button>
     <button type="button" id="settingsBtn" class="pick settings-pick"></button>
     <button type="button" id="effortBtn" class="pick effort-pick"></button>
+    <button type="button" id="mcpBtn" class="pick mcp-pick"></button>
     <span class="spacer"></span>
     <span id="ctxMeter" class="meter" role="meter" aria-valuemin="0" aria-valuemax="100" hidden></span>
-    <button type="button" id="indexBtn" class="pick index" hidden></button>
-    <button type="button" id="attachBtn" class="action" title="Attach images. You can also paste or drop them into the input." aria-label="Attach images"><span class="codicon codicon-file-media" aria-hidden="true"></span></button>
     <button type="button" id="refineBtn" class="action" title="Refine: rewrite the prompt with the routed model (task-x.routing), else the active model. Ctrl+Z restores your text." aria-label="Refine prompt"><span class="codicon codicon-sparkle" aria-hidden="true"></span></button>
     <button type="button" id="send" class="action primary"></button>
   </div>

@@ -177,6 +177,30 @@ fn dispatch(msg: &Value, pending: &Pending) -> Option<Value> {
     }
 }
 
+/// Asks the user for what an MCP server requests (`elicitation/create`). Set once by the server
+/// loop; it sends `mcp/elicit` to the client and returns the MCP answer
+/// (`{ action: "accept" | "decline" | "cancel", content? }`).
+pub type Elicit = Arc<dyn Fn(String, Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>> + Send + Sync>;
+static ELICIT: std::sync::OnceLock<Elicit> = std::sync::OnceLock::new();
+
+pub fn set_elicit(f: Elicit) {
+    let _ = ELICIT.set(f);
+}
+
+/// A server request this client answers after asking the user (an elicitation). The reply is
+/// sent when the user answers; without a handler the server gets "decline".
+fn is_elicit(msg: &Value) -> bool {
+    msg.get("id").is_some() && msg["method"] == "elicitation/create"
+}
+
+async fn elicit_reply(server: &str, msg: &Value) -> Value {
+    let result = match ELICIT.get() {
+        Some(f) => f(server.to_owned(), msg["params"].clone()).await,
+        None => json!({ "action": "decline" }),
+    };
+    json!({ "jsonrpc": "2.0", "id": msg["id"], "result": result })
+}
+
 fn fail_all(pending: &Pending) {
     for (_, tx) in pending.lock().expect("pending lock").drain() {
         let _ = tx.send(Err(json!({ "message": "server exited" })));
@@ -197,6 +221,7 @@ type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, Value>>>>>;
 
 /// A streamable-HTTP server: each request is one POST; the answer is JSON or an event stream.
 struct HttpConn {
+    name: String,
     http: reqwest::Client,
     url: url::Url,
     headers: HeaderMap,
@@ -238,7 +263,14 @@ impl HttpConn {
         while let Some(chunk) = body.next().await {
             let chunk = chunk.map_err(|e| format!("reading from {}: {e}", self.url))?;
             for (_, data) in events.push(&chunk) {
-                if let Some(a) = serde_json::from_str::<Value>(&data).ok().and_then(|v| answer(&v, id)) {
+                let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
+                // The server asks the user something while it works on this request.
+                if is_elicit(&v) {
+                    let reply = elicit_reply(&self.name, &v).await;
+                    let _ = self.post(&reply).await;
+                    continue;
+                }
+                if let Some(a) = answer(&v, id) {
                     return a;
                 }
             }
@@ -271,7 +303,35 @@ pub struct Client {
     stderr: Arc<Mutex<String>>,
     timeout: Duration,
     pub tools: Vec<McpTool>,
+    /// Prompt templates and resources the server offers (shown in the chat's `/` and `#` menus).
+    pub prompts: Vec<McpPrompt>,
+    pub resources: Vec<McpResource>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPrompt {
+    pub server: String,
+    pub name: String,
+    pub description: String,
+    /// Argument names, required ones first.
+    pub arguments: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResource {
+    pub server: String,
+    pub uri: String,
+    pub name: String,
+    pub description: String,
+    pub mime_type: Option<String>,
+}
+
+const MAX_PROMPTS: usize = 100;
+const MAX_RESOURCES: usize = 200;
+/// Text of one prompt or resource given to the model.
+const MAX_ITEM_CHARS: usize = 60_000;
 
 impl Drop for Client {
     fn drop(&mut self) {
@@ -328,21 +388,33 @@ impl Client {
         let alive = Arc::new(AtomicBool::new(true));
         let stderr = Arc::new(Mutex::new(String::new()));
         let transport = match cfg.kind()? {
-            Kind::Stdio => Self::spawn_stdio(cfg, root, &pending, &alive, &stderr)?,
+            Kind::Stdio => Self::spawn_stdio(name, cfg, root, &pending, &alive, &stderr)?,
             Kind::Http => {
                 let (url, headers) = remote(cfg)?;
-                Transport::Http(HttpConn { http: http_client()?, url, headers, session: Mutex::new(None) })
+                Transport::Http(HttpConn { name: name.into(), http: http_client()?, url, headers, session: Mutex::new(None) })
             }
             Kind::Sse => {
                 let (url, headers) = remote(cfg)?;
-                Self::open_sse(url, headers, &pending, &alive).await?
+                Self::open_sse(name, url, headers, &pending, &alive).await?
             }
         };
         let timeout = Duration::from_millis(cfg.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1_000, 600_000));
-        Ok(Self { name: name.into(), transport, pending, next: AtomicI64::new(1), alive, stderr, timeout, tools: Vec::new() })
+        Ok(Self {
+            name: name.into(),
+            transport,
+            pending,
+            next: AtomicI64::new(1),
+            alive,
+            stderr,
+            timeout,
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            resources: Vec::new(),
+        })
     }
 
     fn spawn_stdio(
+        name: &str,
         cfg: &ServerConfig,
         root: Option<&Path>,
         pending: &Pending,
@@ -380,11 +452,22 @@ impl Client {
             });
         }
         let stdin = Arc::new(tokio::sync::Mutex::new(stdin));
-        let (reply_to, pending, alive) = (stdin.clone(), pending.clone(), alive.clone());
+        let (reply_to, pending, alive, server) = (stdin.clone(), pending.clone(), alive.clone(), name.to_owned());
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                // An elicitation waits for the user, so it is answered on its own task.
+                if is_elicit(&msg) {
+                    let (reply_to, server) = (reply_to.clone(), server.clone());
+                    tokio::spawn(async move {
+                        let resp = elicit_reply(&server, &msg).await;
+                        let mut w = reply_to.lock().await;
+                        let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
+                        let _ = w.flush().await;
+                    });
+                    continue;
+                }
                 if let Some(resp) = dispatch(&msg, &pending) {
                     let mut w = reply_to.lock().await;
                     let _ = w.write_all(format!("{resp}\n").as_bytes()).await;
@@ -397,7 +480,8 @@ impl Client {
         Ok(Transport::Stdio { stdin, _child: child })
     }
 
-    async fn open_sse(url: url::Url, headers: HeaderMap, pending: &Pending, alive: &Arc<AtomicBool>) -> Result<Transport, String> {
+    async fn open_sse(name: &str, url: url::Url, headers: HeaderMap, pending: &Pending, alive: &Arc<AtomicBool>) -> Result<Transport, String> {
+        let server = name.to_owned();
         let http = http_client()?;
         let resp = http
             .get(url.clone())
@@ -422,6 +506,16 @@ impl Client {
                         endpoint = url.join(data.trim()).ok().filter(|e| e.origin() == url.origin());
                         let _ = tx.send(endpoint.clone());
                     } else if let Ok(msg) = serde_json::from_str::<Value>(&data) {
+                        if is_elicit(&msg) {
+                            if let Some(ep) = endpoint.clone() {
+                                let (post, headers, server) = (post.clone(), post_headers.clone(), server.clone());
+                                tokio::spawn(async move {
+                                    let resp = elicit_reply(&server, &msg).await;
+                                    let _ = post.post(ep).headers(headers).json(&resp).send().await;
+                                });
+                            }
+                            continue;
+                        }
                         if let (Some(resp), Some(ep)) = (dispatch(&msg, &pending), endpoint.clone()) {
                             let _ = post.post(ep).headers(post_headers.clone()).json(&resp).send().await;
                         }
@@ -505,8 +599,11 @@ impl Client {
 
     pub async fn initialize(&mut self) -> Result<(), String> {
         let never = CancellationToken::new();
-        let init = json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": {}, "clientInfo": { "name": "task-x", "version": env!("CARGO_PKG_VERSION") } });
-        self.request("initialize", init, INIT_TIMEOUT, &never)
+        // Elicitation is offered only when there is a user to ask.
+        let caps = if ELICIT.get().is_some() { json!({ "elicitation": {} }) } else { json!({}) };
+        let init = json!({ "protocolVersion": PROTOCOL_VERSION, "capabilities": caps, "clientInfo": { "name": "task-x", "version": env!("CARGO_PKG_VERSION") } });
+        let info = self
+            .request("initialize", init, INIT_TIMEOUT, &never)
             .await
             .map_err(|e| format!("initialize failed: {e} {}", self.stderr_tail()))?;
         self.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await?;
@@ -533,7 +630,75 @@ impl Client {
                 break;
             }
         }
+        // Prompts and resources are extras: a server that fails to list them still works for its tools.
+        let has = |k: &str| info["capabilities"].get(k).is_some_and(|v| !v.is_null());
+        if has("prompts") {
+            if let Ok(r) = self.request("prompts/list", json!({}), INIT_TIMEOUT, &never).await {
+                for p in r["prompts"].as_array().into_iter().flatten().take(MAX_PROMPTS) {
+                    let Some(name) = p["name"].as_str() else { continue };
+                    let mut args: Vec<(bool, String)> = p["arguments"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|a| Some((a["required"].as_bool() != Some(true), a["name"].as_str()?.to_owned())))
+                        .collect();
+                    args.sort();
+                    self.prompts.push(McpPrompt {
+                        server: self.name.clone(),
+                        name: name.into(),
+                        description: p["description"].as_str().unwrap_or_default().chars().take(300).collect(),
+                        arguments: args.into_iter().map(|(_, n)| n).collect(),
+                    });
+                }
+            }
+        }
+        if has("resources") {
+            if let Ok(r) = self.request("resources/list", json!({}), INIT_TIMEOUT, &never).await {
+                for x in r["resources"].as_array().into_iter().flatten().take(MAX_RESOURCES) {
+                    let Some(uri) = x["uri"].as_str() else { continue };
+                    self.resources.push(McpResource {
+                        server: self.name.clone(),
+                        uri: uri.into(),
+                        name: x["name"].as_str().unwrap_or(uri).into(),
+                        description: x["description"].as_str().unwrap_or_default().chars().take(300).collect(),
+                        mime_type: x["mimeType"].as_str().map(str::to_owned),
+                    });
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// A prompt template filled with `arguments`, as one text (the messages joined by role).
+    pub async fn get_prompt(&self, name: &str, arguments: &serde_json::Map<String, Value>, cancel: &CancellationToken) -> Result<String, String> {
+        let r = self.request("prompts/get", json!({ "name": name, "arguments": arguments }), self.timeout, cancel).await?;
+        let text: Vec<String> = r["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| {
+                let c = &m["content"];
+                let t = match c["type"].as_str() {
+                    Some("text") => c["text"].as_str()?.to_owned(),
+                    Some("resource") => c["resource"]["text"].as_str()?.to_owned(),
+                    _ => return None,
+                };
+                Some(if m["role"] == "assistant" { format!("(assistant) {t}") } else { t })
+            })
+            .collect();
+        Ok(text.join("\n\n").chars().take(MAX_ITEM_CHARS).collect())
+    }
+
+    /// The text of a resource (binary contents are named, not included).
+    pub async fn read_resource(&self, uri: &str, cancel: &CancellationToken) -> Result<String, String> {
+        let r = self.request("resources/read", json!({ "uri": uri }), self.timeout, cancel).await?;
+        let text: Vec<String> = r["contents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| c["text"].as_str().map_or_else(|| format!("[{} content omitted]", c["mimeType"].as_str().unwrap_or("binary")), str::to_owned))
+            .collect();
+        Ok(text.join("\n").chars().take(MAX_ITEM_CHARS).collect())
     }
 
     pub async fn call(&self, tool: &McpTool, input: Value, cancel: &CancellationToken) -> Result<Value, String> {
@@ -619,6 +784,19 @@ impl Manager {
         t
     }
 
+    pub fn client(&self, server: &str) -> Option<Arc<Client>> {
+        self.clients.get(server).filter(|c| c.alive()).cloned()
+    }
+
+    /// Every running server's prompts and resources.
+    pub fn catalog(&self) -> Value {
+        let mut prompts: Vec<&McpPrompt> = self.clients.values().filter(|c| c.alive()).flat_map(|c| &c.prompts).collect();
+        let mut resources: Vec<&McpResource> = self.clients.values().filter(|c| c.alive()).flat_map(|c| &c.resources).collect();
+        prompts.sort_by(|a, b| (&a.server, &a.name).cmp(&(&b.server, &b.name)));
+        resources.sort_by(|a, b| (&a.server, &a.name).cmp(&(&b.server, &b.name)));
+        json!({ "prompts": prompts, "resources": resources })
+    }
+
     pub fn find(&self, qualified: &str) -> Option<(Arc<Client>, McpTool)> {
         self.clients.values().find_map(|c| c.tools.iter().find(|t| t.qualified == qualified).map(|t| (c.clone(), t.clone())))
     }
@@ -678,6 +856,46 @@ done
         assert!(c.call(&t, json!({}), &cancel).await.unwrap_err().contains("missing required field"));
         let st = m.status();
         assert!(st["servers"].as_array().unwrap().iter().any(|s| s["name"] == "broken" && s["error"].is_string()));
+    }
+
+    /// A server with prompts and resources, and a tool that asks the user (elicitation) before it answers.
+    const RICH: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{},"prompts":{},"resources":{}},"serverInfo":{"name":"r","version":"1"}}}\n' "$id" ;;
+    *'"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ask","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"prompts/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"prompts":[{"name":"review","description":"Review a file","arguments":[{"name":"style"},{"name":"file","required":true}]}]}}\n' "$id" ;;
+    *'"prompts/get"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"messages":[{"role":"user","content":{"type":"text","text":"Review main.rs"}}]}}\n' "$id" ;;
+    *'"resources/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"resources":[{"uri":"db://schema","name":"schema"}]}}\n' "$id" ;;
+    *'"resources/read"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"contents":[{"uri":"db://schema","text":"create table t"}]}}\n' "$id" ;;
+    *'"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":900,"method":"elicitation/create","params":{"message":"Name?","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}}}}}\n'
+      IFS= read -r reply
+      action=$(printf '%s' "$reply" | sed -n 's/.*"action":"\([a-z]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$action" ;;
+  esac
+done
+"#;
+
+    #[tokio::test]
+    async fn lists_prompts_and_resources_and_answers_elicitation() {
+        let mut m = Manager::default();
+        let mut cfgs = BTreeMap::new();
+        cfgs.insert("rich".into(), ServerConfig { command: "sh".into(), args: vec!["-c".into(), RICH.into()], timeout_ms: Some(5_000), ..Default::default() });
+        m.configure(cfgs, None).await;
+        let cat = m.catalog();
+        assert_eq!(cat["prompts"][0]["name"], "review");
+        assert_eq!(cat["prompts"][0]["arguments"], json!(["file", "style"]), "required arguments first");
+        assert_eq!(cat["resources"][0]["uri"], "db://schema");
+        let c = m.client("rich").unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(c.get_prompt("review", &serde_json::Map::new(), &cancel).await.unwrap(), "Review main.rs");
+        assert_eq!(c.read_resource("db://schema", &cancel).await.unwrap(), "create table t");
+        // The server's question is answered (by the user handler, or declined without one), and the call finishes.
+        let (c, t) = m.find("mcp__rich__ask").unwrap();
+        let action = c.call(&t, json!({}), &cancel).await.unwrap()["content"].as_str().unwrap().to_owned();
+        assert!(["accept", "decline", "cancel"].contains(&action.as_str()), "{action}");
     }
 
     #[test]

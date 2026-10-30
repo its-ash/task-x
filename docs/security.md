@@ -40,7 +40,7 @@ Only this configuration and your approvals control permissions. Instructions, sk
 - Each command has a fixed working folder, a timeout, and an output limit. The whole process group is killed on timeout or cancel.
 - **Long commands keep running beside the agent.** A `run_command` still running after 30 seconds is handed to the background: the model gets a note instead of blocking, the agent keeps working, and the output arrives as a message when the command ends. The task never finishes while one is still running. Pass `background: true` to skip the wait entirely. Builds, tests, installs, and fetches (`cargo build`, `npm install`, `pytest`, `go test`, `gradle`, `flutter build`, and the like) start in the background at once unless the call passes `background: false`. The Claude Code engine does the same: its Bash hook sets `run_in_background` on those commands, and in ask mode the call still needs approval.
 - A command's output is read until the pipe closes, or for at most two seconds after the command itself ends. A descendant that inherited the pipe (a detached daemon, a `head` in a pipeline that outlived its parent) therefore cannot leave a call stuck on "Running…".
-- **Sandbox** (always on):
+- **Sandbox** (on by default; the Sandbox switch in the chat settings, or `task-x.sandbox.enabled`, turns it off for both engines at once, with no restart. Off, commands can write anywhere the user can; the Safe edit mode then asks before each command, and the edit mode chip shows an open lock):
   - macOS: `sandbox-exec`. Linux: `bwrap`, when installed.
   - Commands can write only to the workspace, temp folders, and build caches (`~/.cargo`, `~/.npm`, `~/.cache`, …).
   - Reads and network stay allowed, so builds and dependency downloads work.

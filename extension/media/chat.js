@@ -3,7 +3,7 @@
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
   const log = $('log'), input = $('input'), send = $('send'), progress = $('progress');
-  const modelBtn = $('modelBtn'), settingsBtn = $('settingsBtn'), effortBtn = $('effortBtn');
+  const modelBtn = $('modelBtn'), settingsBtn = $('settingsBtn'), effortBtn = $('effortBtn'), mcpBtn = $('mcpBtn');
   const nightPlanBtn = $('nightPlanBtn'), nightLoopBtn = $('nightLoopBtn');
   const refineBtn = $('refineBtn');
 
@@ -350,6 +350,145 @@
     });
     document.querySelector('.effort-menu .effort-range')?.focus();
   });
+  // ---------- Tools chip: one card, sections on the left (MCP, Tools, Skills), their list on the right ----------
+  let mcpServers = null, toolList = null, capsMenu = null, capsTab = 'mcp';
+  const TOOL_GROUPS = [['read', 'Read and search'], ['write', 'Edit files'], ['delete', 'Delete'], ['execute', 'Run commands'], ['install', 'Install'], ['gitWrite', 'Git'], ['network', 'Web and browser'], ['external', 'Outside the project']];
+  const CAPS_TABS = [['mcp', 'plug', 'MCP'], ['tools', 'tools', 'Tools'], ['skills', 'symbol-event', 'Skills']];
+  // The chip: servers on, tools turned off, and red when a server fails.
+  function renderCapsChip() {
+    const servers = (mcpServers || []).filter((s) => s.enabled);
+    const bad = servers.filter((s) => s.error).length;
+    const off = (toolList || []).filter((t) => !t.on).length;
+    mcpBtn.dataset.state = bad ? 'bad' : off ? 'off' : servers.some((s) => s.running) ? 'ok' : 'idle';
+    const badges = [...(mcpServers ? [el('span', 'caps-badge', `${servers.length} MCP`)] : []), ...(off ? [el('span', 'caps-badge off', `−${off}`)] : [])];
+    mcpBtn.replaceChildren(icon('tools'), el('span', 'text', 'Tools'), ...badges, icon('chevron-down'));
+    mcpBtn.title = [`MCP servers: ${servers.length} on${bad ? `, ${bad} failing` : ''}`, off ? `${off} tool${off > 1 ? 's' : ''} off for these chats` : 'all tools on', 'Click for MCP servers, tools, and skills.'].join('. ');
+    mcpBtn.setAttribute('aria-label', mcpBtn.title);
+  }
+  const renderMcpChip = renderCapsChip, renderToolsChip = renderCapsChip;
+  function mcpPane(pane) {
+    const head = el('div', 'mp-head caps-head');
+    head.append(el('span', 'caps-title', 'MCP servers'));
+    const acts = el('span', 'mcp-head-tools');
+    acts.append(
+      button('action', icon('refresh'), () => { mcpServers = null; fillCaps(); vscode.postMessage({ type: 'mcpAction', action: 'reload' }); }, 'Reload: read Claude, its plugins, VS Code, and Copilot again'),
+      button('action', icon('add'), () => vscode.postMessage({ type: 'mcpAction', action: 'add' }), 'Add a server in task-x.mcpServers'),
+      button('action', icon('list-tree'), () => vscode.postMessage({ type: 'mcpAction', action: 'details' }), 'Show every server with its tools'),
+    );
+    head.append(acts);
+    pane.append(head);
+    if (!mcpServers) return void pane.append(el('div', 'menu-empty', 'Loading servers…'));
+    if (!mcpServers.length) return void pane.append(el('div', 'menu-empty', 'No MCP servers found in Claude Code, Claude Desktop, VS Code, Copilot CLI, or task-x.mcpServers.'));
+    // One group per place the servers came from.
+    const groups = new Map();
+    for (const s of mcpServers) groups.set(s.origin, [...(groups.get(s.origin) || []), s]);
+    for (const [origin, list] of groups) {
+      menuHeader(pane, origin);
+      for (const s of list) {
+        const st = !s.enabled ? 'Off' : s.error ? 'Failed' : s.running ? `${s.tools} tool${s.tools === 1 ? '' : 's'}` : 'Starting…';
+        toggleRow(pane, {
+          key: `mcp-${s.name}`, ic: s.error && s.enabled ? 'error' : 'server-process', title: s.name, on: s.enabled,
+          desc: s.enabled && s.error ? `${st}: ${s.error}` : st,
+          onToggle: (v) => { s.enabled = v; vscode.postMessage({ type: 'mcpAction', action: 'toggle', name: s.name, enable: v }); renderCapsChip(); fillCaps(); },
+        });
+        const row = pane.lastElementChild;
+        row.classList.add('mcp-row');
+        row.dataset.state = !s.enabled ? 'off' : s.error ? 'bad' : s.running ? 'ok' : 'idle';
+      }
+    }
+  }
+  function toolsPane(pane) {
+    const head = el('div', 'mp-head caps-head');
+    head.append(el('span', 'caps-title', 'Built-in tools for these chats'));
+    pane.append(head);
+    if (!toolList) return void pane.append(el('div', 'menu-empty', 'Loading tools…'));
+    for (const [perm, title] of TOOL_GROUPS) {
+      const list = toolList.filter((t) => t.permission === perm);
+      if (!list.length) continue;
+      menuHeader(pane, title);
+      for (const t of list) {
+        toggleRow(pane, {
+          key: `tool-${t.name}`, ic: 'symbol-method', title: t.name, desc: t.description, on: t.on,
+          onToggle: (v) => { t.on = v; vscode.postMessage({ type: 'toggleTool', name: t.name, on: v }); renderCapsChip(); fillCaps(); },
+        });
+        pane.lastElementChild.classList.add('tool-row');
+      }
+    }
+  }
+  // Skills: call one (puts /name in the input), or open its file.
+  function skillsPane(pane) {
+    const head = el('div', 'mp-head caps-head');
+    head.append(el('span', 'caps-title', 'Skills'));
+    const acts = el('span', 'mcp-head-tools');
+    acts.append(button('action', icon('add'), () => { capsMenu?.hidePopover(); vscode.postMessage({ type: 'slashAction', action: 'newSkill' }); }, 'New skill in .claude/skills'));
+    head.append(acts);
+    pane.append(head);
+    if (!skills) return void pane.append(el('div', 'menu-empty', 'Loading skills…'));
+    if (!skills.length) return void pane.append(el('div', 'menu-empty', 'No skills found. Add them under .github/skills, .claude/skills, or ~/.claude/skills.'));
+    for (const s of skills) {
+      const b = el('button', 'menu-item setting-row skill-row');
+      b.type = 'button';
+      b.dataset.key = `skill-${s.name}`;
+      const text = el('span', 'setting-text');
+      text.append(el('span', 'title', `/${s.name}`), el('span', 'desc', [s.source, s.description].filter(Boolean).join(' · ')));
+      const view = s.view != null ? button('action', icon('go-to-file'), (e) => { e.stopPropagation(); vscode.postMessage({ type: 'slashAction', action: 'view', key: s.view }); }, 'Open the skill file') : el('span');
+      b.append(icon('symbol-event', 'setting-icon'), text, view);
+      b.title = `Use /${s.name}`;
+      b.addEventListener('click', () => {
+        capsMenu?.hidePopover();
+        input.value = `/${s.name} ${input.value.replace(/^\/\S*\s*/, '')}`;
+        autosize();
+        input.focus();
+      });
+      pane.append(b);
+    }
+  }
+  function fillCaps() {
+    if (!capsMenu) return;
+    const menu = capsMenu;
+    const focus = document.activeElement?.dataset.key;
+    const scroll = menu.querySelector('.caps-pane')?.scrollTop ?? 0;
+    menu.replaceChildren();
+    const body = el('div', 'mp-body caps-body');
+    const side = el('div', 'mp-side');
+    side.setAttribute('role', 'tablist');
+    side.setAttribute('aria-label', 'Sections');
+    const count = { mcp: (mcpServers || []).filter((s) => s.enabled).length, tools: (toolList || []).filter((t) => t.on).length, skills: (skills || []).length };
+    for (const [key, ic, label] of CAPS_TABS) {
+      const t = button('mp-prov', [icon(ic), el('span', 'mp-name', label), el('span', 'mp-count', String(count[key] || ''))], () => { capsTab = key; fillCaps(); }, label);
+      t.setAttribute('role', 'tab');
+      t.dataset.key = `caps-${key}`;
+      t.setAttribute('aria-selected', String(key === capsTab));
+      side.append(t);
+    }
+    const pane = el('div', 'mp-list caps-pane');
+    pane.setAttribute('role', 'tabpanel');
+    ({ mcp: mcpPane, tools: toolsPane, skills: skillsPane })[capsTab](pane);
+    body.append(side, pane);
+    menu.append(body);
+    pane.scrollTop = scroll;
+    if (focus) menu.querySelector(`[data-key="${CSS.escape(focus)}"]`)?.focus();
+    menu.place?.();
+  }
+  const fillMcp = fillCaps, fillTools = fillCaps;
+  mcpBtn.setAttribute('aria-haspopup', 'dialog');
+  mcpBtn.addEventListener('click', () => {
+    openMenu(mcpBtn, (menu) => {
+      menu.classList.add('settings-menu', 'model-picker', 'caps-menu');
+      menu.setAttribute('role', 'dialog');
+      menu.setAttribute('aria-label', 'MCP servers, tools, and skills');
+      menu.addEventListener('toggle', (e) => { if (e.newState === 'closed' && capsMenu === menu) capsMenu = null; });
+      capsMenu = menu;
+      fillCaps();
+    });
+    capsMenu?.querySelector('[aria-selected="true"]')?.focus();
+    vscode.postMessage({ type: 'listMcp' });
+    vscode.postMessage({ type: 'listTools' });
+    vscode.postMessage({ type: 'listSkills' });
+  });
+  renderCapsChip();
+  vscode.postMessage({ type: 'listMcp' });
+  vscode.postMessage({ type: 'listTools' });
   let settingsMenu = null;
   function toggleRow(menu, { key, ic, title, desc, on, disabled, onToggle }) {
     const b = el('button', 'menu-item setting-row');
@@ -423,6 +562,13 @@
       key: 'commit', ic: 'git-commit', title: 'Auto-commit', on: state.autoCommit || state.night, disabled: state.night,
       desc: state.night ? 'Always on in Loop Mode: each todo item is committed.' : 'Commit the files each task changes when the task ends.',
       onToggle: (v) => { state.autoCommit = v; vscode.postMessage({ type: 'selectAutoCommit', enabled: v }); fillSettings(); },
+    });
+    toggleRow(menu, {
+      key: 'sandbox', ic: state.sandbox === false ? 'unlock' : 'lock', title: 'Sandbox', on: state.sandbox !== false,
+      desc: state.sandbox === false
+        ? 'Off: commands, scripts, and HTTP fetches (curl, wget) can write anywhere your user can. In Safe mode each command asks first.'
+        : 'Commands, scripts, and HTTP fetches (curl, wget) run in the OS sandbox: they write only in the project, temp folders, and build caches. Network stays on.',
+      onToggle: (v) => { state.sandbox = v; vscode.postMessage({ type: 'selectSandbox', enabled: v }); renderToolbar(); fillSettings(); },
     });
     // Redrawing keeps focus on the control the user was on.
     if (focus) menu.querySelector(`[data-key="${CSS.escape(focus)}"]`)?.focus();
@@ -790,6 +936,13 @@
         const body = el('div', 'request-text md');
         renderMarkdown(body, it.text);
         req.append(body, button('action copy-msg', icon('copy'), () => copyText(it.text), 'Copy message'));
+        // #11: put the files back as they were before this request (and the ones after it).
+        if (it.id) {
+          req.dataset.id = it.id;
+          const restore = button('action restore-msg', icon('discard'), () => vscode.postMessage({ type: 'restoreTo', id: it.id }), 'Restore to here: undo the edits of this request and every later one');
+          restore.hidden = !it.operations?.length;
+          req.append(restore);
+        }
         if (it.images) {
           const n = el('div', 'request-images');
           n.append(icon('file-media'), document.createTextNode(`${it.images} image${it.images > 1 ? 's' : ''} attached`));
@@ -1339,8 +1492,9 @@
     nightPlanBtn.disabled = nightLoopBtn.disabled = state.busy;
     const em = EDIT_MODES[state.editMode] ? state.editMode : 'auto';
     settingsBtn.dataset.mode = em;
-    settingsBtn.replaceChildren(icon(EDIT_MODES[em][0]), el('span', 'text', EDIT_MODES[em][1]), ...(state.night ? [el('span', 'pick-badge', 'Loop')] : []), icon('chevron-down'));
-    settingsBtn.title = `Edit mode: ${EDIT_MODES[em][1]}. ${EDIT_MODES[em][2]}${state.night ? ' Loop Mode is on.' : ''}${state.autoCommit || state.night ? ' Auto-commit is on.' : ''}`;
+    // An open lock on the chip says commands run without the sandbox.
+    settingsBtn.replaceChildren(icon(EDIT_MODES[em][0]), el('span', 'text', EDIT_MODES[em][1]), ...(state.night ? [el('span', 'pick-badge', 'Loop')] : []), ...(state.chatMode ? [el('span', 'pick-badge mode-badge', state.chatMode)] : []), ...(state.sandbox === false ? [icon('unlock', 'no-sandbox')] : []), icon('chevron-down'));
+    settingsBtn.title = `Edit mode: ${EDIT_MODES[em][1]}. ${EDIT_MODES[em][2]}${state.night ? ' Loop Mode is on.' : ''}${state.autoCommit || state.night ? ' Auto-commit is on.' : ''}${state.sandbox === false ? ' The sandbox is off.' : ''}${state.chatMode ? ` Chat mode: ${state.chatMode} (type / to change it).` : ''}`;
     settingsBtn.setAttribute('aria-label', `Chat settings. ${settingsBtn.title}`);
     const ef = EFFORTS[effortAt()];
     effortBtn.dataset.level = ef[0] || 'default';
@@ -1369,14 +1523,66 @@
 
   // ---------- Context chips: the active file and selection that go with the message ----------
   const ctxRow = $('ctx'), indexBtn = $('indexBtn');
+  // #7: the agent's plan, ticked off as it works. Collapses to one line; the open item shows first.
+  const todosBox = $('todos');
+  let todosOpen = true;
+  function renderTodos(list) {
+    todosBox.hidden = !list?.length;
+    if (!list?.length) return todosBox.replaceChildren();
+    const done = list.filter((t) => t.status === 'completed').length;
+    const now = list.find((t) => t.status === 'in_progress');
+    const head = button('todos-head', [icon(todosOpen ? 'chevron-down' : 'chevron-right'), icon('checklist', 'todos-icon'), el('span', 'todos-title', now ? now.content : done === list.length ? 'All steps done' : 'Plan'), el('span', 'todos-count', `${done}/${list.length}`)], () => { todosOpen = !todosOpen; renderTodos(list); }, todosOpen ? 'Hide the plan' : 'Show the plan');
+    head.setAttribute('aria-expanded', String(todosOpen));
+    const bar = el('div', 'todos-bar');
+    bar.style.setProperty('--done', `${(done / list.length) * 100}%`);
+    const items = el('ol', 'todos-list');
+    items.hidden = !todosOpen;
+    for (const t of list) {
+      const li = el('li', `todo ${t.status}`);
+      li.append(icon(t.status === 'completed' ? 'pass-filled' : t.status === 'in_progress' ? 'loading codicon-modifier-spin' : 'circle-large-outline'), el('span', null, t.content));
+      items.append(li);
+    }
+    todosBox.replaceChildren(head, bar, items);
+  }
   // Messages waiting for the running task; each one is sent when the one before it finishes.
   const queueBox = $('queue');
   // Steers the agent has not read yet come first (arrow), then queued messages (clock).
+  // Each waiting message can be edited in place (Enter saves, Escape cancels) or removed.
   function renderQueue(items, steering = []) {
-    const rows = [...steering.map((t) => ['arrow-right', t]), ...items.map((t) => ['clock', t])];
-    queueBox.replaceChildren(...rows.map(([name, t]) => {
-      const row = el('div', 'queued');
-      row.append(icon(name), el('span', null, t));
+    const rows = [...steering.map((t, i) => ['steer', i, t]), ...items.map((t, i) => ['queue', i, t])];
+    // A message being edited keeps its editor while the list redraws.
+    const editing = queueBox.querySelector('.queued.editing');
+    const keep = editing && rows.find(([k, i]) => k === editing.dataset.kind && String(i) === editing.dataset.index) ? editing : null;
+    queueBox.replaceChildren(...rows.map(([kind, i, t]) => {
+      if (keep && keep.dataset.kind === kind && keep.dataset.index === String(i)) return keep;
+      const row = el('div', `queued is-${kind}`);
+      row.dataset.kind = kind;
+      row.dataset.index = String(i);
+      const save = (text) => vscode.postMessage({ type: 'editWaiting', kind, index: i, text });
+      const text = el('span', 'queued-text', t);
+      const edit = () => {
+        row.classList.add('editing');
+        const box = el('textarea', 'queued-edit');
+        box.value = t;
+        box.rows = Math.min(6, t.split('\n').length);
+        box.setAttribute('aria-label', kind === 'steer' ? 'Edit the message for the running task' : 'Edit the queued message');
+        const done = (ok) => { row.classList.remove('editing'); if (ok && box.value.trim() !== t) save(box.value); else renderQueue(items, steering); };
+        box.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); done(true); }
+          else if (e.key === 'Escape') { e.preventDefault(); done(false); }
+        });
+        box.addEventListener('blur', () => { if (row.classList.contains('editing')) done(true); });
+        text.replaceWith(box);
+        tools.replaceChildren(button('action', icon('check'), () => done(true), 'Save'), button('action', icon('close'), () => done(false), 'Cancel'));
+        tools.querySelectorAll('button').forEach((b) => b.addEventListener('mousedown', (e) => e.preventDefault()));
+        box.focus();
+        box.setSelectionRange(box.value.length, box.value.length);
+      };
+      const tools = el('span', 'queued-tools');
+      tools.append(button('action', icon('edit'), edit, 'Edit message'), button('action', icon('trash'), () => save(''), kind === 'steer' ? 'Remove: the task will not read it' : 'Remove from the queue'));
+      row.append(icon(kind === 'steer' ? 'arrow-right' : 'clock'), text, tools);
+      row.title = kind === 'steer' ? 'The running task reads this at its next step. Edit or remove it until then.' : 'Sent when the running task finishes.';
+      text.addEventListener('dblclick', edit);
       return row;
     }));
     queueBox.hidden = !rows.length;
@@ -1393,7 +1599,7 @@
     const toggle = button('ctx-toggle', icon(m.include ? 'eye' : 'eye-closed'), () => vscode.postMessage({ type: 'toggleEditor', include: !m.include }), m.include ? 'Do not send the current file' : 'Send the current file');
     toggle.setAttribute('aria-pressed', String(m.include));
     chip.append(toggle);
-    ctxRow.append(chip, el('span', 'ctx-hint', 'Type @ to add files or folders'));
+    ctxRow.append(chip, el('span', 'ctx-hint', 'Type @ for files, # for problems, changes, terminal'));
   }
   const fmtCount = (n) => (n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
   function renderIndex() {
@@ -1621,10 +1827,10 @@
     scroll(true);
   });
 
-  // ---------- Images: paste, drop, or pick them; they go with the next message ----------
+  // ---------- Images: paste or drop them into the input; they go with the next message ----------
   const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
   const MAX_IMAGES = 8, MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-  const attachList = $('attachments'), attachFile = $('attachFile');
+  const attachList = $('attachments');
   let attachments = []; // { mediaType, data, name }
   let attachHint = null;
   function renderAttachments() {
@@ -1673,8 +1879,6 @@
     e.preventDefault();
     attachFiles(files);
   });
-  $('attachBtn').addEventListener('click', () => attachFile.click());
-  attachFile.addEventListener('change', () => { attachFiles([...attachFile.files]); attachFile.value = ''; });
   send.addEventListener('click', () => (state.busy ? vscode.postMessage({ type: 'cancel' }) : $('form').requestSubmit()));
   // Refine: the host rewrites the prompt with the routed model; the input stays locked until the answer comes.
   let refining = false;
@@ -1740,12 +1944,21 @@
   // ---------- Slash menu: "/" at the start of the input lists skills ----------
   const slash = $('slash');
   const MAX_SLASH = 50;
-  let skills = null, agents = [], plugins = [], slashItems = [], slashActive = 0, slashOpen = false;
+  let skills = null, agents = [], plugins = [], modes = [], mcpPrompts = [], mcpResources = [], slashItems = [], slashActive = 0, slashOpen = false;
   input.setAttribute('aria-autocomplete', 'list');
   input.setAttribute('aria-controls', 'slash');
   const slashQuery = () => /^\/([\w.:-]*)$/.exec(input.value.slice(0, input.selectionStart))?.[1];
   // "@" at a word start opens the file menu; the query is what follows it, up to the caret.
   const atMatch = () => /(^|\s)@([\w./-]*)$/.exec(input.value.slice(0, input.selectionStart));
+  // "#" at a word start opens the context menu (#9): problems, git changes, selection, terminal, codebase.
+  const hashMatch = () => /(^|\s)#([\w:.-]*)$/.exec(input.value.slice(0, input.selectionStart));
+  const HASH_ITEMS = [
+    { name: 'problems', ic: 'warning', description: 'Errors and warnings in the Problems panel' },
+    { name: 'changes', ic: 'git-compare', description: 'The uncommitted git changes (the diff)' },
+    { name: 'selection', ic: 'selection', description: 'The text selected in the editor' },
+    { name: 'terminal', ic: 'terminal', description: 'The last terminal command and its output' },
+    { name: 'codebase', ic: 'search', description: 'Search the whole project before answering' },
+  ];
   let menuKind = 'skill', fileItems = null, fileQuery = null;
   function closeSlash() {
     slashOpen = false;
@@ -1757,6 +1970,18 @@
   function acceptSlash(i = slashActive) {
     const s = slashItems[i];
     if (!s) return;
+    if (menuKind === 'hash') {
+      const m = hashMatch();
+      const at = m ? input.selectionStart - m[2].length : input.selectionStart;
+      const after = input.value.slice(input.selectionStart);
+      input.value = input.value.slice(0, at) + s.name + ' ' + after;
+      const end = at + s.name.length + 1;
+      input.setSelectionRange(end, end);
+      closeSlash();
+      autosize();
+      input.focus();
+      return;
+    }
     if (menuKind === 'file') {
       const m = atMatch();
       const at = m ? input.selectionStart - m[2].length : input.selectionStart;
@@ -1774,6 +1999,8 @@
     }
     if (s.kind === 'action') { closeSlash(); input.value = ''; autosize(); return void vscode.postMessage({ type: 'slashAction', action: s.action }); }
     if (s.kind === 'plugin') return void vscode.postMessage({ type: 'slashAction', action: 'viewPlugin', key: s.id });
+    if (s.kind === 'mcpPrompt') { closeSlash(); input.value = ''; autosize(); return void vscode.postMessage({ type: 'slashAction', action: 'mcpPrompt', key: s.key }); }
+    if (s.kind === 'mode') { closeSlash(); input.value = ''; autosize(); return void vscode.postMessage({ type: 'slashAction', action: 'mode', key: s.mode }); }
     const rest = input.value.slice(input.selectionStart).replace(/^\S*/, '').trimStart();
     // An agent is called by name in the message; a skill by its slash command.
     const lead = s.kind === 'agent' ? `Use the ${s.name} agent to ` : `/${s.name} `;
@@ -1821,9 +2048,37 @@
     input.setAttribute('aria-expanded', 'true');
     markActive();
   }
+  function renderHash(q) {
+    menuKind = 'hash';
+    slash.setAttribute('aria-label', 'Context');
+    const ql = q.toLowerCase();
+    // MCP resources (#15) come after the built-in items; they insert `#mcp:<server>:<uri>`.
+    const res = mcpResources.filter((r) => !ql || r.name.toLowerCase().includes(ql)).slice(0, 30).map((r) => ({ name: r.token, label: r.name, ic: 'database', description: r.description }));
+    slashItems = [...HASH_ITEMS.filter((h) => h.name.startsWith(ql)), ...res];
+    slashActive = Math.min(slashActive, Math.max(0, slashItems.length - 1));
+    slash.replaceChildren(el('div', 'slash-group', 'Add context'));
+    if (!slashItems.length) return closeSlash();
+    slashItems.forEach((s, i) => {
+      const o = el('div', 'slash-item hash-item');
+      o.id = `slash-${i}`;
+      o.setAttribute('role', 'option');
+      const head = el('div', 'slash-head');
+      head.append(icon(s.ic, 'slash-icon'), el('span', 'slash-name', `#${s.label ?? s.name}`), el('span', 'slash-params', s.description));
+      o.append(head);
+      o.addEventListener('mousedown', (e) => { e.preventDefault(); acceptSlash(i); });
+      o.addEventListener('mousemove', () => { if (slashActive !== i) { slashActive = i; markActive(); } });
+      slash.append(o);
+    });
+    slashOpen = true;
+    slash.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+    markActive();
+  }
   function renderSlash() {
     const at = atMatch();
     if (at) return renderFiles(at[2]);
+    const hash = hashMatch();
+    if (hash) return renderHash(hash[2]);
     menuKind = 'skill';
     slash.setAttribute('aria-label', 'Skills, agents, and plugins');
     const q = slashQuery();
@@ -1843,6 +2098,8 @@
     const groups = [
       ['Skills', match((skills || []).map((s) => ({ ...s, kind: 'skill' })), (s) => s.name)],
       ['Agents', match(agents.map((a) => ({ ...a, kind: 'agent' })), (a) => a.name)],
+      ['MCP prompts', match(mcpPrompts.map((p) => ({ ...p, kind: 'mcpPrompt', ic: 'comment-discussion' })), (p) => p.name)],
+      ['Modes', modes.length ? match([{ kind: 'mode', mode: '', name: 'Default mode', description: 'No custom mode instructions', ic: state.chatMode ? 'circle-large-outline' : 'pass-filled' }, ...modes.map((md) => ({ ...md, kind: 'mode', mode: md.name, ic: md.active ? 'pass-filled' : 'circle-large-outline' }))], (md) => md.name) : []],
       ['Plugins', match(plugins.map((p) => ({ ...p, kind: 'plugin', name: p.id, description: `${p.version ? `v${p.version} · ` : ''}${p.enabled ? 'enabled' : 'disabled'}` })), (p) => p.id)],
       ['Add', match(ACTIONS, (a) => a.name)],
     ].map(([title, list]) => [title, list.slice(0, MAX_SLASH)]).filter(([, list]) => list.length);
@@ -1851,7 +2108,7 @@
     slash.replaceChildren();
     if (!skills) slash.append(el('div', 'slash-empty', 'Loading skills, agents, and plugins…'));
     else if (!slashItems.length) slash.append(el('div', 'slash-empty', `Nothing matches "/${q}".`));
-    const ICONS = { skill: 'symbol-event', agent: 'hubot', plugin: 'extensions' };
+    const ICONS = { skill: 'symbol-event', agent: 'hubot', plugin: 'extensions', mode: 'circle-large-outline' };
     let i = 0;
     for (const [title, list] of groups) {
       slash.append(el('div', 'slash-group', title));
@@ -1962,7 +2219,7 @@
         scroll(true);
         break;
       case 'status':
-        state = { ...state, busy: m.busy, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker, refineModel: 'refineModel' in m ? m.refineModel : state.refineModel, helperModel: 'helperModel' in m ? m.helperModel : state.helperModel, effort: 'effort' in m ? m.effort : state.effort };
+        state = { ...state, busy: m.busy, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker, refineModel: 'refineModel' in m ? m.refineModel : state.refineModel, helperModel: 'helperModel' in m ? m.helperModel : state.helperModel, effort: 'effort' in m ? m.effort : state.effort, sandbox: m.sandbox ?? state.sandbox, chatMode: 'chatMode' in m ? m.chatMode : state.chatMode };
         renderToolbar();
         fillSettings();
         break;
@@ -2006,11 +2263,39 @@
         }
         break;
       }
+      case 'todos':
+        renderTodos(m.todos);
+        break;
+      case 'setInput':
+        // An MCP prompt's text, to read and edit before sending.
+        input.value = String(m.text ?? '').slice(0, 100_000);
+        autosize();
+        input.focus();
+        break;
+      case 'tools':
+        toolList = m.tools;
+        renderToolsChip();
+        fillTools();
+        break;
+      case 'restorable': {
+        const b = log.querySelector(`.request[data-id="${CSS.escape(m.id)}"] .restore-msg`);
+        if (b) b.hidden = false;
+        break;
+      }
+      case 'mcp':
+        mcpServers = m.servers;
+        renderMcpChip();
+        fillMcp();
+        break;
       case 'skills':
         skills = m.skills;
         agents = m.agents || [];
         plugins = m.plugins || [];
+        modes = m.modes || [];
+        mcpPrompts = m.mcpPrompts || [];
+        mcpResources = m.mcpResources || [];
         if (slashOpen) renderSlash();
+        fillCaps();
         break;
       case 'files':
         if (m.query === fileQuery) { fileItems = m.items; if (slashOpen && menuKind === 'file') renderFiles(m.query); }

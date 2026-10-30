@@ -75,6 +75,10 @@ export interface WindowChoice {
   helperModel?: NightModel;
   /** Reasoning effort for every model; unset is each model's default. */
   effort?: Effort;
+  /** The custom chat mode in use (a `.chatmode.md` name); unset is the default mode. */
+  chatMode?: string;
+  /** Tools and MCP servers turned off for this window's chats (the tools chip). */
+  offTools?: string[];
 }
 export interface NightModel {
   kind: string;
@@ -96,9 +100,15 @@ export async function setWindowChoice(patch: WindowChoice): Promise<void> {
 }
 
 export const chosenEngine = (): string | undefined => choice.engine;
+export const windowChoice = (): Readonly<WindowChoice> => choice;
 export const chosenClaudeModel = (): string | undefined => choice.claudeModel;
 export const nightModels = (): { planner?: NightModel; worker?: NightModel } => ({ planner: choice.nightPlanner, worker: choice.nightWorker });
 export const toolModels = (): { refine?: NightModel; helper?: NightModel } => ({ refine: choice.refineModel, helper: choice.helperModel });
+/** `task-x.sandbox.enabled`: commands run in the OS sandbox (default on). */
+export const sandboxOn = (): boolean => cfg().get<boolean>('sandbox.enabled', true) !== false;
+export async function setSandbox(on: boolean): Promise<void> {
+  await cfg().update('sandbox.enabled', on, vscode.ConfigurationTarget.Global);
+}
 export const effort = (): Effort | undefined => (EFFORTS.includes(choice.effort as Effort) ? choice.effort : undefined);
 
 async function updateCustom(fn: (list: CustomProvider[]) => CustomProvider[]): Promise<void> {

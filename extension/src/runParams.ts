@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { editMode, effort, isProviderRef, providerConfig, providerConfigWith, settings, SECTION, toolModels } from './config.js';
+import { editMode, effort, isProviderRef, providerConfig, providerConfigWith, settings, SECTION, toolModels, windowChoice } from './config.js';
 import { type ChatMode, type EditorContext, type ImageInput, type PolicyConfig, type PriceRule, type ProviderConfig, ROLES, type Role } from './protocol.js';
 
 const TASK_KINDS = ['question', 'bugInvestigation', 'codeModification', 'newFeature', 'refactoring', 'testing', 'documentation', 'repositoryWide', 'architecture'];
@@ -22,7 +22,9 @@ export function policy(): PolicyConfig {
   const strings = (k: string) => cfg().get<string[]>(k, []).filter((x) => typeof x === 'string');
   const em = editMode();
   // allowAll keeps MCP tools offered in read-only chat modes when nothing asks.
-  return { mode: 'autonomous', allow: strings('agent.allowTools'), deny: strings('agent.denyTools'), allowAll: em === 'auto', editMode: em };
+  // Tools turned off in the chat's Tools chip are refused like `agent.denyTools`.
+  const off = (windowChoice().offTools ?? []).filter((t) => /^[\w.-]{1,64}$/.test(t));
+  return { mode: 'autonomous', allow: strings('agent.allowTools'), deny: [...new Set([...strings('agent.denyTools'), ...off])], allowAll: em === 'auto', editMode: em };
 }
 
 export function limits() {

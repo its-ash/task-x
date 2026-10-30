@@ -8,6 +8,7 @@ pub mod fs;
 pub mod git;
 pub mod logs;
 pub mod memory;
+pub mod todos;
 pub mod patch;
 pub mod search;
 pub mod shell_search;
@@ -601,6 +602,7 @@ pub fn registry() -> &'static [ToolDef] {
             validate::tools(),
             logs::tools(),
             memory::tools(),
+            todos::tools(),
             web::tools(),
             browser::tools(),
         ]

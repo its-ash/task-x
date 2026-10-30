@@ -172,6 +172,10 @@ body[data-view="history"] #log, body[data-view="history"] #changes, body[data-vi
 .request .copy-msg { color: inherit; }
 .message .copy-msg { top: -2px; background: var(--vscode-sideBar-background); }
 .request:hover .copy-msg, .message:hover .copy-msg, .copy-msg:focus-visible { opacity: 1; }
+.restore-msg { position: absolute; top: 30px; right: 4px; opacity: 0; color: inherit; transition: opacity var(--md-duration-short4) ease; }
+.restore-msg[hidden] { display: none; }
+.request:hover .restore-msg, .restore-msg:focus-visible { opacity: 1; }
+.restore-msg:hover { color: var(--bad); }
 .md { line-height: 1.6; word-break: break-word; }
 .md p { margin: 0 0 8px; white-space: pre-wrap; }
 .md p:last-child { margin-bottom: 0; }
@@ -573,11 +577,40 @@ textarea::placeholder { color: var(--on-surface-variant); }
 .effort-ticks .on { opacity: 1; color: var(--accent); }
 .effort-desc { font-size: 11.5px; line-height: 1.45; color: var(--on-surface-variant); }
 @media (forced-colors: active) { .effort-range { border: 1px solid ButtonText; background: Canvas; } .effort-range::-webkit-slider-thumb { background: Highlight; box-shadow: none; } }
+/* Tools chip and card: MCP servers, built-in tools, and skills; sections left, list right. */
+.pick.mcp-pick[data-state=off] > .codicon:first-child { color: var(--warn); }
+.caps-badge { padding: 0 6px; border-radius: 999px; font-size: 10px; font-weight: 700; line-height: 16px; color: var(--on-accent-container); background: var(--accent-container); }
+.caps-badge.off { color: var(--md-ext-on-amber, #000); background: var(--warn); }
+.menu.caps-menu { width: min(620px, calc(100vw - 8px)); }
+.caps-body { min-height: 280px; }
+.caps-pane { max-height: min(60vh, 460px); overflow-y: auto; padding-right: 2px; }
+.caps-head { justify-content: space-between; min-height: 30px; margin-bottom: 2px; }
+.caps-title { font-weight: 600; color: var(--on-surface); }
+.skill-row .title { font-family: var(--mono); font-size: 12px; }
+.skill-row .desc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-row .title { font-family: var(--mono); font-size: 12px; }
+.tool-row .desc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-row[aria-checked=false] .title { opacity: .6; }
+/* MCP chip: green plug when servers run, red when one fails; its popover groups servers by source. */
+.pick.mcp-pick { flex: none; gap: 5px; }
+.pick.mcp-pick > .codicon:first-child { color: var(--on-surface-variant); }
+.pick.mcp-pick[data-state=ok] > .codicon:first-child { color: var(--ok); }
+.pick.mcp-pick[data-state=bad] > .codicon:first-child { color: var(--bad); }
+.menu.mcp-menu { width: min(340px, calc(100vw - 8px)); max-height: min(70vh, 520px); overflow-y: auto; }
+.mcp-menu .settings-head { justify-content: flex-start; }
+.mcp-head-tools { display: flex; gap: 2px; margin-left: auto; }
+.mcp-head-tools .action { width: 24px; height: 24px; min-width: 0; padding: 0; border-radius: 50%; }
+.mcp-row .setting-icon { color: var(--on-surface-variant); }
+.mcp-row[data-state=ok] .setting-icon { color: var(--ok); }
+.mcp-row[data-state=bad] .setting-icon, .mcp-row[data-state=bad] .desc { color: var(--bad); }
+.mcp-row[data-state=off] .title { opacity: .6; }
+.mcp-row .desc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Toolbar chip for the settings: its colour shows the edit mode. */
 .pick.settings-pick { flex: none; gap: 5px; }
 .pick.settings-pick > .codicon:first-child { color: var(--accent); }
 .pick.settings-pick[data-mode=safe] > .codicon:first-child { color: var(--ok); }
 .pick.settings-pick[data-mode=ask] > .codicon:first-child { color: var(--warn); }
+.pick.settings-pick .no-sandbox { color: var(--warn); }
 .pick-badge { padding: 0 6px; border-radius: 999px; font-size: 10px; font-weight: 700; line-height: 16px; color: var(--on-accent-container); background: var(--accent-container); }
 .menu.searchable { display: flex; flex-direction: column; overflow: hidden; min-width: 240px; }
 .menu.searchable:not(:popover-open) { display: none; }
@@ -720,12 +753,43 @@ textarea::placeholder { color: var(--on-surface-variant); }
 .steer { display: flex; gap: 6px; align-items: flex-start; margin: 8px 0; padding: 6px 10px; font-size: 12px; color: var(--on-surface); border-radius: var(--radius); background: var(--surface-high); }
 .steer > .codicon { margin-top: 2px; color: var(--accent); }
 .steer-text { min-width: 0; white-space: pre-wrap; word-break: break-word; }
-/* Queued messages wait above the input, as plain rows. */
-.queue { display: flex; flex-direction: column; gap: 4px; padding: 0 4px 6px; }
+/* The agent's plan: a filled card with a progress bar; items tick off as the agent works. */
+.todos { margin: 0 4px 8px; padding: 4px 6px 6px; border-radius: 14px; background: var(--surface-high); }
+.todos[hidden] { display: none; }
+.todos-head { display: flex; align-items: center; gap: 6px; width: 100%; padding: 4px; border: 0; border-radius: 10px; font-size: 12px; text-align: left; color: var(--on-surface); background: none; cursor: pointer; }
+.todos-head:hover { background: color-mix(in srgb, var(--fg) var(--md-state-hover), transparent); }
+.todos-icon { color: var(--accent); }
+.todos-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.todos-count { flex: none; padding: 0 7px; border-radius: 999px; font-size: 10.5px; font-weight: 700; line-height: 17px; color: var(--on-accent-container); background: var(--accent-container); }
+.todos-bar { height: 4px; margin: 2px 4px 4px; border-radius: 999px; background: linear-gradient(to right, var(--ok) var(--done, 0%), color-mix(in srgb, var(--fg) 10%, transparent) var(--done, 0%)); }
+.todos-list { display: grid; gap: 2px; max-height: 30vh; margin: 0; padding: 0 4px; overflow-y: auto; list-style: none; }
+.todos-list[hidden] { display: none; }
+.todo { display: flex; align-items: flex-start; gap: 8px; padding: 3px 4px; font-size: 12px; line-height: 1.45; color: var(--on-surface); }
+.todo .codicon { flex: none; margin-top: 2px; font-size: 13px; color: var(--on-surface-variant); }
+.todo.in_progress { font-weight: 600; }
+.todo.in_progress .codicon { color: var(--accent); }
+.todo.completed { color: var(--on-surface-variant); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--fg) 40%, transparent); }
+.todo.completed .codicon { color: var(--ok); }
+/* Messages that wait above the input: steers for the running task, then queued messages. */
+.queue { display: flex; flex-direction: column; gap: 6px; padding: 2px 4px 8px; }
 .queue[hidden] { display: none; }
-.queued { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 12px; color: var(--on-surface-variant); }
-.queued .codicon { font-size: 13px; flex: none; }
-.queued span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Waiting messages: filled chips. Steers (for the running task) use the accent tint, queued ones a neutral fill. */
+.queued { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 32px; padding: 4px 4px 4px 6px; border-radius: 16px; font-size: 12px; color: var(--on-surface); background: var(--surface-high); transition: background-color var(--md-duration-short4) ease, box-shadow var(--md-duration-short4) ease; }
+.queued.is-steer { color: var(--on-accent-container); background: var(--accent-container); }
+.queued:hover { box-shadow: 0 1px 3px var(--shadow); }
+.queued > .codicon:first-child { display: grid; place-items: center; flex: none; width: 22px; height: 22px; border-radius: 50%; font-size: 12px; color: var(--on-accent); background: var(--accent); }
+.queued.is-queue > .codicon:first-child { color: var(--on-surface-variant); background: color-mix(in srgb, var(--fg) 10%, transparent); }
+.queued .queued-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: text; }
+.queued-tools { display: flex; flex: none; gap: 4px; }
+.queued-tools .action:has(.codicon-trash):hover { color: var(--bad); background: color-mix(in srgb, var(--bad) 16%, transparent); }
+.queued-tools .action { display: grid; place-items: center; width: 24px; height: 24px; min-width: 0; padding: 0; border: 0; border-radius: 50%; color: inherit; background: color-mix(in srgb, var(--fg) 8%, transparent); }
+.queued-tools .action:hover { background: color-mix(in srgb, var(--fg) 16%, transparent); }
+.queued-tools .action:has(.codicon-check) { color: var(--on-accent); background: var(--accent); }
+.queued.editing { align-items: flex-start; padding: 6px; border-radius: 14px; box-shadow: 0 2px 8px var(--shadow); }
+.queued.editing > .codicon:first-child { margin-top: 3px; }
+.queued-edit { flex: 1; min-width: 0; min-height: 28px; padding: 5px 10px; border: 0; border-radius: 10px; font: inherit; font-size: 12px; line-height: 1.45; color: var(--on-surface); background: var(--surface); resize: vertical; }
+.queued-edit:focus-visible { outline: none; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 50%, transparent); }
+@media (forced-colors: active) { .queued { border: 1px solid CanvasText; } }
 /* Model picker: providers on the left, their models on the right */
 .menu.model-picker { width: min(760px, calc(100vw - 8px)); max-width: none; }
 .mp-body { display: grid; grid-template-columns: minmax(104px, 26%) minmax(0, 1fr); flex: 1 1 auto; min-height: 0; }

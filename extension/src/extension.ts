@@ -6,9 +6,13 @@ import { parseFindings } from './findings.js';
 import { GraphPanel } from './graphView.js';
 import { claudeSignIn, claudeSignOut } from './claudeCode.js';
 import { LogView, levelOf } from './logView.js';
-import { runtimeMcpServers } from './mcpSources.js';
+import { runtimeMcpServers, setExtensionServers } from './mcpSources.js';
+import { type LmToolsHost, lmToolsServer, startLmToolsHost } from './lmToolsMcp.js';
+import { plugins } from './catalog.js';
+import { InlineReview } from './inlineReview.js';
+import { registerVscodeFeatures } from './vscodeFeatures.js';
 import { registerEditorCommands } from './editorCommands.js';
-import { SECTION, type ProviderRef, activeRef, deleteApiKey, hasApiKey, initChoice, isProviderRef, migrateSettings, modelFor, providerConfig, providerRefs, refLabel, refNeedsKey, setProvider, settings, storeApiKey } from './config.js';
+import { SECTION, type ProviderRef, activeRef, deleteApiKey, hasApiKey, initChoice, isProviderRef, migrateSettings, modelFor, providerConfig, providerRefs, refLabel, refNeedsKey, sandboxOn, setProvider, settings, storeApiKey } from './config.js';
 import { ProviderDialog } from './providerDialog.js';
 import type { TestReport } from './protocol.js';
 import type { JsonRpcClient } from './rpc.js';
@@ -43,6 +47,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const version = String(ctx.extension.packageJSON.version ?? '0.0.0');
   const sync = new WorkspaceSync(out);
   // Extensions (hooks, MCP) load after the workspace so `.anvil/*.json` can be read when trusted.
+  let lmHost: LmToolsHost | undefined;
   const configureExtensions = async (rt: RuntimeProcess) => {
     const c = vscode.workspace.getConfiguration(SECTION);
     const workspaceTrusted = vscode.workspace.isTrusted;
@@ -53,6 +58,17 @@ export function activate(ctx: vscode.ExtensionContext): void {
       vscode.window.showErrorMessage(`task-x hooks: ${describeError(e)}`);
     }
     try {
+      // #14: other extensions' language-model tools, as the `vscode` MCP server.
+      if (!lmHost) {
+        lmHost = await startLmToolsHost((l) => out.warn(l)).catch((e) => {
+          out.warn(`VS Code tools server not started: ${describeError(e)}`);
+          return undefined;
+        });
+        if (lmHost) ctx.subscriptions.push(lmHost);
+      }
+      setExtensionServers(lmToolsServer(lmHost));
+      // Refreshes the MCP servers of installed Claude Code plugins (empty without the CLI).
+      await plugins();
       const { servers, notes } = runtimeMcpServers(ctx);
       for (const n of notes) out.info(`MCP import: ${n}`);
       const m = await rt.client.request<{ servers: { name: string; running: boolean; tools: string[]; error?: string }[] }>('mcp/configure', { servers, workspaceTrusted });
@@ -86,8 +102,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
         vscodeBrowser: browserHost && { url: browserHost.url, token: browserHost.token },
         clientVersion: version,
         dataDir: ctx.globalStorageUri.fsPath,
-        // Commands always run in the OS sandbox: writes stay inside the workspace.
-        sandbox: true,
+        // Commands run in the OS sandbox unless the user turned it off: writes stay inside the workspace.
+        sandbox: sandboxOn(),
         cdpEndpoint: settings().cdpEndpoint || process.env.TASK_X_CDP_ENDPOINT,
         log: (l) => {
           raw.info(l);
@@ -114,12 +130,21 @@ export function activate(ctx: vscode.ExtensionContext): void {
   chat.onBusyChange = (busy) => bg.setChatBusy(busy);
   // Review findings (an anvil-findings block in the answer) appear in the Problems panel.
   const findings = vscode.languages.createDiagnosticCollection('task-x-review');
+  // #4: the pending edits inside the editor, with Keep / Undo per file and Undo per change.
+  const review = new InlineReview({ keep: (rel) => chat.settle('keep', [rel]), undoFile: (rel) => chat.settle('revert', [rel]), diff: (rel) => chat.diffFile(rel) });
+  chat.onPending = (files) => review.update(files);
+  ctx.subscriptions.push(review);
+  // #5, #6, #8, #13, #16, #17: quick fixes, commit messages, terminal, tests, review comments, GitHub.
+  const features = registerVscodeFeatures(ctx, chat, client);
+  ctx.subscriptions.push(...features.disposables);
   chat.onSummary = (s) => {
     const root = WorkspaceSync.root();
     if (!root || !s.text.includes('```anvil-findings')) return;
     findings.clear();
     const byFile = new Map<string, vscode.Diagnostic[]>();
-    for (const f of parseFindings(s.text)) {
+    const found = parseFindings(s.text);
+    features.showFindings(root, found);
+    for (const f of found) {
       const sev = { error: vscode.DiagnosticSeverity.Error, warning: vscode.DiagnosticSeverity.Warning, info: vscode.DiagnosticSeverity.Information }[f.severity];
       const d = new vscode.Diagnostic(new vscode.Range(f.line - 1, 0, f.line - 1, Number.MAX_SAFE_INTEGER), f.message, sev);
       d.source = 'task-x review';
@@ -329,6 +354,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
       w.onDidDelete(again);
       return w;
     })(),
+    // Reads every MCP source again (Claude, its plugins, VS Code, Copilot CLI) and restarts the servers.
+    vscode.commands.registerCommand('task-x.reloadMcp', async () => configureExtensions(await ensureRuntime())),
     vscode.commands.registerCommand('task-x.mcpStatus', async () => {
       try {
         const rt = await ensureRuntime();
@@ -408,9 +435,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
         if (e.affectsConfiguration(`${SECTION}.customProviders`) || providerRefs().some((k) => e.affectsConfiguration(`${SECTION}.${k}.baseUrl`))) chat.invalidateModels();
         refresh();
       }
+      // The sandbox switch applies to the next command at once, without a restart.
+      if (e.affectsConfiguration('task-x.sandbox.enabled') && runtime) void runtime.client.request('config/sandbox', { enabled: sandboxOn() }).catch((err) => out.warn(`config/sandbox failed: ${describeError(err)}`));
       if (e.affectsConfiguration('task-x.runtimePath') && runtime) void restartRuntime();
       else if (e.affectsConfiguration('task-x.index.exclude') && runtime) void openWorkspace(runtime);
-      else if (['task-x.mcpServers', 'task-x.mcp.import', 'task-x.hooks', 'mcp.servers'].some((k) => e.affectsConfiguration(k)) && runtime) void configureExtensions(runtime);
+      else if (['task-x.mcpServers', 'task-x.mcp.import', 'task-x.mcp.disabled', 'task-x.hooks', 'mcp.servers'].some((k) => e.affectsConfiguration(k)) && runtime) void configureExtensions(runtime);
     }),
     ctx.secrets.onDidChange(() => {
       chat.invalidateModels();

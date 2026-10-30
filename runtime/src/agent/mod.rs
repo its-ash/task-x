@@ -43,6 +43,9 @@ const VALIDATION_TOOLS: &[&str] = &["run_tests", "check_build", "run_linter", "f
 /// and its output arrives as a message. Long typechecks, builds, and installs would otherwise block
 /// every other tool call for minutes while the chat shows only "Running…".
 const COMMAND_HANDOFF: Duration = Duration::from_secs(30);
+/// How often a reply with no text and no tool call is answered with `EMPTY_ANSWER_NUDGE`.
+const MAX_EMPTY_ANSWERS: u32 = 2;
+const EMPTY_ANSWER_NUDGE: &str = "Your last reply had no text. Write your answer to the request now, as plain text in your reply (not only in your reasoning). If you need more information, call a tool.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -533,6 +536,7 @@ const CORE_TOOLS: &[&str] = &[
     "git_diff",
     "read_log",
     "remember",
+    "todo_write",
 ];
 const FIND_TOOL: &str = "find_tool";
 const SUMMARIZE: &str = "summarize_file";
@@ -1974,6 +1978,8 @@ impl Run {
     async fn run(mut self) -> TaskRecord {
         let deadline = Duration::from_secs(self.limits.deadline_secs.clamp(10, 24 * 3600));
         let mut failed_rounds = 0;
+        // Final replies with no text and no tool call (a model that put the whole answer in its thinking).
+        let mut empty_answers = 0;
         self.rec.status = Status::Running;
         self.save();
         let status = loop {
@@ -2022,6 +2028,23 @@ impl Run {
                 // A message that arrived during this model turn gets one more step instead of ending the task.
                 if self.take_steers() {
                     continue;
+                }
+                // An empty reply is not an answer: ask for one, and after that a summary without tools,
+                // so the task never ends with nothing to show.
+                if out.text.trim().is_empty() {
+                    empty_answers += 1;
+                    if empty_answers <= MAX_EMPTY_ANSWERS {
+                        self.emit(json!({ "type": "warning", "message": "The model replied with no text. task-x asks it for the answer." }));
+                        self.rec.messages.push(Message { role: Role::User, content: vec![ContentPart::Text { text: EMPTY_ANSWER_NUDGE.into() }] });
+                        continue;
+                    }
+                    self.rec.final_text.clear();
+                    self.synthesize("The model gave no answer.").await;
+                    if self.rec.final_text.is_empty() {
+                        self.rec.error = Some("the model ended without an answer: its replies had no text".into());
+                    }
+                    self.save();
+                    break Status::Completed;
                 }
                 // The task ends only after its background commands: their output can change what to do next.
                 if self.background.running.load(std::sync::atomic::Ordering::SeqCst) > 0 {
@@ -2129,6 +2152,24 @@ pub fn steer(steers: &Steers, task_id: &str, text: &str) -> Result<bool, String>
         }
         _ => false,
     })
+}
+
+/// Changes a message still waiting for a running task (`agent/editSteer`): the first one equal to `old`
+/// gets `text`, or is removed when `text` is empty. Returns `false` when the task already read it.
+pub fn edit_steer(steers: &Steers, task_id: &str, old: &str, text: &str) -> Result<bool, String> {
+    let text = text.trim();
+    if text.chars().count() > MAX_STEER_CHARS {
+        return Err(format!("steering text must be at most {MAX_STEER_CHARS} characters"));
+    }
+    let mut map = steers.lock().expect("steers lock");
+    let Some(queue) = map.get_mut(task_id) else { return Ok(false) };
+    let Some(i) = queue.iter().position(|s| s == old.trim()) else { return Ok(false) };
+    if text.is_empty() {
+        queue.remove(i);
+    } else {
+        queue[i] = text.to_owned();
+    }
+    Ok(true)
 }
 
 /// Builds a task (prompt enrichment, tools, skills, hooks, record) without running the loop.
@@ -2743,6 +2784,18 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(reqs[1]["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").count(), 2);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_waiting_steer_can_be_edited_or_removed_until_it_is_read() {
+        let steers = Steers::default();
+        steers.lock().unwrap().insert("t".into(), Vec::new());
+        assert!(steer(&steers, "t", "add a test").unwrap() && steer(&steers, "t", "and docs").unwrap());
+        assert!(edit_steer(&steers, "t", "add a test", "add two tests").unwrap());
+        assert!(edit_steer(&steers, "t", "and docs", "  ").unwrap(), "empty text removes it");
+        assert_eq!(steers.lock().unwrap()["t"], ["add two tests"]);
+        assert!(!edit_steer(&steers, "t", "and docs", "x").unwrap(), "a message already gone cannot change");
+        assert!(!edit_steer(&steers, "other", "add two tests", "x").unwrap());
     }
 
     #[tokio::test]
@@ -3645,6 +3698,27 @@ mod tests {
         let r = run(host(&root, ApprovalDecision::Allow, Arc::default()), p, CancellationToken::new()).await.unwrap();
         assert_eq!(r.status, Status::MaxIterations);
         assert_eq!(r.iterations, 2);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A model that ends with an empty reply (its answer only in its reasoning) is asked again, so the
+    /// task does not end with nothing to show.
+    #[tokio::test]
+    async fn an_empty_final_reply_is_asked_again() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        let (base, seen) = mock(vec![sse_text(""), sse_text("Here are the missing features.")]);
+        let r = run(host(&root, ApprovalDecision::Allow, Arc::default()), params(&base, ChatMode::Agent, Mode::AskBeforeEdit), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(r.status, Status::Completed);
+        assert_eq!(r.final_text, "Here are the missing features.");
+        assert!(seen.lock().unwrap()[1]["messages"].to_string().contains("Your last reply had no text"));
+
+        let (base, _) = mock(vec![sse_text(""), sse_text(""), sse_text(""), sse_text("Summary of the work.")]);
+        let r = run(host(&root, ApprovalDecision::Allow, Arc::default()), params(&base, ChatMode::Agent, Mode::AskBeforeEdit), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!((r.status, r.final_text.as_str()), (Status::Completed, "Summary of the work."), "after the nudges, a summary without tools");
         std::fs::remove_dir_all(root).ok();
     }
 }
