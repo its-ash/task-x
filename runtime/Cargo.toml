@@ -23,6 +23,7 @@ tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 regex = "1"
+ring = "0.17"
 reqwest = { version = "0.13", features = ["json", "stream"] }
 similar = "3"
 serde = { version = "1", features = ["derive"] }

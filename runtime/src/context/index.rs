@@ -131,6 +131,75 @@ pub const SECRET_PATTERNS: &[&str] = &[
 pub const HIDDEN_DIRS_INDEXED: &[&str] =
     &[".github", ".vscode", ".devcontainer", ".claude", ".task-x", ".anvil", ".storybook", ".changeset", ".husky"];
 
+/// Folder names that hold dependencies or build output in every project that has them.
+const BUILD_DIR_NAMES: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "coverage",
+    "bower_components",
+    "jspm_packages",
+    "storybook-static",
+    "__pycache__",
+    "__generated__",
+    "_nuxt",
+    "_next",
+    "_astro",
+    "venv",
+];
+/// Most skipped folders listed in the stats; the count stays exact.
+const MAX_SKIPPED_DIRS: usize = 200;
+
+/// A folder the index does not walk into, and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedDir {
+    pub path: String,
+    pub reason: String,
+}
+
+/// Why `dir` is build output, dependencies, or a cache; `None` for a source folder.
+/// The checks use the folder's name, the marker files that tools write into their output,
+/// and the `outDir` of a `tsconfig.json` next to it.
+pub fn build_dir_reason(dir: &Path) -> Option<String> {
+    let name = dir.file_name()?.to_str()?;
+    if BUILD_DIR_NAMES.contains(&name) {
+        return Some(format!("'{name}' holds build output or dependencies"));
+    }
+    const MARKERS: &[(&str, &str)] = &[
+        ("CACHEDIR.TAG", "cache folder (CACHEDIR.TAG)"),
+        (".rustc_info.json", "Rust build output"),
+        ("CMakeCache.txt", "CMake build folder"),
+        ("pyvenv.cfg", "Python virtual environment"),
+        ("conda-meta", "Conda environment"),
+        (".nojekyll", "generated static site"),
+        ("_nuxt", "generated Nuxt site"),
+        ("_next", "generated Next.js site"),
+        ("_astro", "generated Astro site"),
+        ("asset-manifest.json", "generated web bundle"),
+        (".vite", "Vite build output"),
+    ];
+    if let Some((_, why)) = MARKERS.iter().find(|(m, _)| dir.join(m).exists()) {
+        return Some((*why).to_owned());
+    }
+    if name.ends_with(".egg-info") {
+        return Some("Python package metadata".into());
+    }
+    let parent = dir.parent()?;
+    let tsconfig = std::fs::read_to_string(parent.join("tsconfig.json")).ok()?;
+    let out = tsconfig_out_dir(&tsconfig)?;
+    (parent.join(&out).components().eq(dir.components())).then(|| format!("TypeScript outDir ('{out}' in tsconfig.json)"))
+}
+
+/// The `compilerOptions.outDir` of a tsconfig, which may hold comments, as a clean relative path.
+fn tsconfig_out_dir(text: &str) -> Option<String> {
+    let at = text.find("\"outDir\"")? + "\"outDir\"".len();
+    let rest = text[at..].trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let out = rest[..rest.find('"')?].trim_start_matches("./").trim_end_matches('/');
+    (!out.is_empty() && out != "." && !out.split('/').any(|p| p == "..")).then(|| out.to_owned())
+}
+
 /// True for a directory name the index walks into (the root is always walked).
 fn hidden_dir_indexed(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_none_or(|n| !n.starts_with('.') || HIDDEN_DIRS_INDEXED.contains(&n))
@@ -189,6 +258,9 @@ pub struct IndexStats {
     pub skipped_generated: usize,
     pub reparsed: usize,
     pub truncated: bool,
+    /// Build, dependency, and cache folders found by `build_dir_reason`, not walked.
+    pub skipped_dirs: Vec<SkippedDir>,
+    pub skipped_dir_count: usize,
 }
 
 pub struct Index {
@@ -199,7 +271,13 @@ pub struct Index {
     /// symbol name → (file, symbol); rebuilt after each update.
     defs: HashMap<String, Vec<(String, Symbol)>>,
     stats: IndexStats,
+    /// Walked folders ("" is the root) and their modification time: a new or deleted entry
+    /// changes the folder's time, which is how `scan` finds new files without a full walk.
+    dirs: BTreeMap<String, Option<SystemTime>>,
 }
+
+/// New folders one `scan` walks; a bigger burst (a checkout, an install) waits for the next refresh.
+const MAX_SCAN_NEW_DIRS: usize = 2_000;
 
 /// Converts an absolute path below `root` into a normalized `/`-separated relative path.
 pub fn relative(root: &Path, path: &Path) -> Option<String> {
@@ -233,7 +311,56 @@ impl Index {
             files: BTreeMap::new(),
             defs: HashMap::new(),
             stats: IndexStats::default(),
+            dirs: BTreeMap::new(),
         })
+    }
+
+    /// The paths that changed since the last refresh or scan, found cheaply: one `stat` per known
+    /// file and folder, and a listing only of folders whose time moved (new or deleted entries).
+    /// New folders are walked. Give the result to `update`.
+    pub fn scan(&mut self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for f in self.files.values() {
+            let abs = self.root.join(&f.rel);
+            match std::fs::metadata(&abs) {
+                Ok(m) if m.len() == f.size && m.modified().ok() == f.mtime => {}
+                _ => out.push(abs),
+            }
+        }
+        let mut todo: Vec<String> = Vec::new();
+        for (rel, old) in self.dirs.iter_mut() {
+            let abs = if rel.is_empty() { self.root.clone() } else { self.root.join(rel) };
+            let now = std::fs::metadata(&abs).ok().and_then(|m| m.modified().ok());
+            if now != *old {
+                *old = now;
+                todo.push(rel.clone());
+            }
+        }
+        let mut seen_dirs = 0;
+        while let Some(rel) = todo.pop() {
+            let abs = if rel.is_empty() { self.root.clone() } else { self.root.join(&rel) };
+            let Ok(entries) = std::fs::read_dir(&abs) else { continue };
+            for e in entries.flatten() {
+                let Some(child) = relative(&self.root, &e.path()) else { continue };
+                let Ok(ty) = e.file_type() else { continue };
+                if ty.is_dir() {
+                    if self.dirs.contains_key(&child) || !hidden_dir_indexed(&e.file_name()) || build_dir_reason(&e.path()).is_some() || self.is_excluded(&format!("{child}/")) {
+                        continue;
+                    }
+                    seen_dirs += 1;
+                    if seen_dirs > MAX_SCAN_NEW_DIRS {
+                        break;
+                    }
+                    self.dirs.insert(child.clone(), e.metadata().ok().and_then(|m| m.modified().ok()));
+                    todo.push(child);
+                } else if ty.is_file() && !self.files.contains_key(&child) && !self.is_excluded(&child) {
+                    out.push(e.path());
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     pub fn root(&self) -> &Path {
@@ -264,7 +391,8 @@ impl Index {
         self.excludes.is_match(rel)
     }
 
-    fn walker(&self) -> ignore::Walk {
+    fn walker(&self, skipped: Arc<std::sync::Mutex<Vec<SkippedDir>>>) -> ignore::Walk {
+        let root = self.root.clone();
         WalkBuilder::new(&self.root)
             .hidden(false)
             .git_ignore(true)
@@ -276,7 +404,19 @@ impl Index {
             .follow_links(false)
             // Prune hidden directories before descending: `.pnpm-store` and `.nuxt` hold tens of
             // thousands of files that are only in the way.
-            .filter_entry(|e| e.depth() == 0 || !e.file_type().is_some_and(|t| t.is_dir()) || hidden_dir_indexed(e.file_name()))
+            .filter_entry(move |e| {
+                if e.depth() == 0 || !e.file_type().is_some_and(|t| t.is_dir()) {
+                    return true;
+                }
+                if !hidden_dir_indexed(e.file_name()) {
+                    return false;
+                }
+                let Some(reason) = build_dir_reason(e.path()) else { return true };
+                if let Some(path) = relative(&root, e.path()) {
+                    skipped.lock().expect("skipped dirs lock").push(SkippedDir { path, reason });
+                }
+                false
+            })
             .build()
     }
 
@@ -290,7 +430,14 @@ impl Index {
         let mut old = std::mem::take(&mut self.files);
         let mut stats = IndexStats::default();
         let mut budget = MAX_TOTAL_CONTENT_BYTES;
-        for entry in self.walker().flatten() {
+        let skipped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.dirs.clear();
+        for entry in self.walker(skipped.clone()).flatten() {
+            if entry.file_type().is_some_and(|t| t.is_dir()) {
+                let rel = relative(&self.root, entry.path()).unwrap_or_default();
+                self.dirs.insert(rel, entry.metadata().ok().and_then(|m| m.modified().ok()));
+                continue;
+            }
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -317,7 +464,33 @@ impl Index {
             }
         }
         progress(self.files.len(), stats.reparsed);
+        let mut dirs = std::mem::take(&mut *skipped.lock().expect("skipped dirs lock"));
+        dirs.sort_by(|a, b| a.path.cmp(&b.path));
+        stats.skipped_dir_count = dirs.len();
+        dirs.truncate(MAX_SKIPPED_DIRS);
+        stats.skipped_dirs = dirs;
         self.finish(stats);
+    }
+
+    /// True when a folder on the path from the root to `abs` is build output. A folder found
+    /// now (a build ran after the scan) is added to the skipped list.
+    fn in_build_dir(&self, rel: &str, stats: &mut IndexStats) -> bool {
+        if stats.skipped_dirs.iter().any(|d| rel.strip_prefix(d.path.as_str()).is_some_and(|r| r.starts_with('/'))) {
+            return true;
+        }
+        let parts: Vec<&str> = rel.split('/').collect();
+        let mut dir = self.root.clone();
+        for (i, part) in parts[..parts.len().saturating_sub(1)].iter().enumerate() {
+            dir.push(part);
+            if let Some(reason) = build_dir_reason(&dir) {
+                stats.skipped_dir_count += 1;
+                if stats.skipped_dirs.len() < MAX_SKIPPED_DIRS {
+                    stats.skipped_dirs.push(SkippedDir { path: parts[..=i].join("/"), reason });
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// Incremental update for changed, created, or deleted paths (absolute or root-relative).
@@ -332,7 +505,7 @@ impl Index {
             let prev = self.files.remove(&rel);
             budget += prev.as_ref().and_then(|p| p.content.as_ref()).map_or(0, |c| c.len() as u64);
             changed += 1;
-            if !abs.is_file() || self.is_excluded(&rel) || in_hidden_dir(&rel) || self.is_gitignored(&abs) {
+            if !abs.is_file() || self.is_excluded(&rel) || in_hidden_dir(&rel) || self.in_build_dir(&rel, &mut stats) || self.is_gitignored(&abs) {
                 continue;
             }
             if let Some(e) = self.load(&rel, &abs, prev, &mut budget, &mut stats) {
@@ -503,6 +676,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn finds_build_folders_by_markers_and_lists_them() {
+        let root = temp_repo(&[
+            ("src/app.ts", "export const a = 1;\n"),
+            ("tsconfig.json", "{\n  // comment\n  \"compilerOptions\": { \"outDir\": \"./lib\" }\n}\n"),
+            ("lib/app.js", "exports.a = 1;\n"),
+            ("site/.nojekyll", ""),
+            ("site/index.js", "function page() {}\n"),
+            ("rs-out/CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55\n"),
+            ("rs-out/debug/x.rs", "fn gen() {}\n"),
+            ("env/pyvenv.cfg", "home = /usr/bin\n"),
+            ("env/lib/site.py", "def x(): pass\n"),
+        ]);
+        let mut ix = Index::new(root.clone(), &[]).unwrap();
+        ix.refresh();
+        let files: Vec<&str> = ix.files().map(|f| f.rel.as_str()).collect();
+        assert_eq!(files, ["src/app.ts", "tsconfig.json"], "{files:?}");
+        let dirs: Vec<&str> = ix.stats().skipped_dirs.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(dirs, ["env", "lib", "rs-out", "site"]);
+        assert_eq!(ix.stats().skipped_dir_count, 4);
+
+        // A build that runs after the scan: its new folder is found on the change notice.
+        fs::create_dir_all(root.join("gen")).unwrap();
+        fs::write(root.join("gen/CMakeCache.txt"), "x").unwrap();
+        fs::write(root.join("gen/main.c"), "int main() {}\n").unwrap();
+        ix.update(&["gen/main.c".into(), "lib/app.js".into()]);
+        assert!(ix.get("gen/main.c").is_none() && ix.get("lib/app.js").is_none());
+        assert!(ix.stats().skipped_dirs.iter().any(|d| d.path == "gen"));
+        assert_eq!(tsconfig_out_dir(r#"{"outDir": "../x"}"#), None, "never a folder outside the project");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn indexes_text_and_symbols_while_skipping_ignored_and_binary() {
         let root = temp_repo(&[
             (".gitignore", "generated/\n"),
@@ -522,6 +727,32 @@ pub(crate) mod tests {
         assert!(!names.iter().any(|n| n.starts_with("generated") || n.starts_with("node_modules") || n.starts_with("custom")));
         assert!(idx.get("img.bin").unwrap().content.is_none());
         assert_eq!(idx.definitions("alpha")[0].0, "src/lib.rs");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scan_finds_edits_new_files_new_folders_and_deletions() {
+        let root = temp_repo(&[(".gitignore", "tmp/\n"), ("a.py", "def one():\n    pass\n"), ("src/b.ts", "export const b = 1;\n")]);
+        let mut idx = Index::new(root.clone(), &[]).unwrap();
+        idx.refresh();
+        assert!(idx.scan().is_empty(), "nothing changed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(root.join("a.py"), "def two():\n    pass\n").unwrap();
+        fs::write(root.join("src/c.ts"), "export const c = 1;\n").unwrap();
+        fs::create_dir_all(root.join("lib/deep")).unwrap();
+        fs::write(root.join("lib/deep/d.rs"), "pub fn delta() {}\n").unwrap();
+        fs::create_dir_all(root.join("tmp")).unwrap();
+        fs::write(root.join("tmp/e.ts"), "x").unwrap();
+        fs::remove_file(root.join("src/b.ts")).unwrap();
+        let found: Vec<String> = idx.scan().iter().filter_map(|p| relative(&root, p)).collect();
+        for p in ["a.py", "src/b.ts", "src/c.ts", "lib/deep/d.rs"] {
+            assert!(found.iter().any(|f| f == p), "{p} in {found:?}");
+        }
+        let abs: Vec<PathBuf> = found.iter().map(|f| root.join(f)).collect();
+        idx.update(&abs);
+        assert_eq!(idx.definitions("delta").len(), 1);
+        assert!(idx.get("src/b.ts").is_none() && idx.get("tmp/e.ts").is_none(), "deleted and ignored files are out");
+        assert!(idx.scan().is_empty(), "a second scan finds nothing new");
         fs::remove_dir_all(root).ok();
     }
 

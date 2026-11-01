@@ -1,3 +1,4 @@
+import path from 'node:path';
 import * as vscode from 'vscode';
 import { BackgroundTasks } from './background.js';
 import { ChatViewProvider, ORIGINAL_SCHEME, OriginalContent, describeError } from './chatView.js';
@@ -8,14 +9,15 @@ import { claudeSignIn, claudeSignOut } from './claudeCode.js';
 import { LogView, levelOf } from './logView.js';
 import { runtimeMcpServers, setExtensionServers } from './mcpSources.js';
 import { type LmToolsHost, lmToolsServer, startLmToolsHost } from './lmToolsMcp.js';
-import { plugins } from './catalog.js';
+import { addMarketplace, installPlugin, plugins, setLocalPluginMcp } from './catalog.js';
+import { type McpServerStatus, signIn, signOut, wireMcpAuth, withTokens } from './mcpAuth.js';
 import { InlineReview } from './inlineReview.js';
 import { registerVscodeFeatures } from './vscodeFeatures.js';
 import { addDocs, removeDocs } from './docs.js';
 import { registerEditorCommands } from './editorCommands.js';
 import { SECTION, type ProviderRef, activeRef, deleteApiKey, hasApiKey, initChoice, isProviderRef, migrateSettings, modelFor, providerConfig, providerRefs, refLabel, refNeedsKey, sandboxOn, setProvider, settings, storeApiKey } from './config.js';
 import { ProviderDialog } from './providerDialog.js';
-import type { TestReport } from './protocol.js';
+import type { PluginInfo, TestReport } from './protocol.js';
 import type { JsonRpcClient } from './rpc.js';
 import { RuntimeProcess, findRuntime } from './runtime.js';
 import { DEFAULT_CDP_ENDPOINT, findBrowser, launchBrowser, normalizeCdpEndpoint } from './browserBridge.js';
@@ -53,10 +55,24 @@ export function activate(ctx: vscode.ExtensionContext): void {
     const c = vscode.workspace.getConfiguration(SECTION);
     const workspaceTrusted = vscode.workspace.isTrusted;
     try {
-      const h = await rt.client.request<{ hooks: number; workspaceHooks: number }>('config/hooks', { hooks: c.get('hooks', []), workspaceTrusted });
+      // Only the user's own hooks may approve a call; hooks from workspace settings run but never grant.
+      const ins = c.inspect<unknown[]>('hooks');
+      const own = ins?.globalValue ?? [];
+      const fromWorkspace = [...(ins?.workspaceValue ?? []), ...(ins?.workspaceFolderValue ?? [])];
+      const h = await rt.client.request<{ hooks: number; workspaceHooks: number }>('config/hooks', { hooks: own, workspaceSettingHooks: fromWorkspace, workspaceTrusted });
       if (h.hooks) out.info(`hooks: ${h.hooks} (${h.workspaceHooks} from .anvil/hooks.json)`);
     } catch (e) {
       vscode.window.showErrorMessage(`task-x hooks: ${describeError(e)}`);
+    }
+    try {
+      // Plugin folders from settings (absolute paths only) and the plugins turned off.
+      const dirs = c.get<string[]>('plugins.dirs', []).filter((d) => typeof d === 'string' && path.isAbsolute(d));
+      const disabled = c.get<string[]>('plugins.disabled', []).filter((d) => typeof d === 'string' && /^[\w.@-]{1,128}$/.test(d));
+      const pl = await rt.client.request<{ plugins: number; enabled: number }>('plugins/configure', { dirs, disabled, workspaceTrusted });
+      if (pl.plugins) out.info(`plugins: ${pl.enabled} of ${pl.plugins} enabled`);
+      setLocalPluginMcp(await rt.client.request<PluginInfo[]>('plugins/list'), workspaceTrusted);
+    } catch (e) {
+      out.warn(`plugins/configure failed: ${describeError(e)}`);
     }
     try {
       // #14: other extensions' language-model tools, as the `vscode` MCP server.
@@ -70,10 +86,17 @@ export function activate(ctx: vscode.ExtensionContext): void {
       setExtensionServers(lmToolsServer(lmHost));
       // Refreshes the MCP servers of installed Claude Code plugins (empty without the CLI).
       await plugins();
-      const { servers, notes } = runtimeMcpServers(ctx);
+      const { servers: found, notes } = runtimeMcpServers(ctx);
       for (const n of notes) out.info(`MCP import: ${n}`);
-      const m = await rt.client.request<{ servers: { name: string; running: boolean; tools: string[]; error?: string }[] }>('mcp/configure', { servers, workspaceTrusted });
+      // Remote servers get the tokens of earlier OAuth sign-ins (kept in SecretStorage).
+      wireMcpAuth(rt.client, ctx.secrets, (m) => out.info(m));
+      const servers = await withTokens(found as Record<string, { url?: string }>, ctx.secrets);
+      const m = await rt.client.request<{ servers: McpServerStatus[] }>('mcp/configure', { servers, workspaceTrusted });
       for (const sv of m.servers) sv.error ? out.warn(`MCP ${sv.name}: ${sv.error}`) : out.info(`MCP ${sv.name}: ${sv.tools.length} tools`);
+      const locked = m.servers.filter((s) => s.authRequired).map((s) => s.name);
+      if (locked.length) {
+        void vscode.window.showWarningMessage(`task-x: ${locked.join(', ')} ${locked.length > 1 ? 'need' : 'needs'} sign-in.`, 'Sign In').then((pick) => pick && signIn(rt.client, locked.length === 1 ? locked[0] : undefined));
+      }
     } catch (e) {
       vscode.window.showErrorMessage(`task-x MCP: ${describeError(e)}`);
     }
@@ -87,7 +110,10 @@ export function activate(ctx: vscode.ExtensionContext): void {
       })
       .finally(() => configureExtensions(rt));
 
+  // The last time anything used the runtime; an idle runtime is stopped (see below).
+  let lastUse = Date.now();
   const ensureRuntime = (): Promise<RuntimeProcess> => {
+    lastUse = Date.now();
     if (runtime?.running) return Promise.resolve(runtime);
     starting ??= (async () => {
       const bin = findRuntime(ctx.extensionPath, settings().runtimePath);
@@ -128,7 +154,22 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const chat = new ChatViewProvider(ctx, client, () => ProviderDialog.show(ctx, client), originals, (level, msg) => logs.add(level, 'agent', msg));
   const bg = new BackgroundTasks(ctx.secrets, client, chat, (level, msg) => logs.add(level, 'agent', msg));
   chat.foreignApproval = (req) => bg.approve(req);
-  chat.onBusyChange = (busy) => bg.setChatBusy(busy);
+  chat.onBusyChange = (busy) => {
+    lastUse = Date.now();
+    bg.setChatBusy(busy);
+  };
+  // task-x.runtime.idleStopMinutes: with no task, Loop Mode wait, or call for that long, the runtime
+  // stops (and with it its MCP servers and model sessions); the next request starts it again.
+  const idleCheck = setInterval(() => {
+    const mins = vscode.workspace.getConfiguration(SECTION).get<number>('runtime.idleStopMinutes', 30);
+    if (!runtime?.running || chat.busy || chat.loopPending || bg.busy) return void (lastUse = Date.now());
+    if (!(typeof mins === 'number' && mins > 0) || Date.now() - lastUse < mins * 60_000) return;
+    out.info(`runtime idle for ${mins} min: stopping it (task-x.runtime.idleStopMinutes); the next request starts it again`);
+    const rt = runtime;
+    runtime = undefined;
+    void rt.stop();
+  }, 60_000);
+  ctx.subscriptions.push({ dispose: () => clearInterval(idleCheck) });
   // Review findings (an anvil-findings block in the answer) appear in the Problems panel.
   const findings = vscode.languages.createDiagnosticCollection('task-x-review');
   // #4: the pending edits inside the editor, with Keep / Undo per file and Undo per change.
@@ -285,7 +326,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   };
 
   const restartRuntime = async () => {
-    chat.cancel();
+    chat.cancelAll();
     await runtime?.stop();
     runtime = undefined;
     try {
@@ -370,6 +411,31 @@ export function activate(ctx: vscode.ExtensionContext): void {
         vscode.window.showErrorMessage(`task-x: ${describeError(e)}`);
       }
     }),
+    vscode.commands.registerCommand('task-x.mcpSignIn', async (server?: unknown) => signIn((await ensureRuntime()).client, typeof server === 'string' ? server : undefined)),
+    vscode.commands.registerCommand('task-x.mcpSignOut', async (server?: unknown) => {
+      const rt = await ensureRuntime();
+      await signOut(rt.client, ctx.secrets, () => configureExtensions(rt), typeof server === 'string' ? server : undefined);
+    }),
+    vscode.commands.registerCommand('task-x.installPlugin', async () => {
+      const rt = await ensureRuntime();
+      // A new plugin can bring MCP servers and hooks: the runtime reads them again.
+      if (await installPlugin(rt.client, WorkspaceSync.root())) await configureExtensions(rt);
+    }),
+    vscode.commands.registerCommand('task-x.addMarketplace', async () => {
+      if (await addMarketplace((await ensureRuntime()).client)) await vscode.commands.executeCommand('task-x.installPlugin');
+    }),
+    vscode.commands.registerCommand('task-x.searchMemory', async () => {
+      const rt = await ensureRuntime();
+      const query = await vscode.window.showInputBox({ title: 'task-x: Search the memory of earlier tasks', prompt: 'Words from the request, the answer, or a file name' });
+      if (!query?.trim()) return;
+      const r = await rt.client.request<{ results: { id: string; kind: string; title: string; text: string; files: string[] }[] }>('memory/search', { query, limit: 20 });
+      if (!r.results.length) return void vscode.window.showInformationMessage('task-x: nothing in the memory matches.');
+      const pick = await vscode.window.showQuickPick(
+        r.results.map((x) => ({ label: x.title || x.id, description: x.kind, detail: [x.text.slice(0, 200), x.files.slice(0, 5).join(', ')].filter(Boolean).join(' · '), id: x.id, entry: x.kind })),
+        { title: 'task-x: Memory', matchOnDetail: true },
+      );
+      if (pick?.entry === 'task') await chat.openTask(pick.id).catch(() => undefined);
+    }),
     vscode.commands.registerCommand('task-x.listSkills', async () => {
       try {
         const rt = await ensureRuntime();
@@ -443,7 +509,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       if (e.affectsConfiguration('task-x.sandbox.enabled') && runtime) void runtime.client.request('config/sandbox', { enabled: sandboxOn() }).catch((err) => out.warn(`config/sandbox failed: ${describeError(err)}`));
       if (e.affectsConfiguration('task-x.runtimePath') && runtime) void restartRuntime();
       else if (e.affectsConfiguration('task-x.index.exclude') && runtime) void openWorkspace(runtime);
-      else if (['task-x.mcpServers', 'task-x.mcp.import', 'task-x.mcp.disabled', 'task-x.hooks', 'mcp.servers'].some((k) => e.affectsConfiguration(k)) && runtime) void configureExtensions(runtime);
+      else if (['task-x.mcpServers', 'task-x.mcp.import', 'task-x.mcp.disabled', 'task-x.hooks', 'task-x.plugins', 'mcp.servers'].some((k) => e.affectsConfiguration(k)) && runtime) void configureExtensions(runtime);
     }),
     ctx.secrets.onDidChange(() => {
       chat.invalidateModels();

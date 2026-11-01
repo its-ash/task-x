@@ -10,6 +10,7 @@ pub mod logs;
 pub mod memory;
 pub mod todos;
 pub mod patch;
+pub mod repomap;
 pub mod search;
 pub mod shell_search;
 pub mod validate;
@@ -521,16 +522,274 @@ impl ToolCtx {
     }
 }
 
-pub fn parse<T: DeserializeOwned>(mut input: Value) -> Result<T, ToolError> {
-    loop {
+/// Repairs per call: each one fixes one field, so this bounds the work on a bad input.
+const MAX_REPAIRS: usize = 32;
+
+thread_local! {
+    /// Input fields a tool could not use and dropped; `call` reports them with the result.
+    static IGNORED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_ignored() -> Vec<String> {
+    IGNORED.with(|i| std::mem::take(&mut *i.borrow_mut()))
+}
+
+/// Reads a tool's input into `T`, repairing the shapes models really send instead of failing:
+/// another name for a field (`file` for `path`, `pattern` for `query`, `case` for `caseSensitive`),
+/// a field the tool does not take (dropped and reported), JSON sent as a string, a single value for
+/// a list, numbers and booleans as strings (and the reverse), `null` for an optional field, and a
+/// bare value for a tool with one required field.
+pub fn parse<T: DeserializeOwned>(input: Value) -> Result<T, ToolError> {
+    let mut input = normalize_input(input);
+    let mut last = String::new();
+    for _ in 0..MAX_REPAIRS {
         let e = match T::deserialize(&input) {
             Ok(v) => return Ok(v),
-            Err(e) => e,
+            Err(e) => e.to_string(),
         };
-        if !coerce(&mut input, &e.to_string()) {
+        if !(coerce(&mut input, &e) || repair::<T>(&mut input, &e)) {
             return Err(ToolError::invalid(format!("invalid input: {e}")));
         }
+        last = e;
     }
+    Err(ToolError::invalid(format!("invalid input: {last}")))
+}
+
+/// Keys a model wraps the real input in (`{"input": {...}}`, `{"arguments": "{...}"}`).
+const WRAPPERS: &[&str] = &["input", "arguments", "args", "params", "parameters", "kwargs", "toolinput"];
+
+/// The outer shape of a call's input: JSON sent as a string is read, `null` is `{}`, and a lone
+/// wrapper key around the real object is removed.
+pub fn normalize_input(v: Value) -> Value {
+    match v {
+        Value::Null => json!({}),
+        Value::String(s) => match json_in(&s) {
+            Some(inner) => normalize_input(inner),
+            None => Value::String(s),
+        },
+        Value::Object(o) if o.len() == 1 && WRAPPERS.contains(&norm(o.keys().next().map(String::as_str).unwrap_or_default()).as_str()) => {
+            let inner = o.values().next().cloned().unwrap_or(Value::Null);
+            match inner {
+                Value::Object(_) => normalize_input(inner),
+                Value::String(ref s) if json_in(s).is_some_and(|j| j.is_object()) => normalize_input(inner),
+                _ => Value::Object(o),
+            }
+        }
+        other => other,
+    }
+}
+
+/// A string that holds a JSON object or array.
+pub(crate) fn json_in(s: &str) -> Option<Value> {
+    let t = s.trim();
+    if !(t.starts_with('{') && t.ends_with('}') || t.starts_with('[') && t.ends_with(']')) {
+        return None;
+    }
+    serde_json::from_str::<Value>(t).ok().filter(|v| v.is_object() || v.is_array())
+}
+
+/// A field name for comparison: lower case, letters and digits only (`case_sensitive` = `caseSensitive`).
+fn norm(s: &str) -> String {
+    s.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect()
+}
+
+/// Names models use for the same input, in `norm` form. A name may be in more than one group;
+/// the fields the tool takes decide which one applies.
+const SYNONYMS: &[&[&str]] = &[
+    &["path", "file", "filepath", "filename", "targetfile", "target", "uri", "relativepath", "absolutepath", "directory", "dir", "folder"],
+    &["paths", "files", "filepaths", "filenames", "path"],
+    &["query", "pattern", "regex", "search", "q", "term", "keyword", "searchterm", "needle", "text", "string"],
+    &["glob", "include", "includes", "filepattern", "fileglob", "pathglob", "filter", "files"],
+    &["content", "contents", "body", "data", "code", "filecontent", "newcontent", "text"],
+    &["limit", "max", "maxresults", "count", "topk", "k", "n", "num", "maxcount", "size"],
+    &["offset", "skip", "startindex"],
+    &["casesensitive", "matchcase", "case", "sensitive"],
+    &["start", "startline", "from", "linestart", "fromline", "begin", "firstline"],
+    &["end", "endline", "to", "lineend", "toline", "lastline", "stop"],
+    &["line", "linenumber", "lineno", "at", "beforeline"],
+    &["name", "symbol", "identifier", "symbolname", "function", "functionname", "names"],
+    &["command", "cmd", "script", "shell", "commandline"],
+    &["cwd", "dir", "directory", "workdir", "workingdirectory", "folder"],
+    &["url", "link", "href", "address"],
+    &["edits", "changes", "edit", "replacements", "patches", "operations", "modifications"],
+    &["oldtext", "oldstring", "old", "search", "find", "original", "before"],
+    &["newtext", "newstring", "new", "replace", "replacement", "after"],
+    &["message", "msg", "commitmessage"],
+    &["searches", "queries", "patterns"],
+    &["source", "src", "from", "sourcepath", "oldpath"],
+    &["destination", "dest", "to", "targetpath", "newpath"],
+];
+
+/// Whether `given` is another name for the field `want`.
+pub(crate) fn same_field(given: &str, want: &str) -> bool {
+    let (g, w) = (norm(given), norm(want));
+    g == w || SYNONYMS.iter().any(|grp| grp.contains(&g.as_str()) && grp.contains(&w.as_str()))
+}
+
+/// The names inside backticks after `marker` in a serde message (`expected one of `a`, `b``).
+fn ticked(err: &str, marker: &str) -> Vec<String> {
+    err.split_once(marker).map(|(_, rest)| rest.split('`').skip(1).step_by(2).map(str::to_owned).collect()).unwrap_or_default()
+}
+
+/// The object (the input or one nested in it) that holds `key`.
+fn holder<'a>(v: &'a mut Value, key: &str) -> Option<&'a mut serde_json::Map<String, Value>> {
+    if v.as_object().is_some_and(|o| o.contains_key(key)) {
+        return v.as_object_mut();
+    }
+    match v {
+        Value::Object(o) => o.values_mut().find_map(|x| holder(x, key)),
+        Value::Array(a) => a.iter_mut().find_map(|x| holder(x, key)),
+        _ => None,
+    }
+}
+
+/// The first object, outermost first, that lacks `want` but has another name for it.
+fn synonym_holder<'a>(v: &'a mut Value, want: &str) -> Option<(&'a mut serde_json::Map<String, Value>, String)> {
+    let found = v.as_object().and_then(|o| (!o.contains_key(want)).then(|| o.keys().find(|k| same_field(k, want)).cloned()).flatten());
+    if let Some(k) = found {
+        return v.as_object_mut().map(|o| (o, k));
+    }
+    match v {
+        Value::Object(o) => o.values_mut().find_map(|x| synonym_holder(x, want)),
+        Value::Array(a) => a.iter_mut().find_map(|x| synonym_holder(x, want)),
+        _ => None,
+    }
+}
+
+/// A path given to a tool that filters by glob: a folder covers what is under it.
+fn path_glob(p: &str) -> String {
+    let p = p.trim().trim_start_matches("./").trim_end_matches('/');
+    let last = p.rsplit('/').next().unwrap_or(p);
+    if p.is_empty() || p == "." {
+        "**".into()
+    } else if p.contains(['*', '?', '{', '[']) || last.contains('.') {
+        p.into()
+    } else {
+        format!("{p}/**")
+    }
+}
+
+/// One structural fix for the error serde reported; false when nothing applies.
+fn repair<T: DeserializeOwned>(v: &mut Value, err: &str) -> bool {
+    // A bare value (`"src/a.rs"`, `["a", "b"]`) for a tool that takes an object: it is the first required field.
+    if !v.is_object() && err.contains("expected struct") || err.contains("expected a map") && !v.is_object() {
+        let probe = T::deserialize(&json!({})).err().map(|e| e.to_string()).unwrap_or_default();
+        if let Some(field) = ticked(&probe, "missing field").into_iter().next() {
+            *v = json!({ field: std::mem::take(v) });
+            return true;
+        }
+        return false;
+    }
+    if err.starts_with("unknown field") {
+        let Some(key) = ticked(err, "unknown field").into_iter().next() else { return false };
+        let expected = ticked(err, "expected");
+        let Some(obj) = holder(v, &key) else { return false };
+        let val = obj.remove(&key).unwrap_or(Value::Null);
+        if let Some(to) = expected.iter().find(|w| !obj.contains_key(w.as_str()) && same_field(&key, w)) {
+            obj.insert(to.clone(), val);
+        } else if same_field(&key, "path") && expected.iter().any(|w| w == "glob") && !obj.contains_key("glob") && val.is_string() {
+            obj.insert("glob".into(), json!(path_glob(val.as_str().unwrap_or_default())));
+        } else {
+            IGNORED.with(|i| i.borrow_mut().push(key));
+        }
+        return true;
+    }
+    if err.starts_with("missing field") {
+        let Some(want) = ticked(err, "missing field").into_iter().next() else { return false };
+        let Some((obj, from)) = synonym_holder(v, &want) else { return false };
+        let val = obj.remove(&from).unwrap_or(Value::Null);
+        obj.insert(want, val);
+        return true;
+    }
+    // `null` for a field that takes no null: drop the nulls, so defaults apply.
+    if err.starts_with("invalid type: null") {
+        return drop_nulls(v);
+    }
+    // A list sent as one value, or as a JSON string: `"a.rs"` for `["a.rs"]`.
+    if let Some((raw, want)) = err.strip_prefix("invalid type: string \"").and_then(|r| r.split_once("\", expected ")) {
+        let list = want.starts_with("a sequence") || want.contains("tuple");
+        let map = want.starts_with("struct") || want.starts_with("a map");
+        return (list || map)
+            && map_str(v, raw, &|s| match json_in(s) {
+                Some(j) if j.is_array() == list => Some(j),
+                _ if list => Some(json!([s])),
+                _ => None,
+            });
+    }
+    // A number or boolean where a string goes: `5` for `"5"`.
+    for (prefix, close) in [("invalid type: integer `", "`, expected a string"), ("invalid type: floating point `", "`, expected a string"), ("invalid type: boolean `", "`, expected a string")] {
+        if let Some(raw) = err.strip_prefix(prefix).and_then(|r| r.split_once(close)).map(|(r, _)| r) {
+            return map_scalar(v, raw);
+        }
+    }
+    // One object where a list goes: `{...}` for `[{...}]`.
+    if err.starts_with("invalid type: map, expected a sequence") {
+        return wrap_first_map(v);
+    }
+    false
+}
+
+fn drop_nulls(v: &mut Value) -> bool {
+    match v {
+        Value::Object(o) => {
+            let before = o.len();
+            o.retain(|_, x| !x.is_null());
+            let inner = o.values_mut().fold(false, |hit, x| drop_nulls(x) | hit);
+            o.len() != before || inner
+        }
+        Value::Array(a) => a.iter_mut().fold(false, |hit, x| drop_nulls(x) | hit),
+        _ => false,
+    }
+}
+
+/// A string as serde quotes it in a message (Rust debug form, without the outer quotes).
+fn quoted(s: &str) -> String {
+    let d = format!("{s:?}");
+    d[1..d.len() - 1].to_owned()
+}
+
+/// Replaces the first string equal to `raw` (as quoted in the message) with what `f` makes of it.
+fn map_str(v: &mut Value, raw: &str, f: &dyn Fn(&str) -> Option<Value>) -> bool {
+    match v {
+        Value::String(s) if quoted(s) == raw => match f(s) {
+            Some(to) => {
+                *v = to;
+                true
+            }
+            None => false,
+        },
+        Value::Array(a) => a.iter_mut().any(|x| map_str(x, raw, f)),
+        Value::Object(o) => o.values_mut().any(|x| map_str(x, raw, f)),
+        _ => false,
+    }
+}
+
+fn map_scalar(v: &mut Value, raw: &str) -> bool {
+    match v {
+        Value::Number(n) if n.to_string() == raw => {
+            *v = Value::String(raw.to_owned());
+            true
+        }
+        Value::Bool(b) if (if *b { "true" } else { "false" }) == raw => {
+            *v = Value::String(raw.to_owned());
+            true
+        }
+        Value::Array(a) => a.iter_mut().any(|x| map_scalar(x, raw)),
+        Value::Object(o) => o.values_mut().any(|x| map_scalar(x, raw)),
+        _ => false,
+    }
+}
+
+/// Wraps the first object-valued field in a list (the error does not say which field it was).
+fn wrap_first_map(v: &mut Value) -> bool {
+    let Value::Object(o) = v else { return false };
+    for x in o.values_mut() {
+        if x.is_object() {
+            *x = json!([std::mem::take(x)]);
+            return true;
+        }
+    }
+    o.values_mut().any(wrap_first_map)
 }
 
 /// Models often send numbers and booleans as strings ("396", "true"). Converts the string that the error names when it is a valid value of the expected type.
@@ -545,19 +804,7 @@ fn coerce(v: &mut Value, err: &str) -> bool {
     } else {
         None
     };
-    to.is_some_and(|to| replace_str(v, raw, &to))
-}
-
-fn replace_str(v: &mut Value, raw: &str, to: &Value) -> bool {
-    match v {
-        Value::String(s) if s == raw => {
-            *v = to.clone();
-            true
-        }
-        Value::Array(a) => a.iter_mut().fold(false, |hit, x| replace_str(x, raw, to) | hit),
-        Value::Object(o) => o.values_mut().fold(false, |hit, x| replace_str(x, raw, to) | hit),
-        _ => false,
-    }
+    to.is_some_and(|to| map_str(v, raw, &|_| Some(to.clone())))
 }
 
 pub type Handler = fn(&ToolCtx, Value) -> ToolResult;
@@ -602,6 +849,7 @@ pub fn registry() -> &'static [ToolDef] {
             validate::tools(),
             logs::tools(),
             memory::tools(),
+            repomap::tools(),
             todos::tools(),
             web::tools(),
             browser::tools(),
@@ -653,7 +901,28 @@ pub fn limit_output(v: Value) -> Value {
 /// Runs a tool on a blocking thread with its timeout and the caller's cancellation token.
 pub async fn call(def: &'static ToolDef, ctx: Arc<ToolCtx>, input: Value) -> ToolResult {
     let cancel = ctx.cancel.clone();
-    let task = tokio::task::spawn_blocking(move || (def.handler)(&ctx, input));
+    let input = normalize_input(input);
+    let task = tokio::task::spawn_blocking(move || {
+        take_ignored();
+        let r = (def.handler)(&ctx, input);
+        // Fields the tool dropped are named in the answer, so the model learns the right names.
+        let ignored = take_ignored();
+        if ignored.is_empty() {
+            return r;
+        }
+        let note = format!("{} does not take {}; ignored", def.name, ignored.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", "));
+        match r {
+            Ok(Value::Object(mut o)) => {
+                o.insert("ignoredInput".into(), json!(note));
+                Ok(Value::Object(o))
+            }
+            Err(mut e) => {
+                e.message = format!("{} ({note})", e.message);
+                Err(e)
+            }
+            other => other,
+        }
+    });
     tokio::select! {
         _ = cancel.cancelled() => Err(ToolError::new(ToolErrorKind::Cancelled, "cancelled")),
         r = tokio::time::timeout(def.timeout, task) => match r {
@@ -701,7 +970,40 @@ pub(crate) mod tests {
     }
 
     pub fn run(c: &ToolCtx, name: &str, input: Value) -> ToolResult {
-        (find(name).unwrap_or_else(|| panic!("no tool {name}")).handler)(c, input)
+        (find(name).unwrap_or_else(|| panic!("no tool {name}")).handler)(c, normalize_input(input))
+    }
+
+    #[derive(Deserialize, Debug)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Probe {
+        query: String,
+        #[serde(default)]
+        case_sensitive: bool,
+        #[serde(default)]
+        glob: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        label: Option<String>,
+    }
+
+    #[test]
+    fn inputs_in_other_shapes_are_repaired() {
+        take_ignored();
+        let p: Probe = parse(json!({ "pattern": "x", "path": "design/SKILL.md", "case": "true", "max_results": "5" })).unwrap();
+        assert_eq!((p.query.as_str(), p.case_sensitive, p.glob.as_deref(), p.limit), ("x", true, Some("design/SKILL.md"), Some(5)));
+        let p: Probe = parse(json!({ "query": "x", "path": "src" })).unwrap();
+        assert_eq!(p.glob.as_deref(), Some("src/**"), "a folder covers what is under it");
+        let p: Probe = parse(json!(r#"{"search": "a \"b\"", "tags": "one.rs", "stepNumber": 3, "limit": null}"#)).unwrap();
+        assert_eq!((p.query.as_str(), p.tags.as_slice(), p.limit), ("a \"b\"", ["one.rs".to_string()].as_slice(), None));
+        assert_eq!(take_ignored(), ["stepNumber"], "a field nothing reads is dropped and reported");
+        let p: Probe = parse(json!({ "arguments": { "query": "x", "tags": "[\"a\", \"b\"]", "label": 7 } })).unwrap();
+        assert_eq!((p.tags.len(), p.label.as_deref()), (2, Some("7")));
+        let p: Probe = parse(json!("needle")).unwrap();
+        assert_eq!(p.query, "needle", "a bare value is the required field");
+        assert!(parse::<Probe>(json!({ "limit": 3 })).unwrap_err().message.contains("missing field `query`"));
     }
 
     #[test]

@@ -1,10 +1,12 @@
 mod agent;
 mod claude_cli;
+mod cli;
 mod context;
 mod docs;
 mod errors;
 mod mcp;
 mod mcp_server;
+mod oauth;
 mod provider;
 mod rpc;
 mod server;
@@ -33,6 +35,16 @@ async fn main() -> ExitCode {
     init_logging();
     if std::env::args().nth(1).as_deref() == Some("--version") {
         println!("task-x-runtime {} (protocol {})", env!("CARGO_PKG_VERSION"), rpc::PROTOCOL_VERSION);
+        return ExitCode::SUCCESS;
+    }
+    // The terminal front end: `exec` (one task, for scripts and CI) and `chat` (interactive).
+    let first = std::env::args().nth(1);
+    if matches!(first.as_deref(), Some("exec" | "chat")) {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return cli::main(&args).await;
+    }
+    if matches!(first.as_deref(), Some("--help" | "-h" | "help")) {
+        println!("{}\n\nWith no command, task-x-runtime serves the JSON-RPC protocol on stdio (for the VS Code extension).", cli::USAGE);
         return ExitCode::SUCCESS;
     }
     // `--hook-shell-edit [--no-block] [--ask]`: Claude Code PreToolUse hook for Bash. It blocks file

@@ -30,6 +30,8 @@ pub const APPROVAL_ENV: &str = "TASK_X_APPROVAL";
 /// The MCP tool Claude Code calls (`--permission-prompt-tool`) when a tool call needs permission.
 pub const APPROVE_TOOL: &str = "approve";
 const MAX_APPROVAL_BYTES: u64 = 1024 * 1024;
+/// Token budget of the index excerpts sent with each prompt.
+const CONTEXT_BUDGET_TOKENS: usize = 6_000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -195,12 +197,13 @@ pub fn validate(p: &Params) -> Result<(), String> {
     Ok(())
 }
 
-/// The first user message: the prompt text, then any attached images.
-fn prompt_content(p: &Params) -> Value {
+/// The first user message: index excerpts, the prompt text, then any attached images.
+fn prompt_content(p: &Params, context: &str) -> Value {
+    let text = format!("{context}{}", p.prompt);
     if p.images.is_empty() {
-        return json!(p.prompt);
+        return json!(text);
     }
-    let mut parts = vec![json!({ "type": "text", "text": p.prompt })];
+    let mut parts = vec![json!({ "type": "text", "text": text })];
     parts.extend(
         p.images.iter().map(|i| json!({ "type": "image", "source": { "type": "base64", "media_type": i.media_type, "data": i.data } })),
     );
@@ -855,6 +858,27 @@ fn instruction_note(host: &Host) -> String {
     [guidance, (!memory.is_empty()).then_some(memory)].into_iter().flatten().collect::<Vec<_>>().join("\n\n")
 }
 
+/// The workspace summary and the index excerpts that match the request, so Claude Code does not
+/// have to explore the file tree first.
+fn repo_context(host: &Host, request: &str) -> String {
+    use crate::context::retrieve;
+    let ws = host.workspace.read().expect("workspace lock");
+    let Some(ws) = ws.as_ref() else { return String::new() };
+    let langs: Vec<String> = ws.project.languages.iter().take(5).map(|l| format!("{} ({})", l.language, l.files)).collect();
+    let mut out = format!(
+        "<repository_context>\nWorkspace: {} files indexed. Languages: {}.\nExcerpts selected automatically from the task-x index for this request. They may be incomplete; read files with tools before editing them. Use the task-x search tools (search_regex, find_symbol, find_references) instead of listing the file tree.\n",
+        ws.index.stats().files,
+        if langs.is_empty() { "unknown".into() } else { langs.join(", ") },
+    );
+    let r = retrieve::retrieve(&ws.index, request, &retrieve::Options { budget_tokens: CONTEXT_BUDGET_TOKENS, focus_paths: &[] });
+    for s in &r.snippets {
+        let f = crate::agent::prompt::fence_for(&s.text);
+        out.push_str(&format!("\n{}:{}-{} ({})\n{f}\n{}\n{f}\n", s.path, s.start_line, s.end_line, s.reason, s.text));
+    }
+    out.push_str("</repository_context>\n\n");
+    out
+}
+
 pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Value, String> {
     validate(&p)?;
     let root: PathBuf = host
@@ -895,7 +919,7 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
         .map_err(|e| format!("could not start Claude Code: {e}"))?;
     // The prompt goes through stdin so it can never be read as a CLI flag. Stdin stays open for steering.
     let mut stdin = child.stdin.take();
-    if !write_user(&mut stdin, prompt_content(&p)).await {
+    if !write_user(&mut stdin, prompt_content(&p, &repo_context(&host, &p.prompt))).await {
         return Err("could not send the prompt to Claude Code".into());
     }
     let inbox = Inbox::open(host.steers.clone(), &p.task_id);
@@ -1160,12 +1184,12 @@ mod tests {
             disabled_mcp: Vec::new(),
         };
         validate(&p).unwrap();
-        assert_eq!(prompt_content(&p), json!("--help me"));
+        assert_eq!(prompt_content(&p, ""), json!("--help me"));
         let mut with = p.clone();
         with.images = vec![crate::provider::types::ImageInput { media_type: "image/png".into(), data: "iVBORw0KGgo=".into() }];
         with.mcp_servers.insert("figma".into(), json!({ "type": "http", "url": "http://127.0.0.1:3845/mcp" }));
         validate(&with).unwrap();
-        assert_eq!(prompt_content(&with)[1]["source"]["media_type"], "image/png");
+        assert_eq!(prompt_content(&with, "")[1]["source"]["media_type"], "image/png");
         let wa = args(&with, Some((Path::new("/opt/task-x-runtime"), Path::new("/work/repo"))), "", None);
         let cfg: Value = serde_json::from_str(&wa[wa.iter().position(|x| x == "--mcp-config").unwrap() + 1]).unwrap();
         assert!(

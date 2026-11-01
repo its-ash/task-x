@@ -293,7 +293,7 @@ mod tests {
             "id": "edit", "role": "Implementation", "objective": "say hello"
         }))
         .unwrap();
-        assert_eq!(step.role, Role::Implementation);
+        assert_eq!(step.role, Some(Role::Implementation));
         let err = serde_json::from_value::<super::super::PlanStep>(json!({ "id": "x", "role": "chef", "objective": "cook" })).unwrap_err();
         assert!(err.to_string().contains("unknown role 'chef'") && err.to_string().contains("research"), "{err}");
         // The wire form is unchanged: lowercase, for events and the client.

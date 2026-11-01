@@ -37,7 +37,16 @@ export interface PluginEntry {
 
 /** MCP servers of enabled plugins, from the last `plugins()` call; read without waiting for the CLI. */
 let pluginMcp: { plugin: string; servers: unknown }[] = [];
-export const pluginMcpServers = () => pluginMcp;
+/** MCP servers of plugins the runtime found outside Claude Code (`~/.task-x/plugins`, `.task-x/plugins`, `task-x.plugins.dirs`). */
+let localPluginMcp: { plugin: string; servers: unknown }[] = [];
+export const pluginMcpServers = () => [...pluginMcp, ...localPluginMcp.filter((l) => !pluginMcp.some((p) => p.plugin === l.plugin))];
+
+/** Keeps the MCP servers of enabled non-Claude plugins. Workspace plugins count only in a trusted workspace. */
+export function setLocalPluginMcp(list: { name: string; enabled: boolean; source: string; mcpServers?: unknown }[], trusted: boolean): void {
+  localPluginMcp = list
+    .filter((p) => p.enabled && p.source !== 'claude' && p.mcpServers && typeof p.mcpServers === 'object' && (trusted || p.source !== 'workspace'))
+    .map((p) => ({ plugin: p.name, servers: p.mcpServers }));
+}
 
 export interface Catalog {
   agents: CatalogEntry[];
@@ -158,6 +167,17 @@ export async function newSkill(root: string | undefined): Promise<void> {
   );
 }
 
+/** Creates `.claude/commands/<name>.md` in the project and opens it. */
+export async function newCommand(root: string | undefined): Promise<void> {
+  if (!root) return void vscode.window.showWarningMessage('task-x: open a folder to add a command to it.');
+  const name = await askName('command');
+  if (!name) return;
+  await scaffold(
+    path.join(root, '.claude', 'commands', `${name}.md`),
+    `---\ndescription: Say what /${name} does.\nargument-hint: [what to pass]\n---\n\nDo the task for: $ARGUMENTS\n`,
+  );
+}
+
 /** Creates `.claude/agents/<name>.md` in the project and opens it. */
 export async function newAgent(root: string | undefined): Promise<void> {
   if (!root) return void vscode.window.showWarningMessage('task-x: open a folder to add an agent to it.');
@@ -165,26 +185,101 @@ export async function newAgent(root: string | undefined): Promise<void> {
   if (!name) return;
   await scaffold(
     path.join(root, '.claude', 'agents', `${name}.md`),
-    `---\nname: ${name}\ndescription: Say what this agent does and when to use it.\n---\n\nYou are the ${name} agent. Describe its job, its limits, and what it reports back.\n`,
+    `---\nname: ${name}\ndescription: Say what this agent does and when the lead should delegate to it.\ntools: Read, Grep, Glob, Edit, Bash\nmodel: inherit\n---\n\nYou are the ${name} agent. Describe its job, its limits, and what it reports back.\n`,
   );
 }
 
-/** Runs a `claude plugin` command in a terminal, so the user sees its output and any prompt. */
-function pluginTerminal(args: string[]): void {
-  const cli = findClaude();
-  if (!cli) return void vscode.window.showErrorMessage('task-x: plugins need the Claude Code CLI. Install it, or set task-x.claudeCode.path.');
-  const term = vscode.window.createTerminal({ name: 'Claude plugins', shellPath: cli, shellArgs: ['plugin', ...args], iconPath: new vscode.ThemeIcon('extensions') });
-  term.show();
+interface Marketplace {
+  name: string;
+  owner: 'task-x' | 'claude';
+  plugins: { name: string; description?: string | null; version?: string | null }[];
 }
 
-/** Asks for a plugin id and installs it with `claude plugin install`. */
-export async function installPlugin(): Promise<void> {
-  const id = await vscode.window.showInputBox({
-    title: 'Install a Claude Code plugin',
-    prompt: 'Plugin id, for example name@marketplace',
-    validateInput: (s) => (PLUGIN_ID.test(s.trim()) ? undefined : 'Use name or name@marketplace.'),
+interface RpcLike {
+  request<T>(method: string, params?: unknown): Promise<T>;
+}
+
+const describe = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** Adds a marketplace (git URL, owner/repo, or folder) through the runtime. */
+export async function addMarketplace(client: RpcLike): Promise<boolean> {
+  const source = await vscode.window.showInputBox({
+    title: 'Add a plugin marketplace',
+    prompt: 'A git URL, owner/repo on GitHub, or an absolute folder with .claude-plugin/marketplace.json',
+    validateInput: (s) => (s.trim() && !s.trim().startsWith('-') ? undefined : 'Give a git URL, owner/repo, or folder.'),
   });
-  if (id) pluginTerminal(['install', id.trim()]);
+  if (!source) return false;
+  try {
+    const m = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `task-x: adding ${source.trim()}…` }, () =>
+      client.request<Marketplace>('plugins/marketplaceAdd', { source: source.trim() }),
+    );
+    void vscode.window.showInformationMessage(`task-x: added the marketplace ${m.name} (${m.plugins.length} plugins).`);
+    return true;
+  } catch (e) {
+    void vscode.window.showErrorMessage(`task-x: could not add the marketplace: ${describe(e)}`);
+    return false;
+  }
+}
+
+/**
+ * Installs a plugin without the Claude Code CLI: pick one from a marketplace (task-x's or Claude
+ * Code's), or give `name@marketplace`, a git URL, `owner/repo`, or a folder. Returns whether a plugin
+ * was installed.
+ */
+export async function installPlugin(client: RpcLike, root: string | undefined): Promise<boolean> {
+  let markets: Marketplace[] = [];
+  try {
+    markets = await client.request<Marketplace[]>('plugins/marketplaces');
+  } catch {
+    markets = [];
+  }
+  type Item = vscode.QuickPickItem & { spec?: string; action?: 'add' | 'manual' };
+  const items: Item[] = [
+    ...markets.flatMap((m) =>
+      m.plugins.map((p) => ({ label: p.name, description: `${m.name}${p.version ? ` · v${p.version}` : ''}`, detail: p.description ?? undefined, spec: `${p.name}@${m.name}` })),
+    ),
+    { label: '$(add) Add a marketplace…', action: 'add' },
+    { label: '$(cloud-download) Install from a git URL, owner/repo, or folder…', action: 'manual' },
+  ];
+  const pick = await vscode.window.showQuickPick(items, { title: 'task-x: Install a plugin', matchOnDescription: true, matchOnDetail: true });
+  if (!pick) return false;
+  if (pick.action === 'add') return (await addMarketplace(client)) && installPlugin(client, root);
+  const spec =
+    pick.spec ??
+    (await vscode.window.showInputBox({ title: 'Install a plugin', prompt: 'name@marketplace, a git URL, owner/repo, or an absolute folder', validateInput: (s) => (s.trim() ? undefined : 'Required') }))?.trim();
+  if (!spec) return false;
+  const scope = root
+    ? (await vscode.window.showQuickPick([{ label: 'For me', description: '~/.task-x/plugins', scope: 'user' }, { label: 'For this project', description: '.task-x/plugins (shared through the repository)', scope: 'workspace' }], { title: `Install ${spec}` }))?.scope
+    : 'user';
+  if (!scope) return false;
+  try {
+    const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `task-x: installing ${spec}…` }, () =>
+      client.request<{ name: string; version?: string }>('plugins/install', { spec, scope }),
+    );
+    void vscode.window.showInformationMessage(`task-x: installed ${r.name}${r.version ? ` v${r.version}` : ''}.`);
+    return true;
+  } catch (e) {
+    void vscode.window.showErrorMessage(`task-x: could not install ${spec}: ${describe(e)}`);
+    return false;
+  }
+}
+
+/** Updates or removes a plugin task-x installed. */
+export async function managePlugin(client: RpcLike, name: string, source: string): Promise<boolean> {
+  if (source !== 'user' && source !== 'workspace') {
+    void vscode.window.showInformationMessage(`task-x: ${name} is managed by ${source === 'claude' ? 'Claude Code (claude plugin)' : 'your settings'}.`);
+    return false;
+  }
+  const act = await vscode.window.showQuickPick(['Update', 'Uninstall'], { title: `task-x: ${name}` });
+  if (!act) return false;
+  try {
+    await client.request(act === 'Update' ? 'plugins/update' : 'plugins/uninstall', { name, scope: source });
+    void vscode.window.showInformationMessage(`task-x: ${act === 'Update' ? 'updated' : 'removed'} ${name}.`);
+    return true;
+  } catch (e) {
+    void vscode.window.showErrorMessage(`task-x: ${describe(e)}`);
+    return false;
+  }
 }
 
 /** Enables or disables an installed plugin. Returns false for an id that is not well formed. */

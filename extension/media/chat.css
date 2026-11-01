@@ -486,6 +486,34 @@ textarea::placeholder { color: var(--on-surface-variant); }
 .pick[hidden] { display: none; }
 .pick .codicon-chevron-down { font-size: 12px !important; }
 #modelBtn { flex: 0 1 auto; }
+/* Brand colours: the model chip and the picker take the colour of the provider or model family. */
+[data-brand=claude] { --brand: #d97757; }
+[data-brand=openai] { --brand: #10a37f; }
+[data-brand=gemini] { --brand: #4c8df6; }
+[data-brand=meta] { --brand: #0866ff; }
+[data-brand=qwen] { --brand: #8b5cf6; }
+[data-brand=mistral] { --brand: #fa520f; }
+[data-brand=deepseek] { --brand: #4d6bfe; }
+[data-brand=grok] { --brand: #9ca3af; }
+[data-brand=kimi] { --brand: #16b6c8; }
+[data-brand=glm] { --brand: #3b82f6; }
+[data-brand=ollama] { --brand: #2da44e; }
+[data-brand=other] { --brand: var(--accent); }
+.pick[data-brand] { color: var(--on-surface); border-color: color-mix(in srgb, var(--brand) 55%, var(--border)); background: color-mix(in srgb, var(--brand) 12%, transparent); }
+.pick[data-brand]:hover:not(:disabled) { background: color-mix(in srgb, var(--brand) 22%, transparent); }
+.pick[data-brand] .brand-icon { flex: none; color: var(--brand); }
+.pick[data-brand] .model-window { color: var(--on-surface); background: color-mix(in srgb, var(--brand) 22%, transparent); }
+.mp-prov[data-brand] > .codicon:first-child, .mp-head[data-brand] > .codicon:first-child { color: var(--brand); }
+.mp-prov[data-brand][aria-selected="true"] { color: var(--on-surface); background: color-mix(in srgb, var(--brand) 22%, transparent); box-shadow: inset 3px 0 0 var(--brand); }
+/* The other chips get their own soft tint, so each is easy to find. */
+.pick.effort-pick:not([data-level=default]) { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.pick.mcp-pick[data-state=ok] { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); background: color-mix(in srgb, var(--ok) 8%, transparent); }
+.pick.mcp-pick[data-state=bad] { border-color: color-mix(in srgb, var(--bad) 55%, var(--border)); background: color-mix(in srgb, var(--bad) 10%, transparent); }
+.pick.mcp-pick[data-state=off] { border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.pick.settings-pick[data-mode=safe] { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); background: color-mix(in srgb, var(--ok) 8%, transparent); }
+.pick.settings-pick[data-mode=ask] { border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.pick.settings-pick[data-mode=auto] { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+@media (forced-colors: active) { .pick[data-brand], .pick.effort-pick, .pick.mcp-pick, .pick.settings-pick { border-color: ButtonText; background: ButtonFace; } .pick[data-brand] .brand-icon { color: ButtonText; } }
 .model-window { flex: none; padding: 0 5px; border-radius: 999px; font-size: 10px; line-height: 16px; font-variant-numeric: tabular-nums; color: var(--muted); background: color-mix(in srgb, var(--fg) 8%, transparent); }
 #refineBtn { flex: none; width: 28px; height: 28px; color: var(--accent); }
 #refineBtn.refine-failed { color: var(--stop); }
@@ -581,9 +609,24 @@ textarea::placeholder { color: var(--on-surface-variant); }
 .pick.mcp-pick[data-state=off] > .codicon:first-child { color: var(--warn); }
 .caps-badge { padding: 0 6px; border-radius: 999px; font-size: 10px; font-weight: 700; line-height: 16px; color: var(--on-accent-container); background: var(--accent-container); }
 .caps-badge.off { color: var(--md-ext-on-amber, #000); background: var(--warn); }
-.menu.caps-menu { width: min(620px, calc(100vw - 8px)); }
-.caps-body { min-height: 280px; }
-.caps-pane { max-height: min(60vh, 460px); overflow-y: auto; padding-right: 2px; }
+/* Only the list on the right scrolls: the card and the section list on the left stay put. */
+.menu.caps-menu { display: flex; flex-direction: column; width: min(620px, calc(100vw - 8px)); overflow: hidden; }
+.menu.caps-menu:not(:popover-open) { display: none; }
+.caps-body { flex: 1 1 auto; grid-template-rows: minmax(0, 1fr); min-height: 0; }
+.caps-body > .mp-side { overflow: visible; align-self: start; }
+.caps-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.caps-search { flex: none; margin: 0 0 4px 4px; padding: 2px 4px 6px; }
+.caps-search input::-webkit-search-cancel-button { cursor: pointer; }
+.caps-pane { flex: 0 1 auto; height: min(52vh, 400px); min-height: 0; max-height: min(52vh, 400px); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding-right: 2px; }
+.mcp-line { display: flex; align-items: center; gap: 4px; }
+.mcp-line > .setting-row { flex: 1; min-width: 0; }
+.mcp-connect { display: inline-flex; flex: none; align-items: center; gap: 4px; height: 24px; padding: 0 10px; border: 1px solid var(--accent); border-radius: 999px; font-size: 11px; font-weight: 600; color: var(--on-accent); background: var(--accent); cursor: pointer; }
+.mcp-connect.off { color: var(--on-surface); background: transparent; border-color: var(--border); }
+.mcp-connect:hover:not(:disabled) { filter: brightness(1.1); }
+.mcp-connect.off:hover:not(:disabled) { color: var(--bad); border-color: var(--bad); filter: none; }
+.mcp-connect:disabled { opacity: .6; cursor: default; }
+.mcp-connect:focus-visible { outline: 2px solid var(--focus, var(--accent)); outline-offset: 2px; }
+@media (forced-colors: active) { .mcp-connect { border-color: ButtonText; color: ButtonText; background: ButtonFace; } }
 .caps-head { justify-content: space-between; min-height: 30px; margin-bottom: 2px; }
 .caps-title { font-weight: 600; color: var(--on-surface); }
 .skill-row .title { font-family: var(--mono); font-size: 12px; }
@@ -753,6 +796,18 @@ textarea::placeholder { color: var(--on-surface-variant); }
 .steer { display: flex; gap: 6px; align-items: flex-start; margin: 8px 0; padding: 6px 10px; font-size: 12px; color: var(--on-surface); border-radius: var(--radius); background: var(--surface-high); }
 .steer > .codicon { margin-top: 2px; color: var(--accent); }
 .steer-text { min-width: 0; white-space: pre-wrap; word-break: break-word; }
+/* Token counter: chips above the input with the chat's input, output, cached, and total tokens. */
+.token-bar { display: flex; flex-wrap: wrap; gap: 4px; margin: -2px 0 0; }
+.token-bar[hidden] { display: none; }
+.tok-chip { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 8px; border: 1px solid color-mix(in srgb, var(--chip) 45%, var(--border)); border-radius: 999px; font-size: 11px; line-height: 1; color: var(--on-surface-variant); background: color-mix(in srgb, var(--chip) 10%, transparent); }
+.tok-chip .codicon { font-size: 12px; color: var(--chip); }
+.tok-chip .tok-num { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--on-surface); }
+.tok-chip.in { --chip: var(--accent); }
+.tok-chip.out { --chip: var(--ok); }
+.tok-chip.cached { --chip: var(--warn); }
+.tok-chip.total { --chip: var(--on-surface-variant); }
+@container (max-width: 360px) { .tok-chip .tok-label { display: none; } }
+@media (forced-colors: active) { .tok-chip { border-color: CanvasText; background: Canvas; } .tok-chip .codicon { color: CanvasText; } }
 /* The agent's plan: a filled card with a progress bar; items tick off as the agent works. */
 .todos { margin: 0 4px 8px; padding: 4px 6px 6px; border-radius: 14px; background: var(--surface-high); }
 .todos[hidden] { display: none; }
@@ -824,5 +879,7 @@ textarea::placeholder { color: var(--on-surface-variant); }
   .mp-body { grid-template-columns: minmax(0, 1fr); }
   .mp-side { flex-direction: row; padding: 0 0 4px; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--vscode-menu-separatorBackground, var(--border)); }
   .mp-prov { flex: none; width: auto; }
+  .caps-body { grid-template-rows: auto minmax(0, 1fr); }
+  .caps-body > .mp-side { align-self: stretch; }
 }
 @media (forced-colors: active) { .mp-prov[aria-selected="true"] { color: HighlightText; background: Highlight; } }

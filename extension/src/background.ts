@@ -62,6 +62,11 @@ export class BackgroundTasks implements vscode.Disposable {
     });
   }
 
+  /** True while a background task or a feature that claimed task ids runs. */
+  get busy(): boolean {
+    return this.running.length > 0 || this.owners.size > 0;
+  }
+
   private get running(): Task[] {
     return [...this.tasks.values()].filter((t) => t.abort);
   }

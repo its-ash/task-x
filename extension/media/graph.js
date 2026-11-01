@@ -331,13 +331,28 @@
     legend.append(lg, el('p', 'muted', 'Drag to move, scroll to zoom, double-click to open or drill in.'));
     side.append(legend);
   }
-  function renderChips(s, total, shown) {
+  function renderChips(s, total, shown, skipped = [], skippedCount = 0) {
     const chips = $('chips');
     chips.replaceChildren();
     const add = (v, l, cls = '') => { const c = el('span', 'stat ' + cls); c.append(el('b', null, v), ` ${l}`); chips.append(c); };
     add(s.files.toLocaleString(), 'files'); add(s.modules.toLocaleString(), 'modules');
     add(s.importEdges.toLocaleString(), 'imports'); add(s.referenceEdges.toLocaleString(), 'symbol links');
     add(String(s.cycles), s.cycles === 1 ? 'cycle' : 'cycles', s.cycles ? 'bad' : '');
+    if (skippedCount > 0) {
+      // Build, dependency, and cache folders the index did not walk into, with the reason for each.
+      const d = el('details', 'stat skipped');
+      const sum = el('summary');
+      sum.append(el('span', 'codicon codicon-eye-closed'), el('b', null, skippedCount.toLocaleString()), ` ${skippedCount === 1 ? 'folder' : 'folders'} skipped`);
+      const list = el('ul', 'skipped-list');
+      for (const x of skipped) {
+        const li = el('li');
+        li.append(el('code', null, x.path + '/'), el('span', 'muted', x.reason));
+        list.append(li);
+      }
+      if (skippedCount > skipped.length) list.append(el('li', 'muted', `and ${skippedCount - skipped.length} more`));
+      d.append(sum, list);
+      chips.append(d);
+    }
     $('summary').textContent = total > shown ? `Showing the ${shown} most connected of ${total} ${level === 'module' ? 'modules' : 'files'}` : `${shown} ${level === 'module' ? 'modules' : 'files'}`;
   }
 
@@ -349,7 +364,7 @@
       setLevel(m.level);
       $('focus').value = m.focus;
       stats = m.data.stats;
-      renderChips(stats, m.data.total, m.data.nodes.length);
+      renderChips(stats, m.data.total, m.data.nodes.length, m.data.skippedDirs ?? [], m.data.skippedDirCount ?? 0);
       empty.hidden = m.data.nodes.length > 0;
       empty.textContent = m.focus ? `Nothing matches "${m.focus}".` : 'No files are indexed yet.';
       setGraph(m.data);

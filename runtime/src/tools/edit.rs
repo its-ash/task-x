@@ -273,9 +273,9 @@ pub fn record(c: &ToolCtx, op: &str, changes: &[Change]) -> Value {
 struct ReplaceIn {
     #[serde(alias = "file_path", alias = "filePath", alias = "file")]
     path: String,
-    #[serde(alias = "old_text", alias = "old_string", alias = "oldString", alias = "search", alias = "old")]
+    #[serde(alias = "old_text", alias = "old_string", alias = "oldString", alias = "search", alias = "old", alias = "find", alias = "original")]
     old_text: String,
-    #[serde(alias = "new_text", alias = "new_string", alias = "newString", alias = "replace", alias = "new")]
+    #[serde(alias = "new_text", alias = "new_string", alias = "newString", alias = "replace", alias = "new", alias = "replacement")]
     new_text: String,
     #[serde(default, alias = "expected_count")]
     expected_count: Option<usize>,
@@ -293,12 +293,15 @@ const EDIT_FIELDS: &[&str] = &[
     "oldString",
     "search",
     "old",
+    "find",
+    "original",
     "newText",
     "new_text",
     "new_string",
     "newString",
     "replace",
     "new",
+    "replacement",
     "expectedCount",
     "expected_count",
     "all",
@@ -306,7 +309,7 @@ const EDIT_FIELDS: &[&str] = &[
 /// The names a model uses for an edit's file.
 const PATH_FIELDS: &[&str] = &["path", "file_path", "filePath", "file"];
 /// The names a model uses for the text an edit replaces.
-const OLD_FIELDS: &[&str] = &["oldText", "old_text", "old_string", "oldString", "search", "old"];
+const OLD_FIELDS: &[&str] = &["oldText", "old_text", "old_string", "oldString", "search", "old", "find", "original"];
 
 fn looks_like_edit(v: &Value) -> bool {
     v.as_object().is_some_and(|o| PATH_FIELDS.iter().chain(OLD_FIELDS).any(|k| o.contains_key(*k)))
@@ -375,7 +378,21 @@ fn take_edits(input: Value) -> Result<(Value, Option<String>, Vec<String>), Tool
     let Value::Object(mut map) = input else {
         return Err(ToolError::invalid("edit_files takes an object: {\"edits\": [{\"path\": ..., \"oldText\": ..., \"newText\": ...}]}"));
     };
+    // Another name for the list (`changes`, `replacements`, …), or any key that holds a list of edits.
+    if !map.contains_key("edits") {
+        let key = map.keys().find(|k| super::same_field(k, "edits")).cloned().or_else(|| {
+            map.iter().find(|(_, v)| v.as_array().is_some_and(|a| !a.is_empty() && a.iter().all(looks_like_edit))).map(|(k, _)| k.clone())
+        });
+        if let Some(v) = key.and_then(|k| map.remove(&k)) {
+            map.insert("edits".into(), v);
+        }
+    }
     if let Some(edits) = map.remove("edits") {
+        // The list sent as a JSON string.
+        let edits = match edits {
+            Value::String(s) => super::json_in(&s).unwrap_or(Value::String(s)),
+            v => v,
+        };
         // `{"path": "a.js", "edits": [{oldText, newText}, ...]}`: one file, several edits.
         let path = take_path(&mut map);
         return Ok((edits, path, map.keys().cloned().collect()));
@@ -861,6 +878,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(c2.root.join("t.js")).unwrap(), "T\n");
         let bad = run(&c2, "edit_files", json!({ "edits": [{ "oldText": "x", "newText": "y" }] })).unwrap_err();
         assert!(bad.message.contains("edits[0] names no file") && !bad.message.contains("missing field"), "{}", bad.message);
+
+        // Another name for the list, the list as a JSON string, and the whole call as a string.
+        let c3 = ctx(&[("u.txt", "u v w\n")]);
+        run(&c3, "edit_files", json!({ "changes": [{ "file": "u.txt", "find": "u", "replacement": "U" }] })).unwrap();
+        run(&c3, "edit_files", json!({ "edits": r#"[{"path": "u.txt", "oldText": "v", "newText": "V"}]"# })).unwrap();
+        run(&c3, "edit_files", json!(r#"{"input": {"edits": [{"path": "u.txt", "oldText": "w", "newText": "W"}]}}"#)).unwrap();
+        assert_eq!(std::fs::read_to_string(c3.root.join("u.txt")).unwrap(), "U V W\n");
 
         // No edits at all: the message says what to send, instead of naming a serde field.
         let bad = run(&c, "edit_files", json!({ "5": "nope" })).unwrap_err();

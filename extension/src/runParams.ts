@@ -39,6 +39,8 @@ export function limits() {
     compactPercent: clamp(c.get('context.compactAt'), 30, 95, 85),
     lazyTools: c.get<boolean>('agent.lazyTools', true),
     effort: effort(),
+    maxDepth: clamp(c.get('agent.subagentDepth'), 1, 3, 2),
+    repoMapTokens: clamp(c.get('context.repoMapTokens'), 0, 8_000, 1_000),
   };
 }
 

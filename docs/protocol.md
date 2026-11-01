@@ -117,7 +117,9 @@ Sent while `workspace/open` and `workspace/refresh` run, and after `workspace/fi
 
 ### `graph/project` (request)
 
-Params: `{ level?: "file"|"module", focus?: string, depth?: number, maxNodes?: number, importsOnly?: boolean }`. Result: `{ nodes, edges, total, stats }`.
+Params: `{ level?: "file"|"module", focus?: string, depth?: number, maxNodes?: number, importsOnly?: boolean }`. Result: `{ nodes, edges, total, stats, skippedDirs, skippedDirCount }`.
+
+- `skippedDirs` is `[{ path, reason }]` (at most 200, sorted by path): the folders the index does not walk into because they are build output, dependencies, or caches. A folder is skipped for its name (`node_modules`, `target`, `dist`, `build`, `out`, …), for a marker file that tools write into their output (`CACHEDIR.TAG`, `.rustc_info.json`, `CMakeCache.txt`, `pyvenv.cfg`, `.nojekyll`, a `_nuxt`/`_next`/`_astro` folder, …), or because a `tsconfig.json` next to it names it as `outDir`. A folder that a build makes after the scan is found on its first change notice. `skippedDirCount` is the full count. The workspace `stats` carry the same `skippedDirs` and `skippedDirCount`.
 
 - The graph comes from the index. **Import** edges come from resolved import statements (Rust `mod`/`use crate|super|self`, TypeScript/JavaScript relative `import`/`require`, Python `import`/`from`, Go package imports). **Reference** edges link a file to the file that defines a symbol it uses (any tree-sitter language). A name defined in more than 3 files is not linked.
 - `level: "module"` rolls files up into their directories. Without `focus`, the `maxNodes` (default 250, at most 600) most connected nodes are returned; with `focus` (a file or directory), the nodes within `depth` (default 1, at most 4) steps.
@@ -189,8 +191,21 @@ The prompt is 1..=100 000 characters. With no route and no `provider`, the reque
 | `edits/undo` | request | `{ operation }` → `{ restored, conflicts }` |
 | `config/hooks` | request | `{ hooks, workspaceTrusted }` → `{ hooks, workspaceHooks }` |
 | `mcp/configure` / `mcp/status` | request | `{ servers, workspaceTrusted }` → server status / server status. A server is `{ type?: "stdio"\|"http"\|"sse", command?, args?, env?, cwd?, url?, headers?, timeoutMs?, disabled? }`; unknown fields (from Claude or VS Code files) are ignored. Status entries are `{ name, command, disabled, running, tools, error }`, where `command` is the URL for a remote server. |
-| `skills/list` / `worktrees/list` | request | the skills found / the task-x worktree names |
-| `skills/resolve` | request | `{ prompt, paths? }` → `{ active: [{ name, reason, source, text }] }`: the skills that apply (a leading `/name`, a trigger word, or a file pattern), with `{{param}}` values filled in. Clients use it to give skills to another agent, such as the Claude Code CLI. |
+| `skills/list` / `worktrees/list` | request | the skills found / the task-x worktree names. A skill entry is `{ name, description, kind, triggers, patterns, tools, params, argumentHint?, source, onDemand }`; `kind` is `skill`, `command` (Claude Code slash commands from `commands/` folders), or `prompt` (Copilot prompt files). Plugin skills and commands are named `<plugin>:<name>`. |
+| `skills/resolve` | request | `{ prompt, paths? }` → `{ active: [{ name, reason, source, text }] }`: the skills that apply (a leading `/name`, a trigger word, or a file pattern), with `{{param}}` values filled in. For a command, `$ARGUMENTS` and `$1`…`$9` are filled from the text after `/name`. `/name` also finds a plugin's `<plugin>:name` when only one plugin has it. Clients use it to give skills to another agent, such as the Claude Code CLI. |
+| `agents/list` | request | → `[{ name, description, tools, writes, model, maxIterations, source }]`: the custom agents (see [Custom agents](#custom-agents)), workspace agents first, then the user's, then plugin agents (`<plugin>:<name>`). |
+| `plugins/list` | request | → `[{ name, id, version, description, path, enabled, source, skills, agents, commands, mcpServers? }]`. `source` is `claude` (installed by Claude Code, enabled per `enabledPlugins` in `~/.claude/settings.json`), `user` (`~/.task-x/plugins/`), `workspace` (`.task-x/plugins/`, turned off by `.task-x/plugins.json` `{ disabled }`), or `client`. |
+| `plugins/install` / `plugins/uninstall` / `plugins/update` | request | `{ spec, scope?, force? }` / `{ name, scope? }` / `{ name, scope? }`. `spec` is `name@marketplace`, an https or ssh git URL, `owner/repo`, or an absolute folder; `scope` is `user` (default, `~/.task-x/plugins/`) or `workspace` (`.task-x/plugins/`). install → `{ name, path, scope, version, marketplace }`. |
+| `plugins/marketplaces` / `plugins/marketplaceAdd` / `plugins/marketplaceUpdate` / `plugins/marketplaceRemove` | request | → `[{ name, path, owner: "task-x"\|"claude", plugins: [{ name, description, version, source }] }]` / `{ source }` → the marketplace / `{ name }` → the marketplace / `{ name }` → `{ removed }`. Only task-x's own marketplaces can be updated or removed. |
+| `agent/checkpoints` | request | `{ taskId }` → `[{ index, prompt, messages, operations, createdMs }]`: one per user prompt. `agent/task` also returns `checkpoints` and `forkedFrom`. |
+| `agent/rewind` | request | `{ taskId, checkpoint, restoreCode? }` → `{ taskId, checkpoint, messages, undone, conflicts, text }`. Cuts the conversation back to before that prompt and, unless `restoreCode` is false, undoes the edits made since (a file changed after the agent's edit is a conflict and stays). Waits for a running task on the same id. |
+| `agent/fork` | request | `{ taskId, checkpoint? }` → `{ taskId, title, messages, forkedFrom }`: a copy under a new id, cut before `checkpoint` when given. The fork owns no edits. |
+| `agent/compact` / `agent/cost` | request | `{ taskId }` → `{ pruned, folded, droppedRetrieval, beforeTokens, afterTokens }` / `{ usage, costUsd, unpricedTokens, billedTokens, localTokens, modelCalls, modelMs, toolMs, toolCalls, iterations, prompts, subagents, subagentCostUsd, subagentTokens, compactions }`. |
+| `memory/search` / `memory/forget` | request | `{ query, limit? }` → `{ query, entries, results: [{ id, kind, title, text, files, createdMs, score }] }` / `{ id }` → `{ removed }`. See [Memory](#memory-and-the-repository-map). |
+| `mcp/authorize` | request | `{ server }` → MCP status. Runs the OAuth sign-in for a remote server (see below). |
+| `mcp/openUrl` | **request runtime → client** | `{ server, url }` → `{ opened }`. The client opens the sign-in page. |
+| `mcp/authorizeUrl` / `mcp/tokens` | notification (runtime → client) | `{ server, url }` / `{ server, tokens: { accessToken, refreshToken?, expiresAtMs?, clientId, clientSecret?, tokenEndpoint, resource } }`. The client keeps the tokens (SecretStorage) and sends them back as `oauth` on the server in `mcp/configure`. `mcp/status` entries have `authRequired` and `signedIn`. |
+| `plugins/configure` | request | `{ dirs?, disabled?, workspaceTrusted? }` → `{ plugins, enabled }`. A workspace plugin's hooks run only with `workspaceTrusted`. `dirs` are extra plugin folders (absolute paths, else `-32602`); `disabled` are plugin names or ids to turn off. The setting applies to every later `agent/run`, `skills/*`, and `agents/list`. |
 
 `policy` is `{ mode, allow, deny, allowAll?, editMode? }`. With `allowAll: true`, every tool call runs with no `agent/requestApproval`, destructive tools included; only `deny` refuses a tool. MCP tools are then offered in every mode, and a read-only mode still refuses other writes. Commands stay in the sandbox.
 
@@ -223,16 +238,42 @@ With a `dataDir`, the edit log (checkpoints) is saved per workspace in `dataDir/
 
 `run_plan` takes `{ steps: [{ id, role, objective, context?, dependsOn? }], merge? }` (1 to 12 steps, roles `research`, `implementation`, `testing`, `review`, `documentation`). A role is matched case-insensitively and accepts the common aliases a model writes (`Research`, `code`, `docs`, `qa`, `reviewer`); anything else fails the call with `-32602`-style `invalidInput` naming the five roles. The runtime starts every step whose dependencies are done, up to `limits.maxParallel` (default 3, at most 8) at a time. A step gets the reports of its direct dependencies, and a writing step starts from the patches of all its writing ancestors (committed in its worktree, so its own patch holds only its changes). A step whose dependency did not complete is skipped. When all steps end, writing steps are merged into the working tree in dependency order through the edit log. A step that conflicts keeps its worktree.
 
-`roleProviders: [{ role, provider }]` sets the model for subagents of one role. Events:
+A step can name a custom `agent` in place of `role` (`{ id, agent, objective }`); the agent's mode decides whether it gets a worktree. `roleProviders: [{ role, provider }]` sets the model for subagents of one role. Events:
 
 | type | fields |
 |---|---|
-| `planStarted` | `callId`, `maxParallel`, `steps: [{ id, role, objective, dependsOn }]` |
-| `subagentStarted` | `name` (worktree name), `taskId`, `role`, `objective`, `kind`, `model`, `dir` (worktree folder or null), `step` |
+| `planStarted` | `callId`, `maxParallel`, `steps: [{ id, role, agent, objective, dependsOn }]` |
+| `subagentStarted` | `name` (worktree name), `taskId`, `role`, `agent` (custom agent name or null), `objective`, `kind`, `model`, `dir` (worktree folder or null), `step` |
 | `subagent` | `name`, `taskId`, `event` (the subagent's own event) |
-| `subagentFinished` | `name`, `taskId`, `role`, `status`, `error`, `costUsd`, `unpricedTokens`, `tokens`, `files`, `added`, `removed`, `worktree` |
+| `subagentFinished` | `name`, `taskId`, `role`, `agent`, `status`, `error`, `costUsd`, `unpricedTokens`, `tokens`, `files`, `added`, `removed`, `worktree` |
 | `stepSkipped` | `step`, `reason` |
 | `merged` | `step`, `name`, `ok`, `files`, `error` |
+
+### Custom agents
+
+A custom agent is a Markdown file in Claude Code's agent format: `.claude/agents/`, `.github/agents/`, and `.task-x/agents/` in the workspace, `~/.claude/agents/`, `~/.copilot/agents/`, and `~/.task-x/agents/`, and the `agents/` folder of each enabled plugin. Front matter: `name`, `description`, `tools` (Claude Code names such as `Read, Grep, Edit, Bash` map to task-x tools), `mode` (`read` or `write`; without it, an agent whose tools only read is read-only), `model` (a model id, or `sonnet`/`opus`/`haiku` on Anthropic; `inherit` keeps the caller's), and `maxIterations` (1 to 60).
+
+- With agents present, a top-level task in Agent or Team mode gets an `<available_agents>` list, and `run_subagent` and `run_plan` steps take `agent` in place of `role`. An unknown agent fails the call with `invalidInput` naming the agents.
+- The subagent gets the agent's instructions in an `<agent>` block, only its tools (plus every read tool), its model, and its turn limit. A writing agent works in its own worktree, as a writing role does.
+- A prompt that starts with `@name` (an agent's name) runs the whole task as that agent; `@name` is removed from the request, and the `started` event has `agent`. A read-only agent makes the task read-only.
+
+These fields are additive, so the protocol version is unchanged.
+
+### Subagents in the background and nested subagents
+
+- `run_subagent` takes `background: true`: the call returns at once with `{ background, name, taskId }`, and the subagent's result reaches the lead as a message when it ends. The lead does not finish while background work runs.
+- `limits.maxDepth` (default 2, at most 3) sets the levels of subagents: at 2, a writing subagent gets `run_subagent` too and can hand a part of its work to its own subagent, in a worktree of its worktree.
+
+### Memory and the repository map
+
+- A completed top-level task adds `{ id, title, text, files }` to `<dataDir>/memory/<workspace hash>.jsonl` (the newest 1,000 are kept). The `recall { query, limit? }` tool searches it with BM25, with the notes of `.task-x/memory.md`.
+- Each top-level task starts with a `<repo_map>` block of at most `limits.repoMapTokens` (default 1,000; 0 = none): the files ranked by PageRank over the project graph (leaning towards the files of the request), each with its main definitions and their lines. The `repo_map { focus?, budgetTokens? }` tool gives a larger one.
+- The project graph is saved in `<dataDir>/graphs/<workspace hash>.json` with the engine version and a fingerprint of the indexed files (paths, sizes, times). `workspace/open` reads it back while they match. `graph/project` stats have `cached`.
+- `workspace/open` takes `watch: true`: the runtime then looks for changed, new, and deleted files every 2 seconds (one `stat` per known file and folder, and a listing only of folders whose time moved), indexes them once a burst settles, and sends `workspace/progress { phase: "updated", changed, changedCount, by: "watcher" }`.
+
+### Hook events
+
+`config/hooks` accepts the events `userPromptSubmit`, `stop`, `subagentStop`, `preCompact`, and `notification` besides the earlier ones, and Claude Code's names (`PreToolUse`, `Stop`, …). Hooks from `config/hooks` are trusted (they may approve a call); workspace hooks are not. See [extensibility.md](extensibility.md#hooks).
 
 ### Best of N
 

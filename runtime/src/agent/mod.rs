@@ -1,11 +1,16 @@
 //! The agent loop: enriched request → model → tool calls (policy-checked, approved, executed) →
 //! results back to the model → … until the model finishes or a limit stops it.
 
+pub mod agents;
+pub mod session;
 pub mod compact;
 pub mod cost;
 pub mod hooks;
+pub mod marketplace;
+pub mod plugins;
 pub mod policy;
 pub mod prompt;
+pub mod recall;
 pub mod skills;
 pub mod store;
 pub mod team;
@@ -45,6 +50,9 @@ const VALIDATION_TOOLS: &[&str] = &["run_tests", "check_build", "run_linter", "f
 const COMMAND_HANDOFF: Duration = Duration::from_secs(30);
 /// How often a reply with no text and no tool call is answered with `EMPTY_ANSWER_NUDGE`.
 const MAX_EMPTY_ANSWERS: u32 = 2;
+/// How often a stop hook may send the agent back to work in one run (a hook that always blocks
+/// would otherwise keep the task going until a limit stops it).
+const MAX_STOP_BLOCKS: u32 = 3;
 const EMPTY_ANSWER_NUDGE: &str = "Your last reply had no text. Write your answer to the request now, as plain text in your reply (not only in your reasoning). If you need more information, call a tool.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -114,10 +122,24 @@ pub struct Limits {
     /// Reasoning effort for every model call of the task. Unset: each model's default.
     #[serde(default)]
     pub effort: Option<crate::provider::types::Effort>,
+    /// Levels of subagents: 1 = only the lead delegates; 2 (default) = its subagents may delegate once more.
+    #[serde(default = "d_depth")]
+    pub max_depth: u32,
+    /// Tokens of the repository map in the first request of a task (0 = none).
+    #[serde(default = "d_repo_map")]
+    pub repo_map_tokens: usize,
+}
+fn d_repo_map() -> usize {
+    1_000
 }
 fn d_parallel() -> u32 {
     3
 }
+fn d_depth() -> u32 {
+    2
+}
+/// The deepest subagent nesting `limits.maxDepth` allows.
+const MAX_DEPTH: u32 = 3;
 fn d_compact_percent() -> u32 {
     70
 }
@@ -144,6 +166,8 @@ impl Default for Limits {
             max_parallel: d_parallel(),
             lazy_tools: false,
             effort: None,
+            max_depth: d_depth(),
+            repo_map_tokens: d_repo_map(),
         }
     }
 }
@@ -189,6 +213,10 @@ pub struct RunParams {
     /// Nesting level; subagents run at depth 1 and cannot start more subagents.
     #[serde(default, skip_deserializing)]
     pub depth: u32,
+    /// The custom agent this run acts as (set by the lead for a subagent; a top-level prompt
+    /// that starts with `@name` sets it too).
+    #[serde(default, skip_deserializing)]
+    pub agent: Option<agents::AgentDef>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -238,6 +266,95 @@ struct SubTotals {
     cost_usd: f64,
     tokens: u64,
     unpriced: u64,
+}
+
+/// A prepared subagent: everything it needs to run and report, owned, so it can run in the lead's
+/// turn (`finish().await`) or in its own task (a background subagent).
+struct SubJob {
+    host: Host,
+    params: RunParams,
+    child_id: String,
+    name: String,
+    role: team::Role,
+    agent_name: Option<String>,
+    provider: ProviderConfig,
+    dir: Option<std::path::PathBuf>,
+    step: Option<String>,
+    objective: String,
+    parent_emit: EmitFn,
+    parent_id: String,
+    subagents: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    sub_totals: Arc<Mutex<SubTotals>>,
+    cwd: std::path::PathBuf,
+    /// The lead's token; the subagent runs under a child of it.
+    cancel: CancellationToken,
+}
+
+impl SubJob {
+    fn emit(&self, event: Value) {
+        (self.parent_emit)(&self.parent_id, event);
+    }
+
+    /// Runs the subagent to its end. Returns the tool result and, for writers, the full patch.
+    async fn finish(self) -> Result<(Value, Option<String>), String> {
+        let (role, name, child_id, agent_name) = (self.role, self.name.clone(), self.child_id.clone(), self.agent_name.clone());
+        let child_cancel = self.cancel.child_token();
+        self.subagents.lock().expect("subagents lock").insert(child_id.clone(), child_cancel.clone());
+        self.emit(json!({
+            "type": "subagentStarted", "name": name, "taskId": child_id, "role": role, "agent": agent_name, "objective": self.objective,
+            "kind": self.provider.kind, "model": self.provider.model, "dir": self.dir, "step": self.step,
+        }));
+        let res = run_boxed(self.host.clone(), self.params.clone(), child_cancel).await;
+        self.subagents.lock().expect("subagents lock").remove(&child_id);
+        let rec = match res {
+            Ok(r) => r,
+            Err(e) => {
+                self.emit(json!({
+                    "type": "subagentFinished", "name": name, "taskId": child_id, "role": role, "agent": agent_name, "status": "failed", "error": e,
+                }));
+                return Err(e);
+            }
+        };
+        let m = &rec.metrics;
+        let tokens = m.local_tokens + m.billed_tokens;
+        {
+            let mut t = self.sub_totals.lock().expect("subtotals lock");
+            t.count += 1;
+            t.cost_usd += m.cost_usd;
+            t.tokens += tokens;
+            t.unpriced += m.unpriced_tokens;
+        }
+        let mut out = json!({
+            "role": role,
+            "agent": agent_name,
+            "status": rec.status,
+            "report": rec.final_text,
+            "changedFiles": rec.changed_files,
+            "validations": rec.validations,
+            "model": self.provider.model,
+            "costUsd": m.cost_usd,
+            "tokens": tokens,
+        });
+        let mut full = None;
+        let (mut files, mut added, mut removed) = (Vec::new(), 0, 0);
+        if role.writes() {
+            let (repo, cancel, nm) = (self.cwd.clone(), self.cancel.clone(), name.clone());
+            let patch = tokio::task::spawn_blocking(move || team::diff(&repo, &nm, &cancel)).await.map_err(|e| e.to_string())??;
+            (added, removed) = team::patch_stat(&patch);
+            files = team::patch_paths(&patch);
+            out["worktree"] = json!(name);
+            out["dir"] = json!(self.dir);
+            out["patch"] = json!(truncate(&patch, MAX_PATCH_CHARS));
+            out["next"] = json!("Review the patch, then call worktree_apply or worktree_discard.");
+            full = Some(patch);
+        }
+        self.emit(json!({
+            "type": "subagentFinished", "name": name, "taskId": child_id, "role": role, "agent": agent_name, "status": rec.status, "error": rec.error,
+            "costUsd": m.cost_usd, "unpricedTokens": m.unpriced_tokens, "tokens": tokens, "files": files, "added": added, "removed": removed,
+            "worktree": role.writes().then_some(&name),
+        }));
+        Ok((out, full))
+    }
 }
 
 pub fn is_local(p: &ProviderConfig) -> bool {
@@ -360,6 +477,8 @@ pub struct Host {
     pub steers: Steers,
     /// Running tool calls by `taskId:callId`, so the user can stop one and the task goes on (`agent/cancelTool`).
     pub tool_cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// Extra plugin folders and disabled plugins (`plugins/configure`).
+    pub plugins: Arc<RwLock<plugins::Settings>>,
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -504,7 +623,7 @@ struct Run {
     /// Subagent worktrees created by this task → whether their patch was applied.
     worktrees: Mutex<HashMap<String, bool>>,
     sub_count: std::sync::atomic::AtomicU32,
-    sub_totals: Mutex<SubTotals>,
+    sub_totals: Arc<Mutex<SubTotals>>,
     /// Real prompt tokens ÷ character estimate, from the last response (calibrates estimates).
     token_ratio: f64,
     prices: Vec<cost::PriceRule>,
@@ -516,10 +635,15 @@ struct Run {
     deferred: Vec<crate::provider::ToolSpec>,
     helper: Option<ProviderConfig>,
     embeddings: Option<ProviderConfig>,
+    /// Custom agents the lead can delegate to (`run_subagent { agent }`, plan steps).
+    agents: Vec<agents::AgentDef>,
+    /// `additionalContext` from hooks, given to the model before its next step.
+    hook_notes: Mutex<Vec<String>>,
 }
 
 /// Tools offered from the start when the tool list is lazy: what nearly every coding task uses.
 const CORE_TOOLS: &[&str] = &[
+    "recall",
     "read_file",
     "read_range",
     "read_symbol",
@@ -653,7 +777,8 @@ enum Target {
     Builtin(&'static tools::ToolDef),
     Mcp(Arc<mcp::Client>, mcp::McpTool),
     Skill,
-    Subagent(team::Role),
+    /// `run_subagent`: the role, and the custom agent when one was named.
+    Subagent(team::Role, Option<String>),
     Worktree(&'static str),
     /// `run_plan`; true when a step writes.
     Plan(bool),
@@ -666,13 +791,19 @@ enum Target {
     /// `semantic_search` over the project, and `docs_search` over indexed docs.
     Semantic,
     Docs,
+    /// `recall`: the memory of earlier tasks in this workspace.
+    Recall,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PlanStep {
     id: String,
-    role: team::Role,
+    /// The built-in role; a step may name a custom `agent` instead.
+    #[serde(default)]
+    role: Option<team::Role>,
+    #[serde(default)]
+    agent: Option<String>,
     objective: String,
     #[serde(default)]
     context: String,
@@ -706,6 +837,9 @@ fn plan_order(steps: &[PlanStep]) -> Result<Vec<usize>, String> {
         }
         if s.objective.trim().is_empty() {
             return Err(format!("step '{}' has no objective", s.id));
+        }
+        if s.role.is_none() && s.agent.as_deref().is_none_or(|a| a.trim().is_empty()) {
+            return Err(format!("step '{}' needs a role or an agent", s.id));
         }
     }
     for s in steps {
@@ -742,23 +876,34 @@ struct StepResult {
     worktree: Option<String>,
 }
 
-fn team_specs() -> Vec<crate::provider::ToolSpec> {
+/// The `agent` property for `run_subagent` and plan steps, when custom agents exist.
+fn agent_property(agents: &[agents::AgentDef]) -> Option<Value> {
+    (!agents.is_empty()).then(|| {
+        json!({ "type": "string", "enum": agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), "description": "A custom agent from <available_agents>: its instructions, tools, and model apply. Give agent or role." })
+    })
+}
+
+fn team_specs(agents: &[agents::AgentDef]) -> Vec<crate::provider::ToolSpec> {
     let spec = |name: &str, description: &str, schema: Value| crate::provider::ToolSpec {
         name: name.into(),
         description: description.into(),
         input_schema: schema,
     };
+    let mut description = "Delegate one bounded, independent piece of work to a subagent. Use only for substantial work that can run on its own (several can run in parallel); do the work yourself for small tasks. role is one of research, implementation, testing, review, documentation (writing roles get an isolated git worktree and return a patch; apply it with worktree_apply after reviewing it).".to_owned();
+    let mut schema = json!({ "type": "object", "properties": {
+        "role": { "type": "string", "enum": ["research", "implementation", "testing", "review", "documentation"], "description": "research and review read only; implementation, testing, and documentation edit in a worktree" },
+        "objective": { "type": "string", "description": "What to achieve and how to know it is done" },
+        "context": { "type": "string", "description": "Relevant facts, files, and constraints" },
+        "name": { "type": "string", "description": "Worktree name (letters, digits, - and _)" },
+        "background": { "type": "boolean", "description": "Return at once and keep working; the subagent's report arrives as a message when it ends" }
+    }, "required": ["role", "objective"], "additionalProperties": false });
+    if let Some(a) = agent_property(agents) {
+        description.push_str(" Give agent instead of role to use a custom agent from <available_agents>.");
+        schema["properties"]["agent"] = a;
+        schema["required"] = json!(["objective"]);
+    }
     vec![
-        spec(
-            "run_subagent",
-            "Delegate one bounded, independent piece of work to a subagent. Use only for substantial work that can run on its own (several can run in parallel); do the work yourself for small tasks. role is one of research, implementation, testing, review, documentation (writing roles get an isolated git worktree and return a patch; apply it with worktree_apply after reviewing it).",
-            json!({ "type": "object", "properties": {
-                "role": { "type": "string", "enum": ["research", "implementation", "testing", "review", "documentation"], "description": "research and review read only; implementation, testing, and documentation edit in a worktree" },
-                "objective": { "type": "string", "description": "What to achieve and how to know it is done" },
-                "context": { "type": "string", "description": "Relevant facts, files, and constraints" },
-                "name": { "type": "string", "description": "Worktree name (letters, digits, - and _)" }
-            }, "required": ["role", "objective"], "additionalProperties": false }),
-        ),
+        spec("run_subagent", &description, schema),
         spec(
             "worktree_apply",
             "Apply a subagent worktree's patch to the main working tree (refuses on conflicts).",
@@ -844,20 +989,25 @@ fn ask_spec() -> crate::provider::ToolSpec {
     }
 }
 
-fn plan_spec() -> crate::provider::ToolSpec {
+fn plan_spec(agents: &[agents::AgentDef]) -> crate::provider::ToolSpec {
+    let mut schema = json!({ "type": "object", "properties": {
+        "steps": { "type": "array", "minItems": 1, "maxItems": MAX_PLAN_STEPS, "items": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "Short id: letters, digits, - and _" },
+            "role": { "type": "string", "enum": ["research", "implementation", "testing", "review", "documentation"] },
+            "objective": { "type": "string", "description": "What to achieve and how to know it is done" },
+            "context": { "type": "string", "description": "Relevant facts, files, and constraints" },
+            "dependsOn": { "type": "array", "items": { "type": "string" }, "description": "Ids of steps that must finish first" }
+        }, "required": ["id", "role", "objective"], "additionalProperties": false } },
+        "merge": { "type": "boolean", "description": "Merge writers' work into the working tree (default true)" }
+    }, "required": ["steps"], "additionalProperties": false });
+    if let Some(a) = agent_property(agents) {
+        schema["properties"]["steps"]["items"]["properties"]["agent"] = a;
+        schema["properties"]["steps"]["items"]["required"] = json!(["id", "objective"]);
+    }
     crate::provider::ToolSpec {
         name: "run_plan".into(),
-        description: "Run a plan as a team of subagents. Steps whose dependencies are done run at the same time (up to the parallel limit). A step gets the reports of the steps it depends on, and writers start from their work. When all steps finish, the work of writing steps is merged into the working tree in dependency order; a step that conflicts keeps its worktree. Returns each step's status, report, and merge result.".into(),
-        input_schema: json!({ "type": "object", "properties": {
-            "steps": { "type": "array", "minItems": 1, "maxItems": MAX_PLAN_STEPS, "items": { "type": "object", "properties": {
-                "id": { "type": "string", "description": "Short id: letters, digits, - and _" },
-                "role": { "type": "string", "enum": ["research", "implementation", "testing", "review", "documentation"] },
-                "objective": { "type": "string", "description": "What to achieve and how to know it is done" },
-                "context": { "type": "string", "description": "Relevant facts, files, and constraints" },
-                "dependsOn": { "type": "array", "items": { "type": "string" }, "description": "Ids of steps that must finish first" }
-            }, "required": ["id", "role", "objective"], "additionalProperties": false } },
-            "merge": { "type": "boolean", "description": "Merge writers' work into the working tree (default true)" }
-        }, "required": ["steps"], "additionalProperties": false }),
+        description: "Run a plan as a team of subagents. Steps whose dependencies are done run at the same time (up to the parallel limit). A step gets the reports of the steps it depends on, and writers start from their work. When all steps finish, the work of writing steps is merged into the working tree in dependency order; a step that conflicts keeps its worktree. Each step has a role or a custom agent. Returns each step's status, report, and merge result.".into(),
+        input_schema: schema,
     }
 }
 
@@ -866,8 +1016,8 @@ impl Target {
         match self {
             Self::Builtin(d) => d.permission,
             Self::Mcp(..) => Permission::Network,
-            Self::Skill | Self::Ask(_) | Self::FindTool | Self::Summarize | Self::Semantic | Self::Docs => Permission::Read,
-            Self::Subagent(r) => {
+            Self::Skill | Self::Ask(_) | Self::FindTool | Self::Summarize | Self::Semantic | Self::Docs | Self::Recall => Permission::Read,
+            Self::Subagent(r, _) => {
                 if r.writes() {
                     Permission::Write
                 } else {
@@ -888,7 +1038,7 @@ impl Target {
     }
     /// Reads and subagents (each writer has its own worktree) can run concurrently.
     fn parallel_safe(&self) -> bool {
-        (self.is_read() || matches!(self, Self::Subagent(_))) && !matches!(self, Self::Plan(_))
+        (self.is_read() || matches!(self, Self::Subagent(..))) && !matches!(self, Self::Plan(_))
     }
 }
 
@@ -947,12 +1097,14 @@ impl Run {
     /// Only `messages` are ever touched. The tool list (`tool_specs`), the system prompt, and the
     /// `<tools>` guide in it are never compressed: a run that loses them starts inventing tool
     /// names and argument fields, which is far more expensive than the tokens they cost.
-    fn compress(&mut self, window: usize) {
+    async fn compress(&mut self, window: usize) {
         let limit = window * self.limits.compact_percent.clamp(30, 95) as usize / 100;
         let before = self.used_tokens();
         if before <= limit {
             return;
         }
+        let note = json!({ "taskId": self.rec.id, "trigger": "auto", "beforeTokens": before, "windowTokens": window });
+        let _ = self.hook_event(hooks::Event::PreCompact, None, note, None).await;
         let pruned = compact::prune(&mut self.rec.messages);
         let mut folded = 0;
         if self.used_tokens() > limit {
@@ -979,7 +1131,7 @@ impl Run {
             // Rebuilt on every attempt: after a fallback the model, its context window, the amount
             // of history that fits, and the request shape (e.g. Ollama's `num_ctx`) all change.
             let window = self.window_dynamic().await;
-            self.compress(window);
+            self.compress(window).await;
             // A history saved while a run stopped between a tool call and its result is rejected
             // whole by the provider, so it is repaired before each request (and the repair is kept).
             if repair_history(&mut self.rec.messages) > 0 {
@@ -1067,6 +1219,8 @@ impl Run {
 
     /// Puts the questions to the user and waits for the answers (or a dismissal).
     async fn ask(&self, call: &ToolCall, qs: &[Question]) -> Value {
+        let note = json!({ "taskId": self.rec.id, "kind": "question", "message": qs.first().map_or("task-x has a question", |q| q.text.as_str()) });
+        let _ = self.hook_event(hooks::Event::Notification, None, note, None).await;
         let req = AskRequest { task_id: self.rec.id.clone(), call_id: call.id.clone(), questions: qs.to_vec() };
         let answers = (self.host.ask)(req, self.cancel.clone()).await;
         answer_json(qs, answers)
@@ -1075,7 +1229,7 @@ impl Run {
     /// Applies the permission policy and the user's answer. A policy denial is `Forbidden` (Blocked:
     /// nothing the model sends can change it); a denial the user chose is a plain failure it can
     /// react to by changing the approach.
-    async fn decide(&mut self, call: &ToolCall, name: &str, permission: Permission) -> Result<(), tools::ToolError> {
+    async fn decide(&mut self, call: &ToolCall, name: &str, permission: Permission, hook_approved: bool) -> Result<(), tools::ToolError> {
         let denied = |why: &str| {
             tools::ToolError::new(
                 ToolErrorKind::Forbidden,
@@ -1085,7 +1239,14 @@ impl Run {
         match self.policy.decide(name, permission) {
             Decision::Allow => Ok(()),
             Decision::Deny => Err(denied("do not call it again, use another way or tell the user what they must allow")),
+            // A trusted hook (user settings or an installed plugin) answered for the user.
+            Decision::Ask if hook_approved => {
+                self.emit(json!({ "type": "approvalResolved", "callId": call.id, "decision": "Allow", "by": "hook" }));
+                Ok(())
+            }
             Decision::Ask => {
+                let note = json!({ "taskId": self.rec.id, "kind": "approval", "tool": name, "message": format!("task-x needs your approval to run {name}") });
+                let _ = self.hook_event(hooks::Event::Notification, Some(name), note, None).await;
                 let req = ApprovalRequest {
                     task_id: self.rec.id.clone(),
                     call_id: call.id.clone(),
@@ -1140,7 +1301,7 @@ impl Run {
     /// Checks one call (availability, input shape, repeated failures, hooks, permission) and returns
     /// what to execute. Approval prompts happen here, once per call, and only after the hooks that
     /// can still block the call have run.
-    async fn prepare(&mut self, call: &ToolCall) -> Result<Target, tools::ToolError> {
+    async fn prepare(&mut self, call: &mut ToolCall) -> Result<Target, tools::ToolError> {
         let failed = |m: &str| tools::ToolError::new(ToolErrorKind::Failed, m);
         // Bad input is the model's to fix: a UserError tells it so instead of "the same call fails again".
         let invalid = |m: &str| tools::ToolError::new(ToolErrorKind::InvalidInput, m);
@@ -1159,25 +1320,30 @@ impl Run {
         let target = match tools::find(&call.name) {
             Some(def) => Target::Builtin(def),
             None if call.name == READ_SKILL => Target::Skill,
-            None if call.name == "run_subagent" => {
-                let raw = call.input["role"].as_str().unwrap_or_default();
-                let role = team::Role::parse(raw).ok_or_else(|| {
-                    invalid(&format!("unknown role '{raw}'; use one of: {} (any capitalisation works)", team::Role::NAMES))
-                })?;
-                Target::Subagent(role)
-            }
-            None if call.name == "run_plan" => Target::Plan(
-                call.input["steps"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|s| serde_json::from_value::<team::Role>(s["role"].clone()).map_or(true, |r: team::Role| r.writes())),
-            ),
+            None if call.name == "run_subagent" => match call.input["agent"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                // A named custom agent brings its own role; its name is kept as it was found.
+                Some(n) => {
+                    let a = agents::find(&self.agents, n).ok_or_else(|| {
+                        let names = self.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ");
+                        invalid(&format!("unknown agent '{n}'; available agents: {}", if names.is_empty() { "(none)" } else { &names }))
+                    })?;
+                    Target::Subagent(a.role(), Some(a.name.clone()))
+                }
+                None => {
+                    let raw = call.input["role"].as_str().unwrap_or_default();
+                    let role = team::Role::parse(raw).ok_or_else(|| {
+                        invalid(&format!("unknown role '{raw}'; use one of: {} (any capitalisation works)", team::Role::NAMES))
+                    })?;
+                    Target::Subagent(role, None)
+                }
+            },
+            None if call.name == "run_plan" => Target::Plan(call.input["steps"].as_array().into_iter().flatten().any(|s| self.step_writes(s))),
             None if call.name == ASK_USER => Target::Ask(parse_questions(&call.input).map_err(|e| invalid(&e))?),
             None if call.name == FIND_TOOL => Target::FindTool,
             None if call.name == SUMMARIZE => Target::Summarize,
             None if call.name == SEMANTIC => Target::Semantic,
             None if call.name == DOCS_SEARCH => Target::Docs,
+            None if call.name == "recall" => Target::Recall,
             None if call.name == "worktree_apply" => Target::Worktree("worktree_apply"),
             None if call.name == "worktree_discard" => Target::Worktree("worktree_discard"),
             None => self
@@ -1207,14 +1373,23 @@ impl Run {
         // Hooks run before the approval prompt: a hook that blocks a call must not leave the user with
         // a prompt for work that will not happen, and an approval must not be able to override it.
         let payload = json!({ "taskId": self.rec.id, "tool": call.name, "input": call.input });
-        self.hook(hooks::Event::BeforeTool, &call.name, payload.clone(), None).await.map_err(|e| blocked(&e))?;
+        let before = self.hook(hooks::Event::BeforeTool, &call.name, payload, None).await.map_err(|e| blocked(&e))?;
+        // A beforeTool hook may rewrite the input of a registry or MCP tool (the agent's own tools
+        // were already read from it above, so theirs stays as the model sent it).
+        if let Some(new) = before.updated_input.filter(|v| v.is_object() && matches!(target, Target::Builtin(_) | Target::Mcp(..))) {
+            self.emit(json!({ "type": "hook", "event": hooks::Event::BeforeTool, "command": "updatedInput", "blocked": false, "message": "a hook changed the tool input", "durationMs": 0 }));
+            call.input = new;
+        }
+        self.hook_notes.lock().expect("hook notes lock").extend(before.context);
+        let payload = json!({ "taskId": self.rec.id, "tool": call.name, "input": call.input });
         if matches!(permission, Permission::Write | Permission::Delete | Permission::External) {
             self.hook(hooks::Event::BeforeEdit, &call.name, payload.clone(), None).await.map_err(|e| blocked(&e))?;
         }
         if VALIDATION_TOOLS.contains(&call.name.as_str()) {
             self.hook(hooks::Event::BeforeValidation, &call.name, payload, None).await.map_err(|e| blocked(&e))?;
         }
-        self.decide(call, &call.name, permission).await?;
+        let name = call.name.clone();
+        self.decide(call, &name, permission, before.approve).await?;
         Ok(target)
     }
 
@@ -1232,50 +1407,126 @@ impl Run {
     }
 
     /// Runs the lifecycle hooks for a tool event on a blocking thread; Err means a hook blocked it.
-    async fn hook(&self, event: hooks::Event, tool: &str, payload: Value, severity: Option<errors::Severity>) -> Result<(), String> {
-        if self.hooks.is_empty() {
-            return Ok(());
+    async fn hook(&self, event: hooks::Event, tool: &str, payload: Value, severity: Option<errors::Severity>) -> Result<hooks::Outcome, String> {
+        self.hook_event(event, Some(tool), payload, severity).await
+    }
+
+    /// Runs the hooks of any event (`tool` is None for task events); Err means a hook blocked it.
+    async fn hook_event(&self, event: hooks::Event, tool: Option<&str>, payload: Value, severity: Option<errors::Severity>) -> Result<hooks::Outcome, String> {
+        if !self.hooks.iter().any(|h| h.event == event) {
+            return Ok(hooks::Outcome::default());
         }
-        let ctx = self.hook_context(event, Some(tool), payload, severity);
+        let ctx = self.hook_context(event, tool, payload, severity);
         let (hooks, cwd, cancel) = (self.hooks.clone(), self.cwd.clone(), self.cancel.clone());
         let results = tokio::task::spawn_blocking(move || hooks::run(&hooks, &ctx, &cwd, &cancel)).await.unwrap_or_default();
         for o in &results {
             self.emit(json!({ "type": "hook", "event": event, "command": o.command, "blocked": o.blocked, "message": o.message(), "durationMs": o.duration_ms }));
         }
-        match results.iter().find(|o| o.blocked) {
+        let out = hooks::Outcome::from_results(results);
+        match out.blocked() {
             Some(o) => Err(format!("Blocked by a {event:?} hook ({}): {}", o.command, o.message())),
-            None => Ok(()),
+            None => Ok(out),
         }
     }
 
-    async fn subagent(&self, role: team::Role, call: &ToolCall) -> Result<Value, String> {
-        self.spawn_sub(role, call, &[], None, None).await.map(|(v, _)| v)
+    /// The `stop` (or, in a subagent, `subagentStop`) hooks: the reason to go on when one blocks.
+    async fn stop_reason(&self, again: bool) -> Option<String> {
+        let event = if self.depth > 0 { hooks::Event::SubagentStop } else { hooks::Event::Stop };
+        let payload = json!({ "taskId": self.rec.id, "text": self.rec.final_text, "stop_hook_active": again });
+        // The model gets the hook's reason, not the "Blocked by a … hook (command)" wrapper.
+        self.hook_event(event, None, payload, None).await.err().map(|e| e.split_once("): ").map_or(e.clone(), |(_, r)| r.to_owned()))
+    }
+
+    /// Whether a plan step (as the model sent it) edits: its custom agent's mode, else its role's.
+    fn step_writes(&self, step: &Value) -> bool {
+        match step["agent"].as_str().and_then(|n| agents::find(&self.agents, n)) {
+            Some(a) => a.writes,
+            None => serde_json::from_value::<team::Role>(step["role"].clone()).map_or(true, |r: team::Role| r.writes()),
+        }
+    }
+
+    /// The role and custom agent of a plan step.
+    fn step_target(&self, step: &PlanStep) -> Result<(team::Role, Option<agents::AgentDef>), String> {
+        match step.agent.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+            Some(n) => {
+                let a = agents::find(&self.agents, n).ok_or_else(|| format!("step '{}': unknown agent '{n}'", step.id))?;
+                Ok((a.role(), Some(a.clone())))
+            }
+            None => Ok((step.role.ok_or_else(|| format!("step '{}' needs a role or an agent", step.id))?, None)),
+        }
+    }
+
+    async fn subagent(&self, role: team::Role, agent: Option<String>, call: &ToolCall) -> Result<Value, String> {
+        let agent = agent.as_deref().and_then(|n| agents::find(&self.agents, n));
+        if call.input["background"] != true {
+            return self.spawn_sub(role, agent, call, &[], None, None).await.map(|(v, _)| v);
+        }
+        // A background subagent: the lead goes on at once, and the report comes as a message.
+        let job = self.setup_sub(role, agent, call, &[], None, None).await?;
+        let (bg, name, child) = (self.background.clone(), job.name.clone(), job.child_id.clone());
+        bg.running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (n2, c2) = (name.clone(), child.clone());
+        tokio::spawn(async move {
+            let report = match job.finish().await {
+                Ok((v, _)) => format!(
+                    "Background subagent {n2} (task {c2}) ended with status {}. Its result:\n{}",
+                    v["status"].as_str().unwrap_or("unknown"),
+                    truncate(&v.to_string(), MAX_BACKGROUND_REPORT_CHARS)
+                ),
+                Err(e) => format!("Background subagent {n2} (task {c2}) failed: {e}"),
+            };
+            bg.done.lock().expect("background lock").push(report);
+            bg.running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            bg.changed.notify_waiters();
+        });
+        Ok(json!({
+            "background": true, "name": name, "taskId": child,
+            "message": "The subagent works in the background. Its report comes to you as a message when it ends; continue with other work now and do not poll for it.",
+        }))
     }
 
     /// Runs a subagent to completion. Writers get a fresh worktree (with `base` patches applied as
     /// a commit) and their own workspace index; their events are forwarded to this task as
-    /// `subagent` events. Returns the tool result and, for writers, the full patch.
+    /// `subagent` events. A custom `agent` brings its instructions, tools, model, and turn limit.
+    /// Returns the tool result and, for writers, the full patch.
     async fn spawn_sub(
         &self,
         role: team::Role,
+        agent: Option<&agents::AgentDef>,
         call: &ToolCall,
         base: &[String],
         provider: Option<ProviderConfig>,
         step: Option<&str>,
     ) -> Result<(Value, Option<String>), String> {
+        self.setup_sub(role, agent, call, base, provider, step).await?.finish().await
+    }
+
+    /// Prepares a subagent (its model, worktree, workspace, and run parameters) as a job that owns
+    /// everything it needs, so it can also run in its own task.
+    async fn setup_sub(
+        &self,
+        role: team::Role,
+        agent: Option<&agents::AgentDef>,
+        call: &ToolCall,
+        base: &[String],
+        provider: Option<ProviderConfig>,
+        step: Option<&str>,
+    ) -> Result<SubJob, String> {
         let n = self.sub_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let label = agent.map_or_else(|| format!("{role:?}"), |a| a.name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(20).collect());
         let name = call.input["name"]
             .as_str()
             .filter(|s| team::valid_name(s))
             .map(str::to_owned)
-            .unwrap_or_else(|| format!("{}-{:?}-{n}", self.rec.id, role).to_lowercase());
+            .unwrap_or_else(|| format!("{}-{label}-{n}", self.rec.id).to_lowercase());
         let objective = call.input["objective"].as_str().unwrap_or_default();
         let context = call.input["context"].as_str().unwrap_or_default();
         let provider = provider
             .or_else(|| self.role_providers.iter().find(|r| r.role == role).map(|r| r.provider.clone()))
             // Research only reads and reports, so the cheap helper model does it when one is set.
-            .or_else(|| self.helper.clone().filter(|_| role == team::Role::Research))
+            .or_else(|| self.helper.clone().filter(|_| role == team::Role::Research && agent.is_none()))
             .unwrap_or_else(|| self.provider.clone());
+        let provider = agents::provider_for(&provider, agent);
         let mut host = self.host.clone();
         host.store = Store::new(None);
         host.seen = Arc::default();
@@ -1311,7 +1562,11 @@ impl Run {
             chat_mode: if role.writes() { ChatMode::Agent } else { ChatMode::Ask },
             policy,
             editor: EditorContext::default(),
-            limits: Limits { max_iterations: SUBAGENT_ITERATIONS, deadline_secs: SUBAGENT_DEADLINE_SECS, ..self.limits.clone() },
+            limits: Limits {
+                max_iterations: agent.and_then(|a| a.max_iterations).unwrap_or(SUBAGENT_ITERATIONS),
+                deadline_secs: SUBAGENT_DEADLINE_SECS,
+                ..self.limits.clone()
+            },
             task_id: Some(child_id.clone()),
             routes: Vec::new(),
             fallbacks: self.fallbacks.clone(),
@@ -1320,62 +1575,26 @@ impl Run {
             helper: self.helper.clone(),
             embeddings: self.embeddings.clone(),
             depth: self.depth + 1,
+            agent: agent.cloned(),
         };
-        let child_cancel = self.cancel.child_token();
-        self.host.subagents.lock().expect("subagents lock").insert(child_id.clone(), child_cancel.clone());
-        self.emit(json!({
-            "type": "subagentStarted", "name": name, "taskId": child_id, "role": role, "objective": objective,
-            "kind": provider.kind, "model": provider.model, "dir": dir, "step": step,
-        }));
-        let res = Box::pin(run(host, params, child_cancel)).await;
-        self.host.subagents.lock().expect("subagents lock").remove(&child_id);
-        let rec = match res {
-            Ok(r) => r,
-            Err(e) => {
-                self.emit(
-                    json!({ "type": "subagentFinished", "name": name, "taskId": child_id, "role": role, "status": "failed", "error": e }),
-                );
-                return Err(e);
-            }
-        };
-        let m = &rec.metrics;
-        let tokens = m.local_tokens + m.billed_tokens;
-        {
-            let mut t = self.sub_totals.lock().expect("subtotals lock");
-            t.count += 1;
-            t.cost_usd += m.cost_usd;
-            t.tokens += tokens;
-            t.unpriced += m.unpriced_tokens;
-        }
-        let mut out = json!({
-            "role": role,
-            "status": rec.status,
-            "report": rec.final_text,
-            "changedFiles": rec.changed_files,
-            "validations": rec.validations,
-            "model": provider.model,
-            "costUsd": m.cost_usd,
-            "tokens": tokens,
-        });
-        let mut full = None;
-        let (mut files, mut added, mut removed) = (Vec::new(), 0, 0);
-        if role.writes() {
-            let (repo, cancel, nm) = (self.cwd.clone(), self.cancel.clone(), name.clone());
-            let patch = tokio::task::spawn_blocking(move || team::diff(&repo, &nm, &cancel)).await.map_err(|e| e.to_string())??;
-            (added, removed) = team::patch_stat(&patch);
-            files = team::patch_paths(&patch);
-            out["worktree"] = json!(name);
-            out["dir"] = json!(dir);
-            out["patch"] = json!(truncate(&patch, MAX_PATCH_CHARS));
-            out["next"] = json!("Review the patch, then call worktree_apply or worktree_discard.");
-            full = Some(patch);
-        }
-        self.emit(json!({
-            "type": "subagentFinished", "name": name, "taskId": child_id, "role": role, "status": rec.status, "error": rec.error,
-            "costUsd": m.cost_usd, "unpricedTokens": m.unpriced_tokens, "tokens": tokens, "files": files, "added": added, "removed": removed,
-            "worktree": role.writes().then_some(&name),
-        }));
-        Ok((out, full))
+        Ok(SubJob {
+            host,
+            params,
+            child_id,
+            name,
+            role,
+            agent_name: agent.map(|a| a.name.clone()),
+            provider,
+            dir,
+            step: step.map(str::to_owned),
+            objective: objective.to_owned(),
+            parent_emit: self.host.emit.clone(),
+            parent_id: self.rec.id.clone(),
+            subagents: self.host.subagents.clone(),
+            sub_totals: self.sub_totals.clone(),
+            cwd: self.cwd.clone(),
+            cancel: self.cancel.clone(),
+        })
     }
 
     /// Worktree name for a plan step: unique per task and within `team::valid_name` limits.
@@ -1389,6 +1608,7 @@ impl Run {
     async fn run_step(
         &self,
         step: &PlanStep,
+        target: &(team::Role, Option<agents::AgentDef>),
         deps: Vec<(String, Value)>,
         base: Vec<String>,
         call_id: &str,
@@ -1398,12 +1618,13 @@ impl Run {
             context
                 .push_str(&format!("\n\nResult of step {id}:\n{}", truncate(out["report"].as_str().unwrap_or(""), MAX_DEP_REPORT_CHARS)));
         }
+        let (role, agent) = (target.0, target.1.as_ref());
         let sub = ToolCall {
             id: format!("{call_id}:{}", step.id),
             name: "run_subagent".into(),
-            input: json!({ "role": step.role, "objective": step.objective, "context": context, "name": self.step_worktree(&step.id) }),
+            input: json!({ "role": role, "agent": agent.map(|a| &a.name), "objective": step.objective, "context": context, "name": self.step_worktree(&step.id) }),
         };
-        (0, self.spawn_sub(step.role, &sub, &base, None, Some(&step.id)).await)
+        (0, self.spawn_sub(role, agent, &sub, &base, None, Some(&step.id)).await)
     }
 
     /// Runs a plan: a scheduler starts every step whose dependencies are done, up to the parallel
@@ -1412,10 +1633,13 @@ impl Run {
         let input: PlanInput = serde_json::from_value(call.input.clone()).map_err(|e| format!("invalid plan: {e}"))?;
         let steps = input.steps;
         let order = plan_order(&steps)?;
+        let targets: Vec<(team::Role, Option<agents::AgentDef>)> = steps.iter().map(|s| self.step_target(s)).collect::<Result<_, _>>()?;
         let max = self.limits.max_parallel.clamp(1, MAX_PARALLEL) as usize;
         self.emit(json!({
             "type": "planStarted", "callId": call.id, "maxParallel": max,
-            "steps": steps.iter().map(|s| json!({ "id": s.id, "role": s.role, "objective": s.objective, "dependsOn": s.depends_on })).collect::<Vec<_>>(),
+            "steps": steps.iter().zip(&targets).map(|(s, (role, agent))| json!({
+                "id": s.id, "role": role, "agent": agent.as_ref().map(|a| &a.name), "objective": s.objective, "dependsOn": s.depends_on
+            })).collect::<Vec<_>>(),
         }));
         let index: HashMap<&str, usize> = steps.iter().enumerate().map(|(i, s)| (s.id.as_str(), i)).collect();
         let mut results: HashMap<usize, StepResult> = HashMap::new();
@@ -1457,8 +1681,9 @@ impl Run {
                         }
                     }
                     let base = order.iter().filter(|o| ancestors.contains(o)).filter_map(|o| results[o].patch.clone()).collect();
+                    let target = &targets[i];
                     running.push(async move {
-                        let (_, r) = self.run_step(s, direct, base, &call.id).await;
+                        let (_, r) = self.run_step(s, target, direct, base, &call.id).await;
                         (i, r)
                     });
                 }
@@ -1521,7 +1746,8 @@ impl Run {
                 let out = r.map(|r| &r.out);
                 let mut v = json!({
                     "id": s.id,
-                    "role": s.role,
+                    "role": targets[i].0,
+                    "agent": targets[i].1.as_ref().map(|a| &a.name),
                     "status": out.map_or(json!("cancelled"), |o| o["status"].clone()),
                     "report": out.and_then(|o| o["report"].as_str()).map(|t| truncate(t, MAX_DEP_REPORT_CHARS)),
                     "changedFiles": out.map(|o| o["changedFiles"].clone()),
@@ -1622,7 +1848,9 @@ impl Run {
                     res
                 }
             }
-            Target::Subagent(role) => self.subagent(*role, call).await.map_err(|e| tools::ToolError::new(ToolErrorKind::Failed, e)),
+            Target::Subagent(role, agent) => {
+                self.subagent(*role, agent.clone(), call).await.map_err(|e| tools::ToolError::new(ToolErrorKind::Failed, e))
+            }
             Target::Plan(_) => self.run_plan(call).await.map_err(|e| tools::ToolError::new(ToolErrorKind::Failed, e)),
             Target::Ask(qs) => Ok(self.ask(call, qs).await),
             Target::FindTool => {
@@ -1634,6 +1862,11 @@ impl Run {
             Target::Summarize => self.summarize(call).await,
             Target::Semantic => self.semantic_search(call).await,
             Target::Docs => self.docs_search(call).await,
+            Target::Recall => {
+                let query = call.input["query"].as_str().map(str::trim).filter(|q| !q.is_empty()).ok_or_else(|| tools::ToolError::invalid("query is required"))?;
+                let limit = call.input["limit"].as_u64().unwrap_or(5).clamp(1, 20) as usize;
+                Ok(recall::recall(self.host.store.data_dir().as_deref(), &self.cwd, query, limit))
+            }
             Target::Worktree(op) => {
                 let name = call.input["name"].as_str().unwrap_or_default().to_owned();
                 let (repo, cancel, op) = (self.cwd.clone(), self.cancel.clone(), *op);
@@ -1677,7 +1910,9 @@ impl Run {
         info!(tool = %call.name, ok = res.is_ok(), class = ?res.as_ref().err().map(|e| e.kind.class()), ms = started.elapsed().as_millis() as u64, "tool call");
         let after = json!({ "taskId": self.rec.id, "tool": call.name, "input": call.input, "ok": res.is_ok() });
         let severity = res.as_ref().err().map(|e| errors::Error::from_tool(&call.name, e).severity);
-        let _ = self.hook(hooks::Event::AfterTool, &call.name, after.clone(), severity).await;
+        if let Ok(o) = self.hook(hooks::Event::AfterTool, &call.name, after.clone(), severity).await {
+            self.hook_notes.lock().expect("hook notes lock").extend(o.context);
+        }
         if res.as_ref().is_ok_and(|v| v["changed"].as_array().is_some_and(|a| !a.is_empty())) {
             let _ = self.hook(hooks::Event::AfterEdit, &call.name, after, None).await;
         }
@@ -1899,6 +2134,8 @@ impl Run {
     /// Runs one response's tool calls. Consecutive read-only calls run concurrently; anything that
     /// writes or executes runs alone, in order, so writes never race.
     async fn run_calls(&mut self, calls: &[ToolCall]) -> Round {
+        // Owned, so a beforeTool hook can rewrite a call's input before it runs.
+        let mut calls: Vec<ToolCall> = calls.to_vec();
         let mut results: Vec<Option<ContentPart>> = vec![None; calls.len()];
         let mut any_ok = false;
         // A round where every failure was a policy denial is not the model looping: nothing it does
@@ -1916,7 +2153,7 @@ impl Run {
             while !solo && i < calls.len() {
                 let n = i;
                 i += 1;
-                match self.prepare(&calls[n]).await {
+                match self.prepare(&mut calls[n]).await {
                     Err(e) => {
                         let res = Err(e);
                         note(&calls[n], &res);
@@ -2083,7 +2320,9 @@ impl Run {
     fn take_steers(&mut self) -> bool {
         let texts = self.host.steers.lock().expect("steers lock").get_mut(&self.rec.id).map(std::mem::take).unwrap_or_default();
         // Background reports are not shown as steers: their chat row already has the output.
-        let reports = std::mem::take(&mut *self.background.done.lock().expect("background lock"));
+        let mut reports = std::mem::take(&mut *self.background.done.lock().expect("background lock"));
+        // Context from hooks (`additionalContext`) joins the same way, marked as coming from a hook.
+        reports.extend(std::mem::take(&mut *self.hook_notes.lock().expect("hook notes lock")).into_iter().map(|c| format!("<hook_context>\n{c}\n</hook_context>")));
         for (text, steered) in texts.iter().map(|t| (t, true)).chain(reports.iter().map(|t| (t, false))) {
             let part = ContentPart::Text { text: text.clone() };
             match self.rec.messages.last_mut() {
@@ -2102,6 +2341,8 @@ impl Run {
         let mut failed_rounds = 0;
         // Final replies with no text and no tool call (a model that put the whole answer in its thinking).
         let mut empty_answers = 0;
+        // Times a stop hook sent the agent back to work.
+        let mut stop_blocks = 0;
         self.rec.status = Status::Running;
         self.save();
         let status = loop {
@@ -2168,14 +2409,24 @@ impl Run {
                     self.save();
                     break Status::Completed;
                 }
-                // The task ends only after its background commands: their output can change what to do next.
+                // The task ends only after its background work: its output can change what to do next.
                 if self.background.running.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                    self.emit(json!({ "type": "warning", "message": "Waiting for background commands to finish." }));
+                    self.emit(json!({ "type": "warning", "message": "Waiting for background work to finish." }));
                     if self.wait_background().await && self.take_steers() {
                         continue;
                     }
                     if self.cancel.is_cancelled() {
                         break Status::Cancelled;
+                    }
+                }
+                // A stop hook can send the agent back to work (for example "run the tests first").
+                if stop_blocks < MAX_STOP_BLOCKS {
+                    if let Some(reason) = self.stop_reason(stop_blocks > 0).await {
+                        stop_blocks += 1;
+                        self.emit(json!({ "type": "warning", "message": format!("A stop hook asked the agent to continue: {reason}") }));
+                        let text = format!("Do not stop yet. A stop hook answered: {reason}");
+                        self.rec.messages.push(Message { role: Role::User, content: vec![ContentPart::Text { text }] });
+                        continue;
                     }
                 }
                 self.save();
@@ -2211,6 +2462,14 @@ impl Run {
         }
         self.rec.skipped_checks = self.skipped_checks();
         self.save();
+        // What this task did joins the workspace memory that `recall` searches in later tasks.
+        if self.depth == 0 && matches!(self.rec.status, Status::Completed) {
+            if let Some(d) = self.host.store.data_dir() {
+                let files: Vec<String> = self.rec.changed_files.iter().cloned().collect();
+                let title = self.rec.checkpoints.last().map_or(self.rec.title.clone(), |c| c.prompt.clone());
+                let _ = recall::add(&recall::file(&d, &self.cwd), &self.rec.id, &title, &self.rec.final_text, &files);
+            }
+        }
         if !self.hooks.is_empty() {
             let ctx = self.hook_context(hooks::Event::AfterTask, None, summary(&self.rec), None);
             let (hl, cwd, c) = (self.hooks.clone(), self.cwd.clone(), CancellationToken::new());
@@ -2239,6 +2498,12 @@ pub fn summary(r: &TaskRecord) -> Value {
         "toolCalls": r.tool_calls,
         "error": r.error,
     })
+}
+
+/// `run` behind a `Send` trait object: a subagent's run awaits this, which breaks the recursive
+/// future type, so a background subagent can run in its own task.
+fn run_boxed(host: Host, p: RunParams, cancel: CancellationToken) -> BoxFuture<'static, Result<TaskRecord, String>> {
+    Box::pin(run(host, p, cancel))
 }
 
 pub async fn run(host: Host, p: RunParams, cancel: CancellationToken) -> Result<TaskRecord, String> {
@@ -2301,8 +2566,22 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         return Err("prompt must be 1..=200000 characters".into());
     }
     p.provider.resolve().map_err(|e| e.message)?;
+    let root = host.workspace.read().expect("workspace lock").as_ref().map(|w| w.index.root().to_path_buf());
+    let plugin_settings = host.plugins.read().expect("plugins lock").clone();
+    let plugin_list = plugins::load(root.as_deref(), plugins::home().as_deref(), &plugin_settings.dirs, &plugin_settings.disabled);
+    let plugin_dirs = plugins::enabled_dirs(&plugin_list);
+    let all_agents = agents::load(root.as_deref(), &agents::user_dirs(), &plugin_dirs);
+    // The lead names a subagent's agent; a top-level prompt that starts with `@name` picks one itself.
+    let (agent, prompt_owned): (Option<agents::AgentDef>, String) = match &p.agent {
+        Some(a) => (Some(a.clone()), prompt_text.to_owned()),
+        None => match agents::explicit(&all_agents, prompt_text) {
+            Some((a, rest)) => (Some(a.clone()), if rest.is_empty() { prompt_text.to_owned() } else { rest }),
+            None => (None, prompt_text.to_owned()),
+        },
+    };
+    let prompt_text = prompt_owned.as_str();
     let mut policy_cfg = p.policy.clone();
-    if !p.chat_mode.writes() {
+    if !p.chat_mode.writes() || agent.as_ref().is_some_and(|a| !a.writes) {
         policy_cfg.mode = Mode::ReadOnly;
     }
     let mut policy = Policy::new(policy_cfg.clone());
@@ -2331,14 +2610,27 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
             json!({ "type": "model", "kind": provider.kind, "model": provider.model, "reason": format!("route for {:?} tasks", enriched.kind) }),
         );
     }
+    // An agent's own model wins over a route (the lead already applied it for a subagent).
+    let with_agent_model = agents::provider_for(&provider, agent.as_ref());
+    if with_agent_model.model != provider.model {
+        provider = with_agent_model;
+        route_note = Some(json!({ "type": "model", "kind": provider.kind, "model": provider.model, "reason": format!("model of agent {}", agent.as_ref().map_or("", |a| a.name.as_str())) }));
+    }
+    let mut limits = p.limits.clone();
+    if let Some(n) = agent.as_ref().and_then(|a| a.max_iterations) {
+        limits.max_iterations = n;
+    }
     let fallbacks: Vec<ProviderConfig> = p.fallbacks.iter().filter(|f| f.resolve().is_ok()).cloned().collect();
-    let root = host.workspace.read().expect("workspace lock").as_ref().map(|w| w.index.root().to_path_buf());
     let mut focus: Vec<String> = enriched.sources.iter().map(|s| s.path.clone()).collect();
     focus.extend(p.editor.active_file.iter().cloned());
-    let all_skills = skills::load(root.as_deref(), &skills::user_dirs());
+    let all_skills = skills::load(root.as_deref(), &skills::user_dirs(), &plugin_dirs);
     let active_skills = skills::select(&all_skills, prompt_text, &focus);
     let skill_index = skills::index(&all_skills, &active_skills);
-    let skill_tools: HashSet<&str> = active_skills.iter().flat_map(|s| s.tools.iter().map(String::as_str)).collect();
+    // The tools an active skill or the agent allows; empty means every tool of the mode.
+    let mut skill_tools: HashSet<String> = active_skills.iter().flat_map(|s| s.tools.iter().cloned()).collect();
+    if let Some(a) = &agent {
+        skill_tools.extend(a.tools.iter().cloned());
+    }
     let mut tool_specs = if has_ws {
         tools::specs(|t| {
             policy.decide(t.name, t.permission) != Decision::Deny
@@ -2364,6 +2656,12 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         }
     }
     let mut system = format!("{}\n\n{}", enriched.system, p.chat_mode.guidance());
+    if let Some(a) = &agent {
+        system.push_str(&format!(
+            "\n\n<agent name=\"{}\">\nYou act as the custom agent '{}'. Follow these instructions for the whole task:\n{}\n</agent>",
+            a.name, a.name, a.body
+        ));
+    }
     if let Some(ix) = &skill_index {
         system.push_str("\n\n");
         system.push_str(ix);
@@ -2374,11 +2672,20 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         });
     }
     let is_git = root.as_deref().is_some_and(|r| r.join(".git").exists());
-    let team_ok = p.depth == 0 && is_git && p.chat_mode.writes() && policy.decide("run_subagent", Permission::Write) != Decision::Deny;
+    // Subagents may start their own subagents down to `limits.maxDepth` levels (a level-1 writer
+    // in its worktree can hand a part on); the deepest level works alone.
+    let team_ok = p.depth < p.limits.max_depth.clamp(1, MAX_DEPTH)
+        && is_git
+        && p.chat_mode.writes()
+        && policy.decide("run_subagent", Permission::Write) != Decision::Deny;
     if team_ok {
-        tool_specs.extend(team_specs());
+        tool_specs.extend(team_specs(&all_agents));
         if p.chat_mode == ChatMode::Team && policy.decide("run_plan", Permission::Write) != Decision::Deny {
-            tool_specs.push(plan_spec());
+            tool_specs.push(plan_spec(&all_agents));
+        }
+        if let Some(ix) = agents::index(&all_agents) {
+            system.push_str("\n\n");
+            system.push_str(&ix);
         }
     }
     if p.depth == 0 {
@@ -2386,6 +2693,15 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     }
     if has_ws {
         tool_specs.push(summarize_spec());
+        tool_specs.push(recall::spec());
+    }
+    // A ranked map of the project at the start of a top-level task, leaning towards the request's files.
+    if p.depth == 0 && p.limits.repo_map_tokens > 0 {
+        let map = host.workspace.read().expect("workspace lock").as_ref().map(|w| crate::context::repomap::render(w, &focus, p.limits.repo_map_tokens)).unwrap_or_default();
+        if !map.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&map);
+        }
     }
     let embeddings = p.embeddings.clone().filter(|e| e.resolve().is_ok());
     if has_ws && embeddings.is_some() {
@@ -2431,18 +2747,35 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     for s in &active_skills {
         system.push_str(&format!("\n\n<skill name=\"{}\" reason=\"{}\">\n{}\n</skill>", s.name, s.reason, s.text));
     }
-    let hook_list = host.hooks.read().expect("hooks lock").clone();
+    let mut hook_list = host.hooks.read().expect("hooks lock").clone();
+    // Hooks of enabled plugins: a workspace plugin's hooks run only in a trusted workspace, and only
+    // plugins the user installed may approve a call.
+    for pl in plugin_list.iter().filter(|pl| pl.enabled && (pl.source != "workspace" || plugin_settings.workspace_trusted)) {
+        hook_list.extend(hooks::load_plugin(&pl.path, pl.source != "workspace"));
+    }
     let cwd = root.clone().unwrap_or_else(std::env::temp_dir);
-    if !hook_list.is_empty() {
-        let (hl, cwd2, c2) = (hook_list.clone(), cwd.clone(), cancel.clone());
-        let mut ctx = hooks::HookContext::new(hooks::Event::BeforeTask, None, json!({ "prompt": prompt_text, "chatMode": p.chat_mode }));
-        (ctx.budget_used, ctx.budget_limit) = (Some(0), p.limits.max_total_tokens);
-        let outs = tokio::task::spawn_blocking(move || hooks::run(&hl, &ctx, &cwd2, &c2)).await.unwrap_or_default();
-        if let Some(o) = outs.iter().find(|o| o.blocked) {
-            return Err(format!("blocked by a beforeTask hook ({}): {}", o.command, o.message()));
+    let mut hook_context: Vec<String> = Vec::new();
+    // A subagent's prompt comes from the lead, not the user: only top-level tasks run these.
+    for event in [hooks::Event::UserPromptSubmit, hooks::Event::BeforeTask] {
+        if p.depth > 0 || !hook_list.iter().any(|h| h.event == event) {
+            continue;
         }
+        let (hl, cwd2, c2) = (hook_list.clone(), cwd.clone(), cancel.clone());
+        let mut ctx = hooks::HookContext::new(event, None, json!({ "prompt": prompt_text, "chatMode": p.chat_mode, "taskId": p.task_id }));
+        (ctx.budget_used, ctx.budget_limit) = (Some(0), p.limits.max_total_tokens);
+        let outs = hooks::Outcome::from_results(tokio::task::spawn_blocking(move || hooks::run(&hl, &ctx, &cwd2, &c2)).await.unwrap_or_default());
+        for o in &outs.results {
+            (host.emit)(p.task_id.as_deref().unwrap_or(""), json!({ "type": "hook", "event": event, "command": o.command, "blocked": o.blocked, "message": o.message(), "durationMs": o.duration_ms }));
+        }
+        if let Some(o) = outs.blocked() {
+            return Err(format!("blocked by a {event:?} hook ({}): {}", o.command, o.message()));
+        }
+        hook_context.extend(outs.context);
     }
     let mut user_content = vec![ContentPart::Text { text: enriched.user.clone() }];
+    for c in &hook_context {
+        user_content.push(ContentPart::Text { text: format!("<hook_context>\n{c}\n</hook_context>") });
+    }
     user_content.extend(crate::provider::types::image_parts(&p.images)?);
     let user_msg = Message { role: Role::User, content: user_content };
 
@@ -2495,8 +2828,17 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
             enrichment: None,
             metrics: Metrics::default(),
             skipped_checks: Vec::new(),
+            checkpoints: Vec::new(),
+            forked_from: None,
         },
     };
+    // A checkpoint for this prompt: `agent/rewind` cuts the conversation and undoes the edits back to it.
+    rec.checkpoints.push(store::Checkpoint {
+        messages: rec.messages.len().saturating_sub(1),
+        operations: rec.operations.len(),
+        prompt: prompt_text.chars().take(200).collect(),
+        created_ms: store::now_ms(),
+    });
     rec.enrichment = Some(store::enrichment_json(&enriched));
     rec.model = provider.model.clone();
     if let Some(n) = route_note {
@@ -2507,14 +2849,17 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     }
     (host.emit)(
         &rec.id,
-        json!({ "type": "started", "chatMode": p.chat_mode, "enrichment": enriched, "tools": tool_specs.iter().map(|t| t.name.clone()).collect::<Vec<_>>(), "skills": active_skills }),
+        json!({
+            "type": "started", "chatMode": p.chat_mode, "enrichment": enriched, "tools": tool_specs.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+            "skills": active_skills, "agent": agent.as_ref().map(|a| &a.name),
+        }),
     );
     Ok(Run {
         host,
         rec,
         policy,
         cancel,
-        limits: p.limits,
+        limits,
         provider,
         tool_specs,
         failures: HashMap::new(),
@@ -2528,7 +2873,7 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         policy_cfg: policy_cfg_keep,
         worktrees: Mutex::default(),
         sub_count: Default::default(),
-        sub_totals: Mutex::default(),
+        sub_totals: Arc::default(),
         token_ratio: 1.0,
         prices: p.prices,
         role_providers: p.role_providers,
@@ -2537,6 +2882,8 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         deferred,
         helper: p.helper.filter(|h| h.resolve().is_ok()),
         embeddings,
+        agents: all_agents,
+        hook_notes: Mutex::default(),
     })
 }
 
@@ -2584,6 +2931,7 @@ pub async fn best_of(host: Host, p: BestOfParams, cancel: CancellationToken) -> 
         helper: None,
         embeddings: None,
         depth: 0,
+        agent: None,
     };
     let lead = prepare(host, params, cancel).await?;
     if !lead.cwd.join(".git").exists() {
@@ -2598,7 +2946,7 @@ pub async fn best_of(host: Host, p: BestOfParams, cancel: CancellationToken) -> 
         };
         let pr = pr.clone();
         let lead = &lead;
-        async move { lead.spawn_sub(team::Role::Implementation, &call, &[], Some(pr), Some(&call.id)).await }
+        async move { lead.spawn_sub(team::Role::Implementation, None, &call, &[], Some(pr), Some(&call.id)).await }
     });
     let outs = join_all(runs).await;
     let candidates: Vec<Value> = outs
@@ -2704,6 +3052,7 @@ mod tests {
             subagents: Arc::default(),
             steers: Arc::default(),
             tool_cancels: Arc::default(),
+            plugins: Arc::default(),
         }
     }
 
@@ -2730,6 +3079,7 @@ mod tests {
             prices: Vec::new(),
             role_providers: Vec::new(),
             depth: 0,
+            agent: None,
         }
     }
 
@@ -2818,6 +3168,8 @@ mod tests {
             enrichment: None,
             metrics: Metrics::default(),
             skipped_checks: Vec::new(),
+            checkpoints: Vec::new(),
+            forked_from: None,
         }
     }
 
@@ -3075,10 +3427,8 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let h = host(&root, ApprovalDecision::Allow, events.clone());
         *h.hooks.write().unwrap() = vec![hooks::Hook {
-            event: hooks::Event::BeforeEdit,
-            command: vec!["sh".into(), "-c".into(), "echo 'edits are frozen in this repo' >&2; exit 1".into()],
-            matcher: None,
             timeout_ms: Some(5_000),
+            ..hooks::Hook::new(hooks::Event::BeforeEdit, vec!["sh".into(), "-c".into(), "echo 'edits are frozen in this repo' >&2; exit 1".into()])
         }];
         let r = run(h, params(&base, ChatMode::Agent, Mode::AskBeforeEdit), CancellationToken::new()).await.unwrap();
         assert_eq!(r.status, Status::Completed);
@@ -3239,10 +3589,8 @@ mod tests {
         );
         h.mcp.write().await.configure(cfgs, None).await;
         *h.hooks.write().unwrap() = vec![hooks::Hook {
-            event: hooks::Event::BeforeTool,
-            command: vec!["sh".into(), "-c".into(), "grep -q read_file && exit 1 || exit 0".into()],
-            matcher: None,
             timeout_ms: Some(5_000),
+            ..hooks::Hook::new(hooks::Event::BeforeTool, vec!["sh".into(), "-c".into(), "grep -q read_file && exit 1 || exit 0".into()])
         }];
         let r = run(h, params(&base, ChatMode::Agent, Mode::AskBeforeEdit), CancellationToken::new()).await.unwrap();
         assert_eq!(r.status, Status::Completed);
@@ -3374,6 +3722,189 @@ mod tests {
         let sent = seen.lock().unwrap()[1].to_string();
         assert!(sent.contains("unknown role 'chef'"), "{sent}");
         assert!(sent.contains("research, implementation, testing, review, documentation"), "{sent}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A custom agent file gives a subagent its instructions, tool list, and name; the lead sees it
+    /// in `<available_agents>` and the `agent` field of `run_subagent`.
+    #[tokio::test]
+    async fn a_custom_agent_runs_as_a_subagent_with_its_own_instructions() {
+        let root = git_repo(&[
+            ("a.txt", "x\n"),
+            (".claude/agents/scout.md", "---\ndescription: Finds things\ntools: Read, Grep\n---\nYou are Scout. Report file names only.\n"),
+        ]);
+        let (base, seen) = mock(vec![
+            sse_tool("s1", "run_subagent", json!({ "agent": "scout", "objective": "find a.txt" })),
+            sse_text("a.txt"),
+            sse_text("Scout found a.txt."),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let r = run(host(&root, ApprovalDecision::Allow, events.clone()), params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        assert_eq!(r.metrics.subagents, 1);
+        let reqs = seen.lock().unwrap();
+        let lead = reqs[0].to_string();
+        assert!(lead.contains("<available_agents>") && lead.contains("- scout (read-only): Finds things"), "the lead sees the agent");
+        // Workspace agents come first; the user's own agents on this machine may follow.
+        assert!(lead.contains("\"enum\":[\"scout\""), "run_subagent offers it: {lead}");
+        let sub = &reqs[1];
+        let system = sub["messages"][0]["content"].as_str().unwrap_or_default();
+        assert!(system.contains("<agent name=\"scout\">") && system.contains("You are Scout."), "{system}");
+        let tools: Vec<&str> = sub["tools"].as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        assert!(tools.contains(&"read_file") && tools.contains(&"search_regex"), "{tools:?}");
+        assert!(!tools.contains(&"replace_text") && !tools.contains(&"run_command"), "a read-only agent cannot edit: {tools:?}");
+        let ev = events.lock().unwrap();
+        assert!(ev.iter().any(|e| e["type"] == "subagentStarted" && e["agent"] == "scout" && e["role"] == "research"));
+        assert!(reqs[2].to_string().contains("\\\"agent\\\":\\\"scout\\\""), "the result names the agent");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `@name …` at the start of a prompt runs the task itself as that agent.
+    #[tokio::test]
+    async fn an_at_mention_runs_the_whole_task_as_that_agent() {
+        let root = git_repo(&[("a.txt", "x\n"), (".claude/agents/scout.md", "---\ntools: Read\nmaxIterations: 7\n---\nYou are Scout.\n")]);
+        let (base, seen) = mock(vec![sse_text("Looked.")]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut p = params(&base, ChatMode::Agent, Mode::Autonomous);
+        p.prompt = "@scout what is in a.txt".into();
+        let r = run(host(&root, ApprovalDecision::Allow, events.clone()), p, CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        let req = &seen.lock().unwrap()[0];
+        let system = req["messages"][0]["content"].as_str().unwrap_or_default();
+        assert!(system.contains("You are Scout."), "{system}");
+        let user = req["messages"][1]["content"].to_string();
+        assert!(user.contains("what is in a.txt") && !user.contains("@scout"), "the agent name is not part of the request: {user}");
+        let tools: Vec<&str> = req["tools"].as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        assert!(tools.contains(&"read_file") && !tools.contains(&"replace_text"), "{tools:?}");
+        let ev = events.lock().unwrap();
+        assert!(ev.iter().any(|e| e["type"] == "started" && e["agent"] == "scout"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn hook_script(event: hooks::Event, script: &str, trusted: bool) -> hooks::Hook {
+        hooks::Hook { timeout_ms: Some(5_000), trusted, ..hooks::Hook::new(event, vec!["sh".into(), "-c".into(), script.into()]) }
+    }
+
+    /// A stop hook that blocks sends the agent back to work once; the next stop goes through.
+    #[tokio::test]
+    async fn a_stop_hook_sends_the_agent_back_to_work() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        let (base, seen) = mock(vec![sse_text("Done."), sse_text("Ran the tests too.")]);
+        let h = host(&root, ApprovalDecision::Allow, Arc::default());
+        let script = r#"grep -q '"stop_hook_active":false' && echo '{"decision":"block","reason":"run the tests first"}' || true"#;
+        *h.hooks.write().unwrap() = vec![hook_script(hooks::Event::Stop, script, false)];
+        let r = run(h, params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed);
+        assert_eq!(r.final_text, "Ran the tests too.");
+        assert!(seen.lock().unwrap()[1].to_string().contains("A stop hook answered: run the tests first"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A prompt hook adds context; a trusted beforeTool hook approves a call and rewrites its input.
+    #[tokio::test]
+    async fn prompt_and_tool_hooks_add_context_approve_and_rewrite() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        let (base, seen) = mock(vec![sse_tool("c1", "create_file", json!({ "path": "wrong.txt", "content": "hi" })), sse_text("Created.")]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        // The user would deny: only the hook's approval lets the edit run.
+        let h = host(&root, ApprovalDecision::Deny, events.clone());
+        let rewrite = r#"echo '{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"path":"right.txt","content":"hi"}}}'"#;
+        *h.hooks.write().unwrap() = vec![
+            hook_script(hooks::Event::UserPromptSubmit, "echo 'Release freeze is on.'", false),
+            hooks::Hook { matcher: Some("Write".into()), ..hook_script(hooks::Event::BeforeTool, rewrite, true) },
+        ];
+        let r = run(h, params(&base, ChatMode::Agent, Mode::AskBeforeEdit), CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        assert!(seen.lock().unwrap()[0].to_string().contains("Release freeze is on."), "prompt context reaches the model");
+        assert!(root.join("right.txt").is_file() && !root.join("wrong.txt").exists(), "the hook rewrote the path");
+        assert!(!events.lock().unwrap().iter().any(|e| e["type"] == "approvalRequested"), "a trusted hook approved it");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A background subagent returns at once; its report reaches the lead as a message before it ends.
+    #[tokio::test]
+    async fn a_background_subagent_reports_when_it_ends() {
+        let root = git_repo(&[("a.txt", "x\n")]);
+        let base = mock_with(4, |req| {
+            let all = req.to_string();
+            if all.contains("You are a research subagent") {
+                sse_text("a.txt holds x")
+            } else if all.contains("Background subagent") {
+                sse_text("Got the report.")
+            } else if all.contains("works in the background") {
+                sse_text("Waiting for it.")
+            } else {
+                sse_tool("s1", "run_subagent", json!({ "role": "research", "objective": "look at a.txt", "background": true }))
+            }
+        });
+        let r = run(host(&root, ApprovalDecision::Allow, Arc::default()), params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        assert_eq!(r.final_text, "Got the report.");
+        assert_eq!(r.metrics.subagents, 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A writing subagent may delegate once more (maxDepth 2); with maxDepth 1 it may not.
+    #[tokio::test]
+    async fn writing_subagents_can_delegate_down_to_the_depth_limit() {
+        for (depth, nested) in [(2, true), (1, false)] {
+            let root = git_repo(&[("a.txt", "x\n")]);
+            let (base, seen) = mock(vec![
+                sse_tool("s1", "run_subagent", json!({ "role": "implementation", "objective": "edit a.txt", "name": format!("w{depth}") })),
+                sse_text("Nothing to change."),
+                sse_text("Done."),
+            ]);
+            let mut p = params(&base, ChatMode::Agent, Mode::Autonomous);
+            p.limits.max_depth = depth;
+            let r = run(host(&root, ApprovalDecision::Allow, Arc::default()), p, CancellationToken::new()).await.unwrap();
+            assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+            let sub_tools: Vec<String> = seen.lock().unwrap()[1]["tools"].as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str().map(str::to_owned)).collect();
+            assert_eq!(sub_tools.iter().any(|t| t == "run_subagent"), nested, "maxDepth {depth}: {sub_tools:?}");
+            let _ = team::remove(&root, &format!("w{depth}"), true, false, &CancellationToken::new());
+            std::fs::remove_dir_all(team::worktree_dir(&root, "x").parent().unwrap()).ok();
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    /// A task starts with the repository map, and what it did joins the memory `recall` searches.
+    #[tokio::test]
+    async fn tasks_get_a_repo_map_and_are_remembered() {
+        let root = temp_repo(&[("src/core.rs", "pub fn core_engine() {}\n"), ("src/a.rs", "pub fn alpha() { core_engine(); }\n")]);
+        let (base, seen) = mock(vec![sse_text("The engine lives in src/core.rs."), sse_tool("r1", "recall", json!({ "query": "engine" })), sse_text("Found it.")]);
+        let h = host(&root, ApprovalDecision::Allow, Arc::default());
+        let r = run(h.clone(), params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed);
+        let first = seen.lock().unwrap()[0].to_string();
+        assert!(first.contains("<repo_map>") && first.contains("src/core.rs: function core_engine:1"), "{first}");
+        let r2 = run(h, params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new()).await.unwrap();
+        assert_eq!(r2.status, Status::Completed);
+        let recalled = seen.lock().unwrap()[2].to_string();
+        assert!(recalled.contains("The engine lives in src/core.rs."), "the first task is recalled: {recalled}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A plan step may name a custom agent in place of a role.
+    #[tokio::test]
+    async fn a_plan_step_can_use_a_custom_agent() {
+        let root = git_repo(&[("a.txt", "x\n"), (".claude/agents/scout.md", "---\nmode: read\n---\nYou are Scout.\n")]);
+        let (base, seen) = mock(vec![
+            sse_tool("p1", "run_plan", json!({ "steps": [{ "id": "look", "agent": "scout", "objective": "find a.txt" }] })),
+            sse_text("a.txt"),
+            sse_text("Done."),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let r = run(host(&root, ApprovalDecision::Allow, events.clone()), params(&base, ChatMode::Team, Mode::Autonomous), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        assert_eq!(r.metrics.subagents, 1);
+        assert!(seen.lock().unwrap()[1]["messages"][0]["content"].as_str().unwrap_or_default().contains("You are Scout."));
+        let ev = events.lock().unwrap();
+        assert!(ev.iter().any(|e| e["type"] == "planStarted" && e["steps"][0]["agent"] == "scout" && e["steps"][0]["role"] == "research"));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -3511,7 +4042,8 @@ mod tests {
     fn step(id: &str, deps: &[&str]) -> PlanStep {
         PlanStep {
             id: id.into(),
-            role: team::Role::Research,
+            role: Some(team::Role::Research),
+            agent: None,
             objective: "x".into(),
             context: String::new(),
             depends_on: deps.iter().map(|d| d.to_string()).collect(),

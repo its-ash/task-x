@@ -4,6 +4,7 @@ pub mod graph;
 pub mod index;
 pub mod instructions;
 pub mod project;
+pub mod repomap;
 pub mod retrieve;
 pub mod semantic;
 pub mod symbols;
@@ -21,6 +22,8 @@ pub struct Workspace {
     pub instructions: Vec<Instruction>,
     /// Built on first use and dropped when files change.
     graph: OnceLock<Arc<graph::ProjectGraph>>,
+    /// Where the graph is saved between runs (`<dataDir>/graphs/<root hash>.json`); unset: not saved.
+    pub graph_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -55,7 +58,7 @@ impl Workspace {
         }
         let mut index = Index::new(root, excludes)?;
         index.refresh_with(progress);
-        let mut ws = Self { project: ProjectInfo::default(), instructions: Vec::new(), index, graph: OnceLock::new() };
+        let mut ws = Self { project: ProjectInfo::default(), instructions: Vec::new(), index, graph: OnceLock::new(), graph_file: None };
         ws.reload_metadata();
         Ok(ws)
     }
@@ -71,9 +74,20 @@ impl Workspace {
         self.reload_metadata();
     }
 
-    /// The project graph for the current index.
+    /// The project graph for the current index: the saved copy when it still matches, else built.
     pub fn graph(&self) -> Arc<graph::ProjectGraph> {
-        self.graph.get_or_init(|| Arc::new(graph::ProjectGraph::build(&self.index))).clone()
+        self.graph.get_or_init(|| Arc::new(graph::ProjectGraph::load_or_build(&self.index, self.graph_file.as_deref()))).clone()
+    }
+
+    /// Finds what changed on disk since the last scan (edits, new and deleted files) and indexes it.
+    /// Returns the changed root-relative paths.
+    pub fn rescan(&mut self) -> Vec<String> {
+        let paths = self.index.scan();
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        self.files_changed(&paths);
+        paths.iter().filter_map(|p| index::relative(self.index.root(), p)).collect()
     }
 
     pub fn files_changed(&mut self, paths: &[PathBuf]) -> usize {

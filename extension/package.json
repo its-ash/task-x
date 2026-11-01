@@ -326,6 +326,31 @@
         "category": "task-x"
       },
       {
+        "command": "task-x.mcpSignIn",
+        "title": "Sign In to MCP Server…",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.mcpSignOut",
+        "title": "Sign Out of MCP Server…",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.installPlugin",
+        "title": "Install Plugin…",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.addMarketplace",
+        "title": "Add Plugin Marketplace…",
+        "category": "task-x"
+      },
+      {
+        "command": "task-x.searchMemory",
+        "title": "Search Memory of Earlier Tasks…",
+        "category": "task-x"
+      },
+      {
         "command": "task-x.runInBackground",
         "title": "Run Task in Background…",
         "category": "task-x",
@@ -684,6 +709,20 @@
           "default": "auto",
           "markdownDescription": "How much the agent does without asking. Change it from the settings button in the chat toolbar. `task-x.agent.denyTools` always refuses a tool, and `task-x.agent.allowTools` never asks."
         },
+        "task-x.agent.subagentDepth": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 3,
+          "markdownDescription": "Levels of subagents. 1: only the lead agent delegates. 2 (default): a writing subagent may hand a part of its work to its own subagent. Subagents run in parallel and can run in the background (`run_subagent` with `background: true`)."
+        },
+        "task-x.context.repoMapTokens": {
+          "type": "integer",
+          "default": 1000,
+          "minimum": 0,
+          "maximum": 8000,
+          "markdownDescription": "Tokens of the repository map each task starts with: the files the most code depends on (ranked over the import and reference graph, leaning towards the files of the request), with their main definitions. 0 turns it off. The agent can ask for a larger map with `repo_map`."
+        },
         "task-x.agent.lazyTools": {
           "type": "boolean",
           "default": true,
@@ -724,6 +763,41 @@
           "minimum": 0,
           "maximum": 5,
           "description": "How many times a task continues on its own when it reaches the turn limit. 0 pauses at the limit."
+        },
+        "task-x.session.freshAfterIdleMinutes": {
+          "type": "number",
+          "default": 60,
+          "minimum": 0,
+          "maximum": 10080,
+          "description": "A chat idle for this many minutes starts a new conversation with the next request, so the old history is not sent again with every turn. The old conversation stays in History. 0 keeps the conversation. Type /clear to start fresh at any time."
+        },
+        "task-x.session.stallMinutes": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "maximum": 1440,
+          "description": "Stop a request that makes no progress for this many minutes (waiting for your answer does not count). 0 never stops it."
+        },
+        "task-x.session.maxRunMinutes": {
+          "type": "number",
+          "default": 120,
+          "minimum": 0,
+          "maximum": 1440,
+          "description": "Stop a request after this many minutes, so no session runs for hours unseen. Continue goes on from where it stopped. 0 has no limit. Loop Mode uses task-x.session.loopMaxHours."
+        },
+        "task-x.session.loopMaxHours": {
+          "type": "number",
+          "default": 4,
+          "minimum": 0,
+          "maximum": 72,
+          "description": "Loop Mode stops retrying a request after this many hours. 0 has no limit."
+        },
+        "task-x.runtime.idleStopMinutes": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "maximum": 1440,
+          "description": "Stop the task-x runtime, its MCP servers, and its model sessions after this many minutes with no task. The next request starts it again. 0 keeps it running."
         },
         "task-x.index.exclude": {
           "type": "array",
@@ -770,10 +844,24 @@
           "markdownDescription": "Use the MCP servers you already set up in other tools. `claude`: Claude Desktop, Claude Code (`~/.claude.json`), and the workspace `.mcp.json`. `vscode`: GitHub Copilot in VS Code (the user `mcp.json`, the `mcp.servers` setting, and the workspace `.vscode/mcp.json`). `copilotCli`: `~/.copilot/mcp-config.json`. Workspace files are read only in a trusted workspace. With the Claude Code engine, Claude loads its own servers, so task-x adds only the others.",
           "scope": "machine-overridable"
         },
+        "task-x.plugins.dirs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "markdownDescription": "Extra plugin folders (absolute paths) in the Claude Code plugin layout: `skills/`, `agents/`, `commands/`, and `.mcp.json`. task-x also reads the plugins Claude Code installed, `~/.task-x/plugins/`, and `.task-x/plugins/` in the workspace.",
+          "scope": "machine-overridable"
+        },
+        "task-x.plugins.disabled": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "markdownDescription": "Plugins to turn off, by name or id (`name@marketplace`). Their skills, agents, and commands are not loaded.",
+          "scope": "machine-overridable"
+        },
         "task-x.hooks": {
           "type": "array",
           "default": [],
-          "markdownDescription": "Lifecycle hooks: `[{ \"event\": \"beforeTool\", \"command\": [\"./check.sh\"], \"matcher\": \"^run_\" }]`. Events: beforeTask, beforeTool, afterTool, beforeEdit, afterEdit, beforeValidation, afterTask. A failing `before*` hook blocks the action. A trusted workspace can add hooks in `.anvil/hooks.json`.",
+          "markdownDescription": "Lifecycle hooks: `[{ \"event\": \"beforeTool\", \"command\": [\"./check.sh\"], \"matcher\": \"^run_\" }]`. Events: beforeTask, afterTask, userPromptSubmit, beforeTool, afterTool, beforeEdit, afterEdit, beforeValidation, afterValidation, stop, subagentStop, preCompact, notification (Claude Code's names such as `PreToolUse` work too). A failing `before*`, `userPromptSubmit`, or `stop` hook blocks. JSON output can block with a reason, add context, rewrite a tool's input, or approve a call (only hooks in these settings may approve). A trusted workspace can add hooks in `.task-x/hooks.json`, and plugins in `hooks/hooks.json`.",
           "scope": "machine-overridable"
         },
         "task-x.routing": {

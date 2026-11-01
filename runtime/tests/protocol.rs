@@ -19,7 +19,15 @@ struct Runtime {
 
 impl Runtime {
     async fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_task-x-runtime"))
+        Self::start_with(&[]).await
+    }
+
+    async fn start_with(env: &[(&str, &std::path::Path)]) -> Self {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_task-x-runtime"));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -256,6 +264,130 @@ async fn protocol_errors_and_lifecycle() {
     rt.send(json!({"jsonrpc":"2.0","method":"exit"})).await;
     let status = tokio::time::timeout(WAIT, rt.child.wait()).await.unwrap().unwrap();
     assert!(status.success());
+}
+
+/// `plugins/configure` adds a plugin folder; `plugins/list`, `agents/list`, and `skills/list` then
+/// show its agents, skills, and commands, named `<plugin>:<name>`. A disabled plugin adds nothing.
+#[tokio::test]
+async fn plugins_bring_agents_skills_and_commands() {
+    let base = std::env::temp_dir().join(format!("task-x-proto-plugins-{}", std::process::id()));
+    let (home, plug) = (base.join("home"), base.join("kit"));
+    std::fs::create_dir_all(home.join(".claude/agents")).unwrap();
+    std::fs::write(home.join(".claude/agents/scout.md"), "---\ndescription: Finds\ntools: Read\n---\nYou are Scout.").unwrap();
+    std::fs::create_dir_all(plug.join(".claude-plugin")).unwrap();
+    std::fs::write(plug.join(".claude-plugin/plugin.json"), r#"{ "name": "kit", "version": "1.2.0" }"#).unwrap();
+    std::fs::create_dir_all(plug.join("agents")).unwrap();
+    std::fs::write(plug.join("agents/fixer.md"), "---\ndescription: Fixes\n---\nFix things.").unwrap();
+    std::fs::create_dir_all(plug.join("commands")).unwrap();
+    std::fs::write(plug.join("commands/ship.md"), "---\nargument-hint: [version]\n---\nShip $ARGUMENTS").unwrap();
+    let mut rt = Runtime::start_with(&[("HOME", &home), ("USERPROFILE", &home)]).await;
+    rt.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}})).await;
+    rt.recv().await;
+    rt.send(json!({"jsonrpc":"2.0","id":1,"method":"plugins/configure","params":{"dirs":["relative/path"]}})).await;
+    assert_eq!(rt.recv().await["error"]["code"], -32602, "plugin folders must be absolute");
+    rt.send(json!({"jsonrpc":"2.0","id":2,"method":"plugins/configure","params":{"dirs":[plug]}})).await;
+    assert_eq!(rt.recv().await["result"], json!({ "plugins": 1, "enabled": 1 }));
+    rt.send(json!({"jsonrpc":"2.0","id":3,"method":"plugins/list"})).await;
+    let p = rt.recv().await["result"][0].clone();
+    assert_eq!((p["name"].clone(), p["version"].clone(), p["agents"].clone(), p["commands"].clone()), (json!("kit"), json!("1.2.0"), json!(1), json!(1)));
+    rt.send(json!({"jsonrpc":"2.0","id":4,"method":"agents/list"})).await;
+    let agents = rt.recv().await["result"].clone();
+    let names: Vec<&str> = agents.as_array().unwrap().iter().filter_map(|a| a["name"].as_str()).collect();
+    assert_eq!(names, ["scout", "kit:fixer"], "the user's agents before plugin agents");
+    assert_eq!(agents[0]["writes"], false);
+    rt.send(json!({"jsonrpc":"2.0","id":5,"method":"skills/list"})).await;
+    let skills = rt.recv().await["result"].clone();
+    let ship = skills.as_array().unwrap().iter().find(|s| s["name"] == "kit:ship").expect("plugin command listed").clone();
+    assert_eq!((ship["kind"].clone(), ship["argumentHint"].clone()), (json!("command"), json!("[version]")));
+    rt.send(json!({"jsonrpc":"2.0","id":6,"method":"skills/resolve","params":{"prompt":"/ship 2.0"}})).await;
+    assert_eq!(rt.recv().await["result"]["active"][0]["text"], "Ship 2.0");
+    rt.send(json!({"jsonrpc":"2.0","id":7,"method":"plugins/configure","params":{"dirs":[plug],"disabled":["kit"]}})).await;
+    assert_eq!(rt.recv().await["result"]["enabled"], 0);
+    rt.send(json!({"jsonrpc":"2.0","id":8,"method":"agents/list"})).await;
+    assert_eq!(rt.recv().await["result"].as_array().unwrap().len(), 1, "a disabled plugin's agents are gone");
+    std::fs::remove_dir_all(base).ok();
+}
+
+/// `task-x-runtime exec` runs one task against a model and exits 0, with the summary as JSON; a model
+/// that cannot be reached makes it exit 1.
+#[tokio::test]
+async fn the_cli_runs_one_task_and_exits_with_its_status() {
+    let sse = [r#"{"choices":[{"index":0,"delta":{"content":"Hello from the CLI."},"finish_reason":"stop"}]}"#, "[DONE]"];
+    let (base, _) = mock(200, "text/event-stream", sse.iter().map(|d| format!("data: {d}\n\n")).collect(), false).await;
+    let dir = std::env::temp_dir().join(format!("task-x-proto-cli-{}", std::process::id()));
+    let (home, ws) = (dir.join("home"), dir.join("ws"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("a.rs"), "pub fn hi() {}\n").unwrap();
+    let run = |base: String| {
+        let (home, ws) = (home.clone(), ws.clone());
+        async move {
+            Command::new(env!("CARGO_BIN_EXE_task-x-runtime"))
+                .args(["exec", "--cwd", &ws.to_string_lossy(), "--provider", "openaiCompatible", "--model", "m", "--base-url", &base, "--api-key-env", "MOCK_KEY", "--json", "say hi"])
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("MOCK_KEY", "k")
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+    let out = run(base).await;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let summary: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((summary["status"].clone(), summary["text"].clone()), (json!("completed"), json!("Hello from the CLI.")));
+    assert!(home.join(".task-x/cli/tasks").read_dir().unwrap().next().is_some(), "the task is saved");
+    let down = run("http://127.0.0.1:9/v1".into()).await;
+    assert_eq!(down.status.code(), Some(1), "a failed task exits 1");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// The session methods on a saved task: checkpoints, cost, fork, compact, and rewind; and the hooks
+/// config accepts Claude Code's event names.
+#[tokio::test]
+async fn session_controls_work_on_a_saved_task() {
+    let dir = std::env::temp_dir().join(format!("task-x-proto-session-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("tasks")).unwrap();
+    let text = |role: &str, t: &str| json!({ "role": role, "content": [{ "type": "text", "text": t }] });
+    let rec = json!({
+        "version": 1, "id": "s1", "title": "first", "createdMs": 1, "updatedMs": 1, "status": "completed", "chatMode": "agent",
+        "providerKind": "Ollama", "model": "m", "system": "s",
+        "messages": [text("user", "first"), text("assistant", "one"), text("user", "second"), text("assistant", "two")],
+        "usage": { "inputTokens": 100, "outputTokens": 20 }, "iterations": 2, "toolCalls": 0, "changedFiles": [], "operations": [],
+        "validations": [], "finalText": "two", "error": null,
+        "checkpoints": [
+            { "messages": 0, "operations": 0, "prompt": "first", "createdMs": 1 },
+            { "messages": 2, "operations": 0, "prompt": "second", "createdMs": 2 }
+        ]
+    });
+    std::fs::write(dir.join("tasks/s1.json"), rec.to_string()).unwrap();
+    let mut rt = Runtime::start().await;
+    rt.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"dataDir":dir}})).await;
+    rt.recv().await;
+    rt.send(json!({"jsonrpc":"2.0","id":1,"method":"agent/checkpoints","params":{"taskId":"s1"}})).await;
+    assert_eq!(rt.recv().await["result"][1]["prompt"], "second");
+    rt.send(json!({"jsonrpc":"2.0","id":2,"method":"agent/cost","params":{"taskId":"s1"}})).await;
+    let c = rt.recv().await["result"].clone();
+    assert_eq!((c["usage"]["inputTokens"].clone(), c["prompts"].clone()), (json!(100), json!(2)));
+    rt.send(json!({"jsonrpc":"2.0","id":3,"method":"agent/fork","params":{"taskId":"s1","checkpoint":1}})).await;
+    let f = rt.recv().await["result"].clone();
+    assert_eq!((f["messages"].clone(), f["forkedFrom"].clone()), (json!(2), json!("s1")));
+    rt.send(json!({"jsonrpc":"2.0","id":4,"method":"agent/compact","params":{"taskId":"s1"}})).await;
+    assert!(rt.recv().await["result"]["beforeTokens"].is_number());
+    rt.send(json!({"jsonrpc":"2.0","id":5,"method":"agent/rewind","params":{"taskId":"s1","checkpoint":1,"restoreCode":false}})).await;
+    let r = rt.recv().await["result"].clone();
+    assert_eq!((r["messages"].clone(), r["text"].clone()), (json!(2), json!("one")));
+    rt.send(json!({"jsonrpc":"2.0","id":6,"method":"agent/task","params":{"taskId":"s1"}})).await;
+    let t = rt.recv().await["result"].clone();
+    assert_eq!((t["messages"].as_array().unwrap().len(), t["checkpoints"].as_array().unwrap().len()), (2, 1), "the rewind is saved");
+    rt.send(json!({"jsonrpc":"2.0","id":7,"method":"agent/rewind","params":{"taskId":"s1","checkpoint":9}})).await;
+    assert_eq!(rt.recv().await["error"]["code"], -32602);
+    rt.send(json!({"jsonrpc":"2.0","id":8,"method":"config/hooks","params":{"hooks":[{"event":"PreToolUse","command":["true"]},{"event":"stop","command":["true"]}],"workspaceTrusted":false}})).await;
+    assert_eq!(rt.recv().await["result"]["hooks"], 2, "Claude Code event names are accepted");
+    rt.send(json!({"jsonrpc":"2.0","id":9,"method":"mcp/authorize","params":{"server":"nope"}})).await;
+    assert_eq!(rt.recv().await["error"]["code"], -32602, "an unknown server cannot sign in");
+    std::fs::remove_dir_all(dir).ok();
 }
 
 /// A runtime that was killed mid-run leaves `status: "running"` behind; the next start must clear it,

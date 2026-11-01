@@ -1404,6 +1404,7 @@ dependencies = [
  "ignore",
  "regex",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "similar",

@@ -63,6 +63,23 @@ pub struct TaskRecord {
     /// Detected checks (format, lint, test, build) that did not run although files changed.
     #[serde(default)]
     pub skipped_checks: Vec<String>,
+    /// One per user prompt: where the conversation and the edit list stood before it, for rewind.
+    #[serde(default)]
+    pub checkpoints: Vec<Checkpoint>,
+    /// The task this one was forked from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
+}
+
+/// The state before one user prompt: `messages` and `operations` are lengths to cut back to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checkpoint {
+    pub messages: usize,
+    pub operations: usize,
+    /// The start of the prompt, for the list the user picks from.
+    pub prompt: String,
+    pub created_ms: u64,
 }
 
 pub fn now_ms() -> u64 {
@@ -166,10 +183,10 @@ pub fn enrichment_json(e: &Enriched) -> serde_json::Value {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
-    fn record(id: &str, status: Status) -> TaskRecord {
+    pub fn record(id: &str, status: Status) -> TaskRecord {
         TaskRecord {
             version: RECORD_VERSION,
             id: id.into(),
@@ -193,6 +210,8 @@ mod tests {
             enrichment: None,
             metrics: Default::default(),
             skipped_checks: Vec::new(),
+            checkpoints: Vec::new(),
+            forked_from: None,
         }
     }
 

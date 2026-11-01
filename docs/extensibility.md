@@ -1,6 +1,6 @@
-# Skills, instructions, hooks, and MCP
+# Skills, commands, agents, plugins, hooks, and MCP
 
-You can extend task-x without rebuilding it. task-x reads the same instruction and skill files as GitHub Copilot and Claude Code, so most repositories need no changes.
+You can extend task-x without rebuilding it. task-x reads the same instruction, skill, command, agent, and plugin files as GitHub Copilot and Claude Code, so most repositories need no changes.
 
 ## Instruction files
 
@@ -38,9 +38,83 @@ There are three ways a skill applies:
 
 Run **task-x: List Skills** to see what task-x found.
 
+## Commands
+
+A command is a Claude Code slash command: a Markdown file that you run by typing `/name`. It never applies by itself, and the model does not see it in the skill index.
+
+```markdown
+---
+description: Fix a GitHub issue
+argument-hint: [issue-number]
+allowed-tools: Bash(git:*), Read, Edit
+---
+Fix issue #$1. Details: $ARGUMENTS
+```
+
+- Locations: `~/.claude/commands/`, `~/.copilot/commands/`, `~/.task-x/commands/`, `.claude/commands/` and `.task-x/commands/` in the workspace, and `commands/` in a plugin.
+- A subfolder makes a namespace: `commands/frontend/test.md` is `/frontend:test`.
+- `$ARGUMENTS` is the text after `/name`, and `$1` to `$9` are its words.
+- `allowed-tools` limits the edit and command tools while the command runs. Read tools stay available.
+- In the chat, the `/` menu lists commands first, with their argument hint. **New command…** creates one.
+
+## Custom agents
+
+A custom agent is a specialist subagent with its own instructions, tools, and model, in Claude Code's agent format:
+
+```markdown
+---
+name: code-reviewer
+description: Review changed code for defects. Use after a change.
+tools: Read, Grep, Glob
+model: inherit
+maxIterations: 20
+---
+You are a code reviewer. Report each defect with file:line and severity.
+```
+
+- Locations, lowest precedence first: plugin `agents/` folders (named `<plugin>:<name>`), `~/.claude/agents/`, `~/.copilot/agents/`, `~/.task-x/agents/`, then `.claude/agents/`, `.github/agents/`, and `.task-x/agents/` in the workspace.
+- `tools` uses Claude Code names (`Read`, `Grep`, `Glob`, `Edit`, `Write`, `Bash`, `WebFetch`, `WebSearch`) or task-x tool names. An agent whose tools only read is read-only. `mode: read` or `mode: write` sets it directly.
+- `model` is a model id for the current provider, or `sonnet`, `opus`, or `haiku` on Anthropic. Other providers ignore those aliases.
+- **Delegation:** in Agent and Team mode, the lead sees the agents by name and description and calls `run_subagent { agent, objective }`. Several run at the same time, and each writing agent works in its own git worktree. In Team mode, each `run_plan` step can name an agent.
+- **Direct use:** start the message with `@name` to run the whole task as that agent. The `@` menu lists agents at the start of the message, and the `/` menu lists them too.
+- Each subagent has a lane in the chat with the agent's name, model, live steps, and Stop, Apply, or Discard.
+
+## Plugins
+
+A plugin is a folder in the Claude Code plugin layout that bundles skills, commands, agents, and MCP servers:
+
+```text
+my-plugin/
+  .claude-plugin/plugin.json   { "name", "version", "description" }
+  skills/<name>/SKILL.md
+  commands/<name>.md
+  agents/<name>.md
+  .mcp.json                    { "mcpServers": { … } }
+```
+
+task-x loads plugins from these places:
+
+- the plugins that Claude Code installed (`claude plugin install`), enabled or disabled as `enabledPlugins` in `~/.claude/settings.json` says;
+- `~/.task-x/plugins/<name>/` and `.task-x/plugins/<name>/` in the workspace;
+- the folders in `task-x.plugins.dirs`.
+
+A plugin's skills and commands are `/plugin:name`, and `/name` also works when no other plugin has that name. Its agents are `plugin:name`. Turn a plugin off with `task-x.plugins.disabled`, or for one workspace with `.task-x/plugins.json` (`{ "disabled": ["name"] }`). In the `/` menu, the toggle on a plugin row uses `claude plugin enable|disable` for Claude Code plugins, and `task-x.plugins.disabled` for the others.
+
+A plugin's `hooks/hooks.json` (Claude Code's hook format) runs too. Hooks of a workspace plugin run only in a trusted workspace. Its MCP servers (`.mcp.json`) start like the others.
+
+### Marketplaces and installs
+
+task-x installs plugins without the Claude Code CLI. Run **task-x: Install Plugin…** or pick **Install plugin…** in the `/` menu:
+
+- Pick a plugin from a marketplace. task-x reads its own marketplaces (`~/.task-x/marketplaces/`) and the ones Claude Code added (`~/.claude/plugins/marketplaces/`).
+- Or give `name@marketplace`, a git URL, `owner/repo` on GitHub, or an absolute folder.
+- Choose **For me** (`~/.task-x/plugins/`) or **For this project** (`.task-x/plugins/`, which you can commit).
+
+**task-x: Add Plugin Marketplace…** adds a marketplace from a git URL, `owner/repo`, or a folder. A marketplace is a repository with `.claude-plugin/marketplace.json`, in Claude Code's format. The gear on a plugin row updates or uninstalls a plugin that task-x installed. git runs with an argument list, with repository hooks turned off, and https or ssh URLs only.
+
 ## Hooks
 
-Hooks run your commands at agent events. Each hook gets a JSON object on stdin: `{ event, tool, filePath, budgetUsed, budgetLimit, severity, payload }`. `filePath` is the tool's `path` (or `from`) input. `budgetUsed` is the task's tokens so far, and `budgetLimit` its token budget (null when there is none). `severity` is set for `afterTool` when the call failed: `retryable`, `permanent`, or `blocked`. `payload` holds the event data (task id, tool input, result).
+Hooks run your commands at agent events. Each hook gets a JSON object on stdin: `{ event, tool, filePath, budgetUsed, budgetLimit, severity, payload }`, plus the fields Claude Code hooks read (`hook_event_name`, `tool_name`, `tool_input`, `session_id`, `cwd`, `prompt`). `filePath` is the tool's `path` (or `from`) input. `budgetUsed` is the task's tokens so far, and `budgetLimit` its token budget (null when there is none). `severity` is set for `afterTool` when the call failed: `retryable`, `permanent`, or `blocked`. `payload` holds the event data (task id, tool input, result).
 
 ```json
 { "hooks": [
@@ -49,10 +123,28 @@ Hooks run your commands at agent events. Each hook gets a JSON object on stdin: 
 ] }
 ```
 
-- Events: `beforeTask`, `beforeTool`, `afterTool`, `beforeEdit`, `afterEdit`, `beforeValidation`, `afterTask`.
-- A `before*` hook that exits with a non-zero code blocks the action. Its output goes back to the model.
-- A hook runs before the permission policy decides, so a hook can block but never grant: an approved call still has to pass every hook, and the user is only asked to approve a call no hook blocks.
-- Commands are argument arrays and never run through a shell.
+| Event | When | Can block |
+|---|---|---|
+| `userPromptSubmit` | The user's prompt, before the task starts | Yes: the task does not start |
+| `beforeTask` / `afterTask` | The task starts / ends | `beforeTask` |
+| `beforeTool` / `afterTool` | Around every tool call | `beforeTool` |
+| `beforeEdit` / `afterEdit` | Around a call that writes or deletes | `beforeEdit` |
+| `beforeValidation` / `afterValidation` | Around tests, builds, and linters | `beforeValidation` |
+| `stop` / `subagentStop` | The agent (or a subagent) is about to finish | Yes: it goes on, with the reason as feedback (at most 3 times) |
+| `preCompact` | The history is about to be compressed | No |
+| `notification` | The agent waits for an approval or an answer | No |
+
+Claude Code's names work too: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SubagentStop`, `PreCompact`, `Notification`, `SessionStart`, and `SessionEnd`. A `matcher` matches the task-x tool name or its Claude Code name (`Bash`, `Edit`, `Write`, `Read`, `Grep`, `Glob`).
+
+- A blocking event's hook that exits with a non-zero code blocks. Its output goes back to the model.
+- A hook can also answer with JSON on stdout:
+  - `{ "decision": "block", "reason": "…" }` blocks with that reason (also `{ "continue": false, "stopReason" }`).
+  - `{ "additionalContext": "…" }` gives the model text before its next step. For `userPromptSubmit` and `beforeTask`, plain stdout counts as context.
+  - `{ "updatedInput": { … } }` from a `beforeTool` hook replaces the tool's input.
+  - `{ "decision": "approve" }` from a `beforeTool` hook skips the approval prompt. Only a trusted hook can approve: one from `task-x.hooks` or from a plugin you installed. A workspace hook can block but never grant, and `task-x.agent.denyTools` always wins.
+  - Claude Code's `hookSpecificOutput` (`permissionDecision`, `permissionDecisionReason`, `updatedInput`, `additionalContext`) is read the same way.
+- Hooks run before the permission policy asks the user, so the user is only asked about a call no hook blocks.
+- Hooks from settings and `.task-x/hooks.json` are argument arrays and never run through a shell. Plugin hooks are Claude Code command lines: they run with `sh -c` (`cmd /C` on Windows) with `CLAUDE_PLUGIN_ROOT` set, and only exit code 2 blocks, as in Claude Code.
 
 Configure hooks in the `task-x.hooks` setting, or in `.task-x/hooks.json`. task-x loads `.task-x/hooks.json` only when VS Code trusts the workspace.
 
@@ -78,7 +170,10 @@ A server is local or remote:
 
 - `type` is `stdio` (default with a `command`), `http` (streamable HTTP; default with only a `url`), or `sse` (the older HTTP+SSE transport).
 - `headers` go with every request. They are never logged, and never sent over plain `http` to a host that is not loopback.
-- A server that answers 401 or 403 needs sign-in. task-x does not run OAuth sign-in flows; put a token in `headers`.
+- A server that answers 401 or 403 needs sign-in. task-x shows **Sign In**, or run **task-x: Sign In to MCP Server…**:
+  - task-x finds the server's authorization server (from the `WWW-Authenticate` header or the `.well-known` metadata), registers itself as a client, and opens the sign-in page in your browser. The code comes back to a one-time listener on 127.0.0.1, with PKCE.
+  - The tokens are kept in VS Code's secret storage, never in settings or logs. An expired token is refreshed before the server starts.
+  - **task-x: Sign Out of MCP Server…** forgets them. A server that does not support OAuth still works with a token in `headers`, which wins over a sign-in.
 
 ### Servers from Claude and Copilot
 

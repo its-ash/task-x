@@ -50,6 +50,34 @@ pub struct ServerConfig {
     /// HTTP headers for the `http` and `sse` transports (for example `Authorization`). Never logged.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// Tokens from an OAuth sign-in (`mcp/authorize`), kept by the client and sent back here. Sent
+    /// as `Authorization: Bearer`; never serialized back out.
+    #[serde(default, skip_serializing)]
+    pub oauth: Option<crate::oauth::Tokens>,
+}
+
+/// Marks a start error that a sign-in would fix; `[www-authenticate: …]` carries the server's hint.
+const AUTH_REQUIRED: &str = "sign-in required: ";
+
+fn auth_error(url: &url::Url, status: reqwest::StatusCode, www: Option<&str>) -> String {
+    format!(
+        "{AUTH_REQUIRED}{url} answered HTTP {status}. Sign in with task-x: Sign In to MCP Server, or put a token in the server's headers.{}",
+        www.map(|w| format!(" [www-authenticate: {w}]")).unwrap_or_default()
+    )
+}
+
+/// Hands new OAuth tokens (after a sign-in or a refresh) to the client to keep.
+pub type TokenSink = Arc<dyn Fn(&str, &crate::oauth::Tokens) + Send + Sync>;
+static TOKEN_SINK: std::sync::RwLock<Option<TokenSink>> = std::sync::RwLock::new(None);
+
+pub fn set_token_sink(f: TokenSink) {
+    *TOKEN_SINK.write().expect("token sink lock") = Some(f);
+}
+
+fn tokens_changed(server: &str, t: &crate::oauth::Tokens) {
+    if let Some(f) = TOKEN_SINK.read().expect("token sink lock").as_ref() {
+        f(server, t);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +119,7 @@ fn remote(cfg: &ServerConfig) -> Result<(url::Url, HeaderMap), String> {
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,
     };
-    if u.scheme() == "http" && !loopback && !cfg.headers.is_empty() {
+    if u.scheme() == "http" && !loopback && (!cfg.headers.is_empty() || cfg.oauth.is_some()) {
         return Err("refusing to send headers over plain http to a non-loopback host".into());
     }
     let mut h = HeaderMap::new();
@@ -100,6 +128,12 @@ fn remote(cfg: &ServerConfig) -> Result<(url::Url, HeaderMap), String> {
         let mut val = HeaderValue::from_str(v).map_err(|_| format!("invalid value for header '{k}'"))?;
         val.set_sensitive(true);
         h.insert(name, val);
+    }
+    // A header the user set wins over a sign-in token.
+    if let Some(t) = cfg.oauth.as_ref().filter(|_| !h.contains_key(reqwest::header::AUTHORIZATION)) {
+        let mut val = HeaderValue::from_str(&format!("Bearer {}", t.access_token)).map_err(|_| "the OAuth token is not a valid header value".to_owned())?;
+        val.set_sensitive(true);
+        h.insert(reqwest::header::AUTHORIZATION, val);
     }
     Ok((u, h))
 }
@@ -245,7 +279,8 @@ impl HttpConn {
         match r.status() {
             s if s.is_success() => Ok(r),
             s if matches!(s.as_u16(), 401 | 403) => {
-                Err(format!("{} answered HTTP {s}: the server needs sign-in; set an Authorization header for it", self.url))
+                let www = r.headers().get(reqwest::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok());
+                Err(auth_error(&self.url, s, www))
             }
             s => Err(format!("{} answered HTTP {s}", self.url)),
         }
@@ -490,6 +525,9 @@ impl Client {
             .send()
             .await
             .map_err(|e| format!("could not reach {url}: {e}"))?;
+        if matches!(resp.status().as_u16(), 401 | 403) {
+            return Err(auth_error(&url, resp.status(), resp.headers().get(reqwest::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok())));
+        }
         if !resp.status().is_success() {
             return Err(format!("{url} answered HTTP {}", resp.status()));
         }
@@ -728,6 +766,38 @@ pub struct Manager {
     clients: HashMap<String, Arc<Client>>,
     errors: BTreeMap<String, String>,
     configs: BTreeMap<String, ServerConfig>,
+    /// Servers that answered 401 or 403, with their `WWW-Authenticate` header (maybe empty).
+    auth_required: BTreeMap<String, String>,
+    root: Option<PathBuf>,
+}
+
+/// Starts one server: refreshes an expired OAuth token first, and once more after a 401. Returns the
+/// client, or the error, and the tokens when they changed.
+async fn start_one(name: &str, cfg: &ServerConfig, root: Option<&Path>) -> (Result<Client, String>, Option<crate::oauth::Tokens>) {
+    let mut cfg = cfg.clone();
+    let mut fresh = None;
+    if let Some(t) = cfg.oauth.as_ref().filter(|t| t.expired() && t.refresh_token.is_some()) {
+        if let Ok(n) = crate::oauth::refresh(t).await {
+            cfg.oauth = Some(n.clone());
+            fresh = Some(n);
+        }
+    }
+    let attempt = |cfg: ServerConfig| async move {
+        let mut c = Client::start(name, &cfg, root).await?;
+        c.initialize().await?;
+        Ok::<_, String>(c)
+    };
+    let first = attempt(cfg.clone()).await;
+    match (&first, cfg.oauth.as_ref().filter(|t| t.refresh_token.is_some() && fresh.is_none())) {
+        (Err(e), Some(t)) if e.contains(AUTH_REQUIRED) => match crate::oauth::refresh(t).await {
+            Ok(n) => {
+                cfg.oauth = Some(n.clone());
+                (attempt(cfg).await, Some(n))
+            }
+            Err(_) => (first, None),
+        },
+        _ => (first, fresh),
+    }
 }
 
 pub fn load_workspace(root: &Path) -> Result<BTreeMap<String, ServerConfig>, String> {
@@ -750,32 +820,67 @@ pub fn load_workspace(root: &Path) -> Result<BTreeMap<String, ServerConfig>, Str
 
 impl Manager {
     /// Starts the configured servers (in parallel), replacing any running ones.
-    pub async fn configure(&mut self, configs: BTreeMap<String, ServerConfig>, root: Option<PathBuf>) {
+    pub async fn configure(&mut self, mut configs: BTreeMap<String, ServerConfig>, root: Option<PathBuf>) {
         self.clients.clear();
         self.errors.clear();
+        self.auth_required.clear();
         let starts = configs.iter().filter(|(_, c)| !c.disabled).map(|(name, cfg)| {
             let (name, cfg, root) = (name.clone(), cfg.clone(), root.clone());
             async move {
-                let r = async {
-                    let mut c = Client::start(&name, &cfg, root.as_deref()).await?;
-                    c.initialize().await?;
-                    Ok::<_, String>(c)
-                }
-                .await;
-                (name, r)
+                let (r, fresh) = start_one(&name, &cfg, root.as_deref()).await;
+                (name, r, fresh)
             }
         });
-        for (name, r) in futures_util::future::join_all(starts).await {
-            match r {
-                Ok(c) => {
-                    self.clients.insert(name, Arc::new(c));
-                }
-                Err(e) => {
-                    self.errors.insert(name, e);
+        for (name, r, fresh) in futures_util::future::join_all(starts).await {
+            if let Some(t) = fresh {
+                tokens_changed(&name, &t);
+                if let Some(c) = configs.get_mut(&name) {
+                    c.oauth = Some(t);
                 }
             }
+            self.record(name, r);
         }
         self.configs = configs;
+        self.root = root;
+    }
+
+    fn record(&mut self, name: String, r: Result<Client, String>) {
+        match r {
+            Ok(c) => {
+                self.errors.remove(&name);
+                self.auth_required.remove(&name);
+                self.clients.insert(name, Arc::new(c));
+            }
+            Err(e) => {
+                if let Some(rest) = e.find(AUTH_REQUIRED).map(|i| &e[i + AUTH_REQUIRED.len()..]) {
+                    let hint = rest.split_once("[www-authenticate: ").map(|(_, h)| h.trim_end_matches(']').to_owned()).unwrap_or_default();
+                    self.auth_required.insert(name.clone(), hint);
+                }
+                self.errors.insert(name, e);
+            }
+        }
+    }
+
+    /// What `mcp/authorize` needs for a server: its URL and the `WWW-Authenticate` hint of its 401.
+    pub fn auth_target(&self, name: &str) -> Result<(String, Option<String>), String> {
+        let cfg = self.configs.get(name).ok_or_else(|| format!("no MCP server named '{name}'"))?;
+        if cfg.kind()? == Kind::Stdio {
+            return Err(format!("'{name}' is a local server; sign-in is for http and sse servers"));
+        }
+        let url = cfg.url.clone().ok_or_else(|| format!("'{name}' has no url"))?;
+        Ok((url, self.auth_required.get(name).filter(|h| !h.is_empty()).cloned()))
+    }
+
+    /// Starts a server again with the tokens of a sign-in, and hands them to the client to keep.
+    pub async fn install_tokens(&mut self, name: &str, tokens: crate::oauth::Tokens) -> Result<(), String> {
+        let mut cfg = self.configs.get(name).cloned().ok_or_else(|| format!("no MCP server named '{name}'"))?;
+        cfg.oauth = Some(tokens.clone());
+        tokens_changed(name, &tokens);
+        let (r, _) = start_one(name, &cfg, self.root.as_deref()).await;
+        self.configs.insert(name.to_owned(), cfg);
+        let err = r.as_ref().err().cloned();
+        self.record(name.to_owned(), r);
+        err.map_or(Ok(()), Err)
     }
 
     pub fn tools(&self) -> Vec<McpTool> {
@@ -814,6 +919,8 @@ impl Manager {
                     "running": c.is_some_and(|c| c.alive()),
                     "tools": c.map(|c| c.tools.iter().map(|t| t.qualified.clone()).collect::<Vec<_>>()).unwrap_or_default(),
                     "error": self.errors.get(name),
+                    "authRequired": self.auth_required.contains_key(name),
+                    "signedIn": cfg.oauth.is_some(),
                 })
             })
             .collect();
@@ -909,6 +1016,33 @@ done
         assert_eq!(cfg(json!({ "url": "https://mcp.example.com/mcp" })).kind(), Ok(Kind::Http), "a url alone means http");
         assert_eq!(cfg(json!({ "type": "sse", "url": "https://x.dev/sse" })).kind(), Ok(Kind::Sse));
         assert!(cfg(json!({ "type": "ws", "url": "ws://x" })).kind().is_err());
+    }
+
+    /// A server that answers 401 is marked for sign-in; after `sign_in` and `install_tokens` it runs
+    /// with the Bearer token, and the client is handed the tokens to keep.
+    #[tokio::test]
+    async fn a_server_that_needs_sign_in_runs_after_oauth() {
+        let (base, _) = crate::oauth::tests::auth_server().await;
+        let kept: Arc<Mutex<Vec<String>>> = Arc::default();
+        let k = kept.clone();
+        set_token_sink(Arc::new(move |s, t| k.lock().unwrap().push(format!("{s}:{}", t.access_token))));
+        let mut m = Manager::default();
+        let cfg = ServerConfig { url: Some(format!("{base}/mcp")), ..Default::default() };
+        m.configure(BTreeMap::from([("secure".to_string(), cfg)]), None).await;
+        let s = m.status();
+        assert_eq!((s["servers"][0]["authRequired"].clone(), s["servers"][0]["running"].clone()), (json!(true), json!(false)), "{s}");
+        let (url, hint) = m.auth_target("secure").unwrap();
+        assert!(hint.as_deref().is_some_and(|h| h.contains("resource_metadata")), "{hint:?}");
+        let (open, _) = crate::oauth::tests::browser();
+        let tokens = crate::oauth::sign_in(&url, hint.as_deref(), open, &CancellationToken::new()).await.unwrap();
+        m.install_tokens("secure", tokens).await.unwrap();
+        let s = m.status();
+        assert_eq!((s["servers"][0]["running"].clone(), s["servers"][0]["signedIn"].clone(), s["servers"][0]["authRequired"].clone()), (json!(true), json!(true), json!(false)));
+        assert!(m.tools().iter().any(|t| t.qualified == "mcp__secure__whoami"));
+        assert!(kept.lock().unwrap().contains(&"secure:tok-1".to_string()), "the client keeps the tokens");
+        let local = ServerConfig { command: "true".into(), ..Default::default() };
+        m.configure(BTreeMap::from([("local".to_string(), local)]), None).await;
+        assert!(m.auth_target("local").is_err(), "sign-in is for remote servers");
     }
 
     #[test]

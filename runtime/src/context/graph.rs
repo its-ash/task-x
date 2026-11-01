@@ -27,7 +27,7 @@ const HUBS: usize = 10;
 const MAX_CYCLES: usize = 20;
 const TS_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EdgeKind {
     Import,
@@ -64,6 +64,33 @@ pub struct ProjectGraph {
     /// Import cycles (strongly connected components with more than one file), largest first.
     pub cycles: Vec<Vec<usize>>,
     pub build_ms: u64,
+    /// Read from the saved copy instead of built.
+    pub cached: bool,
+}
+
+/// The graph as saved on disk, with the engine version and the index fingerprint it was built from.
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    version: u32,
+    fingerprint: u64,
+    nodes: Vec<(String, usize, u64)>,
+    edges: Vec<(usize, usize, EdgeKind, u32)>,
+    cycles: Vec<Vec<usize>>,
+}
+
+/// A hash of every indexed path with its size and modification time: the saved graph is used only
+/// when it matches, so any change to the files (or the index rules) builds it again.
+pub fn fingerprint(index: &Index) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    GRAPH_ENGINE_VERSION.hash(&mut h);
+    for f in index.files() {
+        f.rel.hash(&mut h);
+        f.size.hash(&mut h);
+        f.mtime.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).hash(&mut h);
+        f.content.is_some().hash(&mut h);
+    }
+    h.finish()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -292,10 +319,98 @@ impl ProjectGraph {
             out[e.from].push(k);
             inc[e.to].push(k);
         }
-        let mut g = Self { version: GRAPH_ENGINE_VERSION, nodes, edges, ids, out, inc, cycles: Vec::new(), build_ms: 0 };
+        let mut g = Self { version: GRAPH_ENGINE_VERSION, nodes, edges, ids, out, inc, cycles: Vec::new(), build_ms: 0, cached: false };
         g.cycles = g.import_cycles();
         g.build_ms = started.elapsed().as_millis() as u64;
         g
+    }
+
+    /// The saved graph at `file` when its engine version and fingerprint match the index, else a
+    /// fresh build, which is then saved there.
+    pub fn load_or_build(index: &Index, file: Option<&Path>) -> Self {
+        let fp = fingerprint(index);
+        if let Some(g) = file.and_then(|f| Self::load(index, f, fp)) {
+            return g;
+        }
+        let g = Self::build(index);
+        if let Some(f) = file {
+            g.save(f, fp);
+        }
+        g
+    }
+
+    fn save(&self, file: &Path, fingerprint: u64) {
+        let saved = Saved {
+            version: self.version,
+            fingerprint,
+            nodes: self.nodes.iter().map(|n| (n.path.clone(), n.symbols, n.size)).collect(),
+            edges: self.edges.iter().map(|e| (e.from, e.to, e.kind, e.weight)).collect(),
+            cycles: self.cycles.clone(),
+        };
+        let Ok(bytes) = serde_json::to_vec(&saved) else { return };
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = file.with_extension("json.tmp");
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(tmp, file);
+        }
+    }
+
+    fn load(index: &Index, file: &Path, fingerprint: u64) -> Option<Self> {
+        let started = Instant::now();
+        let s: Saved = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
+        if s.version != GRAPH_ENGINE_VERSION || s.fingerprint != fingerprint {
+            return None;
+        }
+        let n = s.nodes.len();
+        if s.edges.iter().any(|e| e.0 >= n || e.1 >= n) || s.cycles.iter().flatten().any(|&v| v >= n) {
+            return None;
+        }
+        let nodes: Vec<Node> = s
+            .nodes
+            .into_iter()
+            .map(|(path, symbols, size)| Node { dir: dir_of(&path).to_owned(), language: index.get(&path).and_then(|f| f.language), path, symbols, size })
+            .collect();
+        let ids = nodes.iter().enumerate().map(|(i, n)| (n.path.clone(), i)).collect();
+        let edges: Vec<Edge> = s.edges.into_iter().map(|(from, to, kind, weight)| Edge { from, to, kind, weight }).collect();
+        let (mut out, mut inc) = (vec![Vec::new(); n], vec![Vec::new(); n]);
+        for (k, e) in edges.iter().enumerate() {
+            out[e.from].push(k);
+            inc[e.to].push(k);
+        }
+        Some(Self { version: s.version, nodes, edges, ids, out, inc, cycles: s.cycles, build_ms: started.elapsed().as_millis() as u64, cached: true })
+    }
+
+    /// PageRank over the dependency edges (a file is important when important files depend on it),
+    /// weighted by linked symbols. With `focus`, half the restart weight goes to those files, so the
+    /// ranking leans towards the code around them.
+    pub fn page_rank(&self, focus: &[usize]) -> Vec<f64> {
+        const DAMPING: f64 = 0.85;
+        const ROUNDS: usize = 30;
+        let n = self.nodes.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let focus: Vec<usize> = focus.iter().copied().filter(|&v| v < n).collect();
+        let mut restart = vec![1.0 / n as f64; n];
+        if !focus.is_empty() {
+            restart.iter_mut().for_each(|r| *r *= 0.5);
+            for &v in &focus {
+                restart[v] += 0.5 / focus.len() as f64;
+            }
+        }
+        let weight_out: Vec<f64> = (0..n).map(|v| self.out[v].iter().map(|&k| f64::from(self.edges[k].weight)).sum()).collect();
+        let mut rank = restart.clone();
+        for _ in 0..ROUNDS {
+            let dangling: f64 = (0..n).filter(|&v| weight_out[v] == 0.0).map(|v| rank[v]).sum();
+            let mut next: Vec<f64> = restart.iter().map(|r| (1.0 - DAMPING) * r + DAMPING * dangling * r).collect();
+            for e in &self.edges {
+                next[e.to] += DAMPING * rank[e.from] * f64::from(e.weight) / weight_out[e.from];
+            }
+            rank = next;
+        }
+        rank
     }
 
     pub fn id(&self, path: &str) -> Option<usize> {
@@ -381,6 +496,7 @@ impl ProjectGraph {
             "importCycles": self.cycles.iter().take(MAX_CYCLES).map(|c| c.iter().map(|&i| self.nodes[i].path.clone()).collect::<Vec<_>>()).collect::<Vec<_>>(),
             "buildMs": self.build_ms,
             "version": self.version,
+            "cached": self.cached,
         })
     }
 
@@ -555,6 +671,36 @@ mod tests {
         assert!(g.neighbors("web/app.ts").unwrap()["importCycle"].is_array());
         let s = g.stats();
         assert!(s["importEdges"].as_u64().unwrap() >= 8);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn the_saved_graph_is_reused_until_a_file_changes_and_ranks_hubs_first() {
+        let root = temp_repo(&[
+            ("src/a.rs", "pub fn alpha() { core(); }\n"),
+            ("src/b.rs", "pub fn beta() { core(); }\n"),
+            ("src/core.rs", "pub fn core() {}\n"),
+            ("src/lone.rs", "pub fn lone() {}\n"),
+        ]);
+        let mut ix = Index::new(root.clone(), &[]).unwrap();
+        ix.refresh();
+        let file = root.join(".cache/graph.json");
+        let first = ProjectGraph::load_or_build(&ix, Some(&file));
+        assert!(!first.cached && file.is_file(), "built and saved");
+        let again = ProjectGraph::load_or_build(&ix, Some(&file));
+        assert!(again.cached, "read back while nothing changed");
+        assert_eq!((again.nodes.len(), again.edges.len()), (first.nodes.len(), first.edges.len()));
+        assert_eq!(deps(&again, "src/a.rs"), ["src/core.rs"], "edges survive the round trip");
+        let rank = again.page_rank(&[]);
+        let core = again.id("src/core.rs").unwrap();
+        assert!((0..rank.len()).all(|v| v == core || rank[core] > rank[v]), "the file both others use ranks first: {rank:?}");
+        let lone = again.id("src/lone.rs").unwrap();
+        let focused = again.page_rank(&[lone]);
+        assert!(focused[lone] > rank[lone], "focus lifts a file");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(root.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
+        ix.refresh();
+        assert!(!ProjectGraph::load_or_build(&ix, Some(&file)).cached, "a changed file builds the graph again");
         std::fs::remove_dir_all(root).ok();
     }
 

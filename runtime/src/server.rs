@@ -1,4 +1,4 @@
-use crate::agent::{self, ApprovalDecision, ApprovalRequest, AskRequest, Host, RunParams, hooks, skills, store::Store};
+use crate::agent::{self, ApprovalDecision, ApprovalRequest, AskRequest, Host, RunParams, agents, hooks, plugins, skills, store::Store};
 use crate::context::{Workspace, retrieve};
 use crate::mcp;
 use crate::provider::{self, ChatRequest, ContentPart, ErrorKind, Message, ProviderConfig, ProviderError, Providers, Role};
@@ -39,6 +39,57 @@ struct InitializeParams {
 #[serde(rename_all = "camelCase")]
 struct TaskIdParams {
     task_id: String,
+}
+
+/// `plugins/install`, `plugins/uninstall`, `plugins/update`, and the marketplace methods.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginOpParams {
+    /// install: `name@marketplace`, a git URL, `owner/repo`, or an absolute folder.
+    #[serde(default)]
+    spec: Option<String>,
+    /// uninstall, update, and marketplace update and remove.
+    #[serde(default)]
+    name: Option<String>,
+    /// marketplace add: a git URL, `owner/repo`, or an absolute folder.
+    #[serde(default)]
+    source: Option<String>,
+    /// `user` (default) or `workspace`.
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+/// `mcp/authorize`: the server to sign in to.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerNameParams {
+    server: String,
+}
+
+/// `memory/search` and `memory/forget`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryParams {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// `agent/fork` and `agent/rewind`: a task and a checkpoint index (from `agent/checkpoints`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CheckpointParams {
+    task_id: String,
+    #[serde(default)]
+    checkpoint: Option<usize>,
+    /// Rewind only: also undo the edits made since the checkpoint (default true).
+    #[serde(default)]
+    restore_code: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -160,8 +211,12 @@ struct SkillsResolveParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HooksParams {
+    /// The user's own hooks: trusted, so they may approve a call.
     #[serde(default)]
     hooks: Vec<hooks::Hook>,
+    /// Hooks a workspace set (its settings): they run in a trusted workspace but never approve.
+    #[serde(default)]
+    workspace_setting_hooks: Vec<hooks::Hook>,
     #[serde(default)]
     workspace_trusted: bool,
 }
@@ -223,6 +278,9 @@ struct OpenParams {
     root: PathBuf,
     #[serde(default)]
     exclude: Vec<String>,
+    /// Look for file changes every `WATCH_INTERVAL` and index them (for clients without a file watcher).
+    #[serde(default)]
+    watch: bool,
     /// Accepted from older clients and ignored: only the workspace instruction file is read.
     #[serde(default, rename = "userInstructions")]
     _user_instructions: Option<serde::de::IgnoredAny>,
@@ -287,7 +345,15 @@ pub struct Server {
     task_slots: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Where task files and checkpoints are saved (`initialize.dataDir`).
     data_dir: Arc<RwLock<Option<PathBuf>>>,
+    /// Extra plugin folders and disabled plugins (`plugins/configure`).
+    plugins: Arc<RwLock<plugins::Settings>>,
+    /// Bumped by every `workspace/open`, so the watcher of an earlier workspace stops.
+    watch_gen: Arc<AtomicU64>,
 }
+
+/// How often the watcher looks for changed files, and how long it waits for a burst of writes to settle.
+const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const WATCH_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 fn params<T: DeserializeOwned>(v: Value) -> Result<T, RpcError> {
     serde_json::from_value(v).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, format!("invalid params: {e}")))
@@ -328,7 +394,45 @@ impl Server {
             tool_cancels: Arc::default(),
             task_slots: Arc::default(),
             data_dir: Arc::default(),
+            plugins: Arc::default(),
+            watch_gen: Arc::default(),
         })
+    }
+
+    /// Indexes file changes made outside the client (another editor, git, a build) until the next
+    /// `workspace/open` or shutdown. A burst of writes is indexed once it settles.
+    fn watch(&self) {
+        let generation = self.watch_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(WATCH_INTERVAL).await;
+                if this.watch_gen.load(Ordering::SeqCst) != generation || this.shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
+                let mut changed: Vec<String> = Vec::new();
+                // Rescan until a scan finds nothing new, so one save of many files is one update.
+                for _ in 0..5 {
+                    let ws = this.workspace.clone();
+                    let found = tokio::task::spawn_blocking(move || ws.write().expect("workspace lock").as_mut().map(Workspace::rescan).unwrap_or_default())
+                        .await
+                        .unwrap_or_default();
+                    if found.is_empty() {
+                        break;
+                    }
+                    changed.extend(found);
+                    tokio::time::sleep(WATCH_SETTLE).await;
+                }
+                if changed.is_empty() {
+                    continue;
+                }
+                changed.sort();
+                changed.dedup();
+                let stats = this.workspace.read().expect("workspace lock").as_ref().map(|w| json!(w.index.stats()));
+                let shown: Vec<&String> = changed.iter().take(50).collect();
+                this.progress(json!({ "phase": "updated", "stats": stats, "changed": shown, "changedCount": changed.len(), "by": "watcher" }));
+            }
+        });
     }
 
     fn send(&self, msg: String) {
@@ -399,6 +503,16 @@ impl Server {
             "tools/list" => self.reply(&id, Ok(json!(tools::infos()))),
             "agent/tasks" => self.reply(&id, Ok(json!(self.store.read().expect("store lock").list(100)))),
             "agent/task" => self.reply(&id, self.get_task(msg.params)),
+            "agent/checkpoints" => self.reply(&id, self.with_record(msg.params, |r| Ok(agent::session::checkpoints(&r)))),
+            "agent/cost" => self.reply(&id, self.with_record(msg.params, |r| Ok(agent::session::cost(&r)))),
+            "agent/fork" => self.reply(
+                &id,
+                params::<CheckpointParams>(msg.params).and_then(|p| {
+                    let r = agent::session::fork(&self.store.read().expect("store lock"), &p.task_id, p.checkpoint)
+                        .map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?;
+                    Ok(json!({ "taskId": r.id, "title": r.title, "messages": r.messages.len(), "forkedFrom": r.forked_from }))
+                }),
+            ),
             "agent/deleteTask" => self
                 .reply(&id, params::<TaskIdParams>(msg.params).map(|p| json!(self.store.read().expect("store lock").delete(&p.task_id)))),
             "edits/list" => self.reply(&id, Ok(self.list_edits())),
@@ -407,9 +521,13 @@ impl Server {
             "skills/resolve" => self.reply(
                 &id,
                 params::<SkillsResolveParams>(msg.params).map(|p| {
-                    json!({ "active": skills::resolve(&skills::load(self.root().as_deref(), &skills::user_dirs()), &p.prompt, &p.paths) })
+                    json!({ "active": skills::resolve(&skills::load(self.root().as_deref(), &skills::user_dirs(), &self.plugin_dirs()), &p.prompt, &p.paths) })
                 }),
             ),
+            "memory/search" | "memory/forget" => self.reply(&id, self.memory(&method, msg.params)),
+            "agents/list" => self.reply(&id, Ok(json!(agents::load(self.root().as_deref(), &agents::user_dirs(), &self.plugin_dirs())))),
+            "plugins/list" => self.reply(&id, Ok(json!(self.list_plugins()))),
+            "plugins/configure" => self.reply(&id, self.configure_plugins(msg.params)),
             "worktrees/list" => self.reply(
                 &id,
                 self.root().ok_or_else(|| RpcError::new(rpc::NO_WORKSPACE, "no workspace is open")).and_then(|r| {
@@ -476,6 +594,16 @@ impl Server {
             | "docs/remove"
             | "mcp/getPrompt"
             | "mcp/readResource"
+            | "agent/rewind"
+            | "agent/compact"
+            | "plugins/install"
+            | "plugins/uninstall"
+            | "plugins/update"
+            | "plugins/marketplaces"
+            | "plugins/marketplaceAdd"
+            | "plugins/marketplaceUpdate"
+            | "plugins/marketplaceRemove"
+            | "mcp/authorize"
             | "mcp/status" => self.spawn(id, key, method, msg.params),
             _ => self.reply(&id, Err(RpcError::new(rpc::METHOD_NOT_FOUND, format!("unknown method: {method}")))),
         }
@@ -525,6 +653,9 @@ impl Server {
         if let Some(on) = p.sandbox {
             tools::exec::SANDBOX.store(on, Ordering::Relaxed);
         }
+        // OAuth tokens of MCP servers go to the client to keep (SecretStorage); the runtime never stores them.
+        let sink = self.clone();
+        mcp::set_token_sink(Arc::new(move |server, tokens| sink.send(rpc::notification("mcp/tokens", json!({ "server": server, "tokens": tokens })))));
         // MCP elicitation: a server's question goes to the client (`mcp/elicit`); no answer cancels it.
         let me = self.clone();
         mcp::set_elicit(Arc::new(move |server, params| {
@@ -579,12 +710,16 @@ impl Server {
                 "tools/call" => this.call_tool(p, &token).await,
                 "agent/run" => this.run_agent(p, &token).await,
                 "agent/bestOf" => this.best_of(p, &token).await,
+                "agent/rewind" => this.rewind(p).await,
+                "agent/compact" => this.compact_task(p).await,
+                m if m.starts_with("plugins/") => this.plugin_op(m, p, &token).await,
                 "worktrees/apply" | "worktrees/discard" => this.worktree(method == "worktrees/apply", p).await,
                 "edits/undo" => this.undo(p).await,
                 "edits/keep" | "edits/revert" => this.settle(method == "edits/keep", p).await,
                 "mcp/configure" => this.configure_mcp(p).await,
                 "claude/run" => this.run_claude(p, &token).await,
                 "mcp/status" => Ok(this.mcp.read().await.status()),
+                "mcp/authorize" => this.mcp_authorize(p, &token).await,
                 "mcp/catalog" => Ok(this.mcp.read().await.catalog()),
                 "docs/add" => this.docs_add(p, &token).await,
                 "docs/list" => Ok(this.data_dir.read().expect("data dir lock").as_deref().map_or_else(|| json!([]), crate::docs::list)),
@@ -599,7 +734,16 @@ impl Server {
                 "provider/complete" => this.complete(p, &token).await,
                 "context/inspect" => this.with_workspace(|w| Ok(json!(w.summary()))).await,
                 "graph/project" => match params::<crate::context::graph::ViewOptions>(p) {
-                    Ok(o) => this.with_workspace(move |w| Ok(w.graph().view(&o))).await,
+                    Ok(o) => {
+                        this.with_workspace(move |w| {
+                            let mut v = w.graph().view(&o);
+                            let st = w.index.stats();
+                            v["skippedDirs"] = json!(st.skipped_dirs);
+                            v["skippedDirCount"] = json!(st.skipped_dir_count);
+                            Ok(v)
+                        })
+                        .await
+                    }
                     Err(e) => Err(e),
                 },
                 "graph/file" => match params::<PathParams>(p) {
@@ -661,10 +805,11 @@ impl Server {
 
     async fn open_workspace(&self, p: Value) -> Result<Value, RpcError> {
         let p: OpenParams = params(p)?;
+        let watch = p.watch;
         let ws = self.workspace.clone();
         let (edits, data_dir) = (self.edits.clone(), self.data_dir.read().expect("data dir lock").clone());
         let this = self.clone();
-        tokio::task::spawn_blocking(move || {
+        let summary = tokio::task::spawn_blocking(move || {
             let started = Instant::now();
             this.progress(json!({ "phase": "indexing", "files": 0, "parsed": 0, "elapsedMs": 0 }));
             let last = Mutex::new(Instant::now());
@@ -677,10 +822,14 @@ impl Server {
                     );
                 }
             };
-            let w = Workspace::open_progress(&p.root, &p.exclude, &report).map_err(|e| {
+            let mut w = Workspace::open_progress(&p.root, &p.exclude, &report).map_err(|e| {
                 this.progress(json!({ "phase": "failed", "error": e }));
                 RpcError::new(rpc::INVALID_PARAMS, e)
             })?;
+            // The project graph is saved per workspace and read back while the files are unchanged.
+            if let Some(d) = &data_dir {
+                w.graph_file = Some(d.join("graphs").join(format!("{:016x}.json", tools::fingerprint(&w.index.root().to_string_lossy()))));
+            }
             log(format_args!("indexed {} files in {}ms", w.index.stats().files, started.elapsed().as_millis()));
             this.progress(json!({ "phase": "graph", "files": w.index.stats().files, "elapsedMs": started.elapsed().as_millis() as u64 }));
             let graph = w.graph().stats();
@@ -700,7 +849,14 @@ impl Server {
             Ok(summary)
         })
         .await
-        .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, format!("indexing failed: {e}")))?
+        .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, format!("indexing failed: {e}")))??;
+        if watch {
+            self.watch();
+        } else {
+            // A new workspace without a watcher stops the one of the previous workspace.
+            self.watch_gen.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(summary)
     }
 
     pub fn tool_ctx(&self, cancel: CancellationToken) -> Result<Arc<ToolCtx>, RpcError> {
@@ -767,6 +923,7 @@ impl Server {
             subagents: self.subagents.clone(),
             steers: self.steers.clone(),
             tool_cancels: self.tool_cancels.clone(),
+            plugins: self.plugins.clone(),
             approve: Arc::new(move |req: ApprovalRequest, cancel| {
                 let ask = ask.clone();
                 Box::pin(async move {
@@ -837,10 +994,121 @@ impl Server {
     }
 
     fn get_task(&self, p: Value) -> Result<Value, RpcError> {
+        self.with_record(p, |r| {
+            Ok(json!({ "summary": agent::summary(&r), "messages": r.messages, "title": r.title, "checkpoints": agent::session::checkpoints(&r), "forkedFrom": r.forked_from }))
+        })
+    }
+
+    /// Loads the task named by `{ taskId }` and hands it to `f`.
+    fn with_record(&self, p: Value, f: impl FnOnce(agent::store::TaskRecord) -> Result<Value, RpcError>) -> Result<Value, RpcError> {
         let p: TaskIdParams = params(p)?;
-        let r =
-            self.store.read().expect("store lock").load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "unknown task"))?;
-        Ok(json!({ "summary": agent::summary(&r), "messages": r.messages, "title": r.title }))
+        let r = self.store.read().expect("store lock").load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "unknown task"))?;
+        f(r)
+    }
+
+    /// `agent/rewind`: cuts the conversation back to before a prompt and, by default, undoes the
+    /// edits made since. A file the user changed after the agent's edit is left as is (a conflict).
+    async fn rewind(&self, p: Value) -> Result<Value, RpcError> {
+        let p: CheckpointParams = params(p)?;
+        let at = p.checkpoint.ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "checkpoint is required"))?;
+        let _slot = self.task_slot(Some(&p.task_id)).await;
+        let store = self.store.read().expect("store lock").clone();
+        let mut r = store.load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "unknown task"))?;
+        let ops = agent::session::cut(&mut r, at).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?;
+        let (mut undone, mut conflicts) = (Vec::new(), Vec::new());
+        if p.restore_code.unwrap_or(true) && !ops.is_empty() {
+            let ctx = self.tool_ctx(CancellationToken::new())?;
+            let list = ops.clone();
+            let results = tokio::task::spawn_blocking(move || list.iter().map(|op| (*op, tools::undo(&ctx, *op))).collect::<Vec<_>>())
+                .await
+                .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e.to_string()))?;
+            for (op, res) in results {
+                match res {
+                    Ok(v) => {
+                        undone.push(op);
+                        conflicts.extend(v["conflicts"].as_array().cloned().unwrap_or_default());
+                    }
+                    // Already undone by hand, or too old: nothing more to do for it.
+                    Err(e) => conflicts.push(json!({ "operation": op, "reason": e.message })),
+                }
+            }
+        }
+        store.save(&r).map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e.to_string()))?;
+        Ok(json!({ "taskId": r.id, "checkpoint": at, "messages": r.messages.len(), "undone": undone, "conflicts": conflicts, "text": r.final_text }))
+    }
+
+    /// `memory/search { query, limit? }` and `memory/forget { id }` on the workspace memory.
+    fn memory(&self, method: &str, p: Value) -> Result<Value, RpcError> {
+        let p: MemoryParams = params(p)?;
+        let root = self.root().ok_or_else(|| RpcError::new(rpc::NO_WORKSPACE, "no workspace is open"))?;
+        let data = self.data_dir.read().expect("data dir lock").clone();
+        let bad = |m: &str| RpcError::new(rpc::INVALID_PARAMS, m);
+        if method == "memory/search" {
+            let q = p.query.filter(|q| !q.trim().is_empty()).ok_or_else(|| bad("query is required"))?;
+            return Ok(agent::recall::recall(data.as_deref(), &root, &q, p.limit.unwrap_or(10).clamp(1, 50)));
+        }
+        let id = p.id.ok_or_else(|| bad("id is required"))?;
+        let d = data.ok_or_else(|| bad("no data folder"))?;
+        let removed = agent::recall::forget(&agent::recall::file(&d, &root), &id).map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e.to_string()))?;
+        Ok(json!({ "removed": removed }))
+    }
+
+    /// `mcp/authorize`: the OAuth sign-in for a remote server. The client opens the sign-in page
+    /// (`mcp/openUrl`), keeps the tokens it gets in `mcp/tokens`, and sends them back with
+    /// `mcp/configure` from then on. Returns the server status.
+    async fn mcp_authorize(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
+        let p: ServerNameParams = params(p)?;
+        let (url, hint) = self.mcp.read().await.auth_target(&p.server).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?;
+        let (me, server) = (self.clone(), p.server.clone());
+        let open: crate::oauth::Opener = Arc::new(move |u: String| {
+            let (me, server) = (me.clone(), server.clone());
+            Box::pin(async move {
+                // The link also goes out as a notification, for a client that shows it rather than opening it.
+                me.send(rpc::notification("mcp/authorizeUrl", json!({ "server": server, "url": u })));
+                let never = CancellationToken::new();
+                let ask = me.request_client("mcp/openUrl", json!({ "server": server, "url": u }), &never);
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(15), ask).await;
+            })
+        });
+        let tokens = crate::oauth::sign_in(&url, hint.as_deref(), open, cancel).await.map_err(|e| RpcError::new(rpc::TOOL_ERROR, e))?;
+        self.mcp.write().await.install_tokens(&p.server, tokens).await.map_err(|e| RpcError::new(rpc::TOOL_ERROR, e))?;
+        Ok(self.mcp.read().await.status())
+    }
+
+    /// The plugin and marketplace methods: git clones and copies, on a blocking thread.
+    async fn plugin_op(&self, method: &str, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
+        let p: PluginOpParams = if p.is_null() { PluginOpParams::default() } else { params(p)? };
+        let home = agent::plugins::home().ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "no home folder"))?;
+        let (root, method, cancel) = (self.root(), method.to_owned(), cancel.clone());
+        let need = |v: Option<String>, what: &str| v.filter(|s| !s.trim().is_empty()).ok_or_else(|| format!("{what} is required"));
+        tokio::task::spawn_blocking(move || -> Result<Value, String> {
+            use agent::marketplace as m;
+            let scope = p.scope.clone().unwrap_or_default();
+            match method.as_str() {
+                "plugins/marketplaces" => Ok(json!(m::list(&home))),
+                "plugins/marketplaceAdd" => m::add(&home, &need(p.source, "source")?, &cancel).map(|v| json!(v)),
+                "plugins/marketplaceUpdate" => m::update(&home, &need(p.name, "name")?, &cancel).map(|v| json!(v)),
+                "plugins/marketplaceRemove" => m::remove(&home, &need(p.name, "name")?).map(|_| json!({ "removed": true })),
+                "plugins/install" => m::install(&home, root.as_deref(), &need(p.spec, "spec")?, &scope, p.force, &cancel),
+                "plugins/uninstall" => m::uninstall(&home, root.as_deref(), &need(p.name, "name")?, &scope).map(|_| json!({ "removed": true })),
+                "plugins/update" => m::update_plugin(&home, root.as_deref(), &need(p.name, "name")?, &scope, &cancel),
+                other => Err(format!("unknown method: {other}")),
+            }
+        })
+        .await
+        .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e.to_string()))?
+        .map_err(|e| RpcError::new(rpc::TOOL_ERROR, e))
+    }
+
+    /// `agent/compact`: compresses a saved conversation now, between runs.
+    async fn compact_task(&self, p: Value) -> Result<Value, RpcError> {
+        let p: TaskIdParams = params(p)?;
+        let _slot = self.task_slot(Some(&p.task_id)).await;
+        let store = self.store.read().expect("store lock").clone();
+        let mut r = store.load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "unknown task"))?;
+        let out = agent::session::compact_record(&mut r);
+        store.save(&r).map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e.to_string()))?;
+        Ok(out)
     }
 
     fn list_edits(&self) -> Value {
@@ -865,12 +1133,17 @@ impl Server {
     /// User hooks always apply; workspace hooks (`.anvil/hooks.json`) only in a trusted workspace.
     fn configure_hooks(&self, p: Value) -> Result<Value, RpcError> {
         let p: HooksParams = params(p)?;
-        let mut all = p.hooks;
+        // Hooks from the user's own settings are trusted: they may approve a call.
+        let mut all: Vec<hooks::Hook> = p.hooks.into_iter().map(|h| hooks::Hook { trusted: true, ..h }).collect();
         let mut workspace = 0;
+        if p.workspace_trusted {
+            workspace += p.workspace_setting_hooks.len();
+            all.extend(p.workspace_setting_hooks);
+        }
         if p.workspace_trusted {
             if let Some(root) = self.root() {
                 let ws = hooks::load_workspace(&root).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?;
-                workspace = ws.len();
+                workspace += ws.len();
                 all.extend(ws);
             }
         }
@@ -945,7 +1218,29 @@ impl Server {
     }
 
     fn list_skills(&self) -> Value {
-        json!(skills::load(self.root().as_deref(), &skills::user_dirs()))
+        json!(skills::load(self.root().as_deref(), &skills::user_dirs(), &self.plugin_dirs()))
+    }
+
+    /// Every plugin found on this machine and in the workspace, with the client's settings applied.
+    fn list_plugins(&self) -> Vec<plugins::Plugin> {
+        let s = self.plugins.read().expect("plugins lock").clone();
+        plugins::load(self.root().as_deref(), plugins::home().as_deref(), &s.dirs, &s.disabled)
+    }
+
+    /// `(name, path)` of the enabled plugins, for the skill, command, and agent loaders.
+    fn plugin_dirs(&self) -> Vec<(String, PathBuf)> {
+        plugins::enabled_dirs(&self.list_plugins())
+    }
+
+    /// `plugins/configure`: extra plugin folders and names to turn off. Returns the resulting list.
+    fn configure_plugins(&self, p: Value) -> Result<Value, RpcError> {
+        let s: plugins::Settings = params(p)?;
+        if s.dirs.iter().any(|d| !d.is_absolute()) {
+            return Err(RpcError::new(rpc::INVALID_PARAMS, "plugin folders must be absolute paths"));
+        }
+        *self.plugins.write().expect("plugins lock") = s;
+        let list = self.list_plugins();
+        Ok(json!({ "plugins": list.len(), "enabled": list.iter().filter(|p| p.enabled).count() }))
     }
 
     async fn settle(&self, keep: bool, p: Value) -> Result<Value, RpcError> {

@@ -156,6 +156,8 @@ export interface WorkspaceSummary {
     skippedGenerated: number;
     reparsed: number;
     truncated: boolean;
+    skippedDirs?: SkippedDir[];
+    skippedDirCount?: number;
   };
   instructions: { source: string; scope: 'user' | 'workspace' | 'directory'; dir: string; bytes: number; truncated: boolean }[];
   excludes: string[];
@@ -183,11 +185,19 @@ export type WorkspaceProgress =
   | { phase: 'updated'; stats: WorkspaceSummary['stats'] }
   | { phase: 'failed'; error: string };
 
+/** A build, dependency, or cache folder the index does not walk into. */
+export interface SkippedDir {
+  path: string;
+  reason: string;
+}
+
 export interface GraphView {
   nodes: { id: string; language: string | null; symbols: number; files: number; degree: number; inCycle: boolean }[];
   edges: { from: number; to: number; weight: number; kind: 'import' | 'reference' }[];
   total: number;
   stats: GraphStats;
+  skippedDirs?: SkippedDir[];
+  skippedDirCount?: number;
 }
 
 export interface FileDependencies {
@@ -379,7 +389,7 @@ export interface AgentSummary {
 }
 
 export type AgentEvent =
-  | { type: 'started'; chatMode: ChatMode; enrichment: { kind: string; plan: string[]; instructions: string[]; sources: { path: string; startLine: number; endLine: number; reason: string }[]; ambiguity: string | null }; tools: string[]; skills?: { name: string; reason: string }[] }
+  | { type: 'started'; chatMode: ChatMode; enrichment: { kind: string; plan: string[]; instructions: string[]; sources: { path: string; startLine: number; endLine: number; reason: string }[]; ambiguity: string | null }; tools: string[]; skills?: { name: string; reason: string }[]; agent?: string | null }
   | { type: 'iteration'; n: number }
   | { type: 'textDelta'; text: string }
   | { type: 'assistantMessage'; text: string; toolCalls: number }
@@ -400,23 +410,94 @@ export type AgentEvent =
   | { type: 'compacted'; folded: number; pruned?: number; droppedRetrieval?: boolean; beforeTokens?: number; afterTokens?: number; windowTokens?: number }
   | { type: 'context'; usedTokens: number; windowTokens: number }
   | { type: 'hook'; event: string; command: string; blocked: boolean; message: string }
-  | { type: 'subagentStarted'; name: string; taskId: string; role: Role; objective: string; kind: ProviderKind; model: string; dir: string | null; step: string | null }
-  | { type: 'subagentFinished'; name: string; taskId: string; role: Role; status: TaskStatus; error?: string | null; costUsd?: number; unpricedTokens?: number; tokens?: number; files?: string[]; added?: number; removed?: number; worktree?: string | null }
-  | { type: 'planStarted'; callId: string; maxParallel: number; steps: { id: string; role: Role; objective: string; dependsOn: string[] }[] }
+  | { type: 'subagentStarted'; name: string; taskId: string; role: Role; agent?: string | null; objective: string; kind: ProviderKind; model: string; dir: string | null; step: string | null }
+  | { type: 'subagentFinished'; name: string; taskId: string; role: Role; agent?: string | null; status: TaskStatus; error?: string | null; costUsd?: number; unpricedTokens?: number; tokens?: number; files?: string[]; added?: number; removed?: number; worktree?: string | null }
+  | { type: 'planStarted'; callId: string; maxParallel: number; steps: { id: string; role: Role; agent?: string | null; objective: string; dependsOn: string[] }[] }
   | { type: 'stepSkipped'; step: string; reason: string }
   | { type: 'merged'; step: string; name: string; ok: boolean; files?: string[]; error?: string }
   | { type: 'bestOfDone'; candidates: number; costUsd: number };
 
-/** One entry of `skills/list`. */
+/** One entry of `skills/list`: a skill, a Claude Code command, or a Copilot prompt file. */
 export interface SkillInfo {
   name: string;
   description: string;
+  kind?: 'skill' | 'command' | 'prompt';
   source: string;
   triggers: string[];
   patterns: string[];
+  tools?: string[];
   params: string[];
+  /** What to type after `/name` (commands). */
+  argumentHint?: string;
   onDemand: boolean;
 }
+
+/** One entry of `agents/list`: a custom agent the lead can delegate to, or `@name` runs as. */
+export interface AgentInfo {
+  name: string;
+  description: string;
+  tools: string[];
+  writes: boolean;
+  model: string | null;
+  maxIterations: number | null;
+  source: string;
+}
+
+/** One entry of `plugins/list`. */
+export interface PluginInfo {
+  name: string;
+  id: string;
+  version: string;
+  description: string;
+  path: string;
+  enabled: boolean;
+  source: 'claude' | 'user' | 'workspace' | 'client';
+  skills: number;
+  agents: number;
+  commands: number;
+  mcpServers?: unknown;
+}
+
+/** One entry of `agent/checkpoints`: a prompt of the conversation, for `agent/rewind` and `agent/fork`. */
+export interface Checkpoint {
+  index: number;
+  prompt: string;
+  messages: number;
+  operations: number;
+  createdMs: number;
+}
+
+/** `agent/rewind` result. */
+export interface RewindResult {
+  taskId: string;
+  checkpoint: number;
+  messages: number;
+  undone: number[];
+  conflicts: unknown[];
+  text: string;
+}
+
+/** One entry of `plugins/marketplaces`. */
+export interface MarketplaceInfo {
+  name: string;
+  path: string;
+  owner: 'task-x' | 'claude';
+  plugins: { name: string; description?: string | null; version?: string | null; source: unknown }[];
+}
+
+/** One entry of `memory/search` results. */
+export interface MemoryEntry {
+  id: string;
+  kind: 'task' | 'note';
+  title: string;
+  text: string;
+  files: string[];
+  createdMs: number;
+  score: number;
+}
+
+/** The hook events (`task-x.hooks`); Claude Code's names (`PreToolUse`, `Stop`, …) are accepted too. */
+export const HOOK_EVENTS = ['beforeTask', 'afterTask', 'beforeTool', 'afterTool', 'beforeEdit', 'afterEdit', 'beforeValidation', 'afterValidation', 'userPromptSubmit', 'stop', 'subagentStop', 'preCompact', 'notification'] as const;
 
 /** One entry of `skills/resolve`: a skill that applies to the prompt, with params filled in. */
 export interface ResolvedSkill {

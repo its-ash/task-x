@@ -1,3 +1,4 @@
+import { AsyncLocalStorage, AsyncResource } from 'node:async_hooks';
 import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,9 +25,11 @@ import {
   type ProviderErrorData,
   type RefineResult,
   type ResolvedSkill,
+  type AgentInfo,
+  type PluginInfo,
   type SkillInfo,
 } from './protocol.js';
-import { type PluginEntry, catalog, installPlugin, newAgent, newSkill, setPlugin, viewPlugin } from './catalog.js';
+import { type PluginEntry, catalog, managePlugin, newAgent, newCommand, newSkill, setPlugin, viewPlugin } from './catalog.js';
 import { CLAUDE_KIND, CLAUDE_LABEL, claudeAuth, claudeModel, claudePermissions, claudeSignIn, claudeSignOut, engine, findClaude, useClaude } from './claudeCode.js';
 import { CLAUDE_MODEL_INFO, type Listed, MODEL_LIST_TTL_MS, formatTokens, listModels, missingNote, withSaved } from './models.js';
 import { type JsonRpcClient, RpcError } from './rpc.js';
@@ -88,6 +91,25 @@ const NIGHT_STALL_MS = 10 * 60_000;
 const NIGHT_CHECK_MS = 30_000;
 const NIGHT_RETRY_BASE_MS = 15_000;
 const NIGHT_RETRY_MAX_MS = 5 * 60_000;
+
+/**
+ * Session guards (`task-x.session.*`), in minutes or hours; 0 turns one off. A chat idle this long
+ * starts a fresh conversation, a run stops without progress or past its time, and Loop Mode ends.
+ */
+function sessionLimits() {
+  const c = vscode.workspace.getConfiguration(SECTION);
+  const n = (k: string, def: number, max: number) => {
+    const v = c.get<number>(k, def);
+    return typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(0, v)) : def;
+  };
+  return {
+    freshMin: n('session.freshAfterIdleMinutes', 60, 7 * 24 * 60),
+    stallMin: n('session.stallMinutes', 30, 24 * 60),
+    maxRunMin: n('session.maxRunMinutes', 120, 24 * 60),
+    loopHours: n('session.loopMaxHours', 4, 72),
+  };
+}
+const fmtIdle = (ms: number) => (ms >= 3_600_000 ? `${Math.round(ms / 3_600_000)} h` : `${Math.round(ms / 60_000)} min`);
 /** Night mode with a Think model: it splits the request into todo.md, and the Loop model works on one item per run. */
 const NIGHT_TODO_KEY = 'task-x.nightTodo';
 const NIGHT_ITEM_KEY = 'task-x.nightItem';
@@ -172,6 +194,8 @@ type Lane = {
   taskId: string;
   name: string;
   role: string;
+  /** The custom agent the subagent runs as, if any. */
+  agent?: string | null;
   objective: string;
   model: string;
   step?: string | null;
@@ -193,7 +217,7 @@ type Lane = {
 type Inbound =
   | { type: 'ready' }
   | { type: 'send'; text: string; queue?: boolean; images?: unknown }
-  | { type: 'cancel' }
+  | { type: 'cancel'; tab?: unknown }
   | { type: 'clear' }
   | { type: 'newTab' }
   | { type: 'selectTab'; id: string }
@@ -303,7 +327,33 @@ interface ChatTab {
   status?: 'running' | 'completed' | 'failed' | 'cancelled';
   usage?: { used: number; window: number };
   assistant?: Extract<Item, { kind: 'assistant' }>;
+  /** The plan checklist of this chat's newest task. */
+  todos?: Todo[];
+  /** Tokens the chat's task used so far (the runtime's running total for the task). */
+  tokens?: { input: number; output: number; cached: number };
+  /** When the chat's last request ended, for the fresh start after idle time. */
+  lastUsed?: number;
 }
+
+/** One chat tab's running task: each tab runs its own, at the same time as the others. */
+interface Run {
+  abort: AbortController;
+  started: number;
+  /** Approval and question cards, shown again when the tab comes back on screen. */
+  cards: Map<string, object>;
+  approvals: Map<string, (d: ApprovalDecision | 'always') => void>;
+  questions: Map<string, { questions: Question[]; done: (res: AskUserResult) => void }>;
+  /** Messages sent to the running task that it has not read yet. */
+  steering: string[];
+  /** The request that runs, so its edits can be restored from its message (#11). */
+  lastRequest?: Extract<Item, { kind: 'user' }>;
+  /** True when Loop Mode stopped a stalled run, so the stop is not taken as the user's. */
+  stalled: boolean;
+  lastActivity: number;
+}
+
+/** Chat tabs that run a task at the same time; a request beyond this waits for a free slot. */
+const MAX_PARALLEL_RUNS = 4;
 
 const blankTab = (items: Item[] = [], taskId?: string): ChatTab => ({ id: `t${Date.now().toString(36)}${randomBytes(3).toString('hex')}`, kind: 'chat', items, taskId });
 
@@ -468,20 +518,20 @@ function summaryText(s: AgentSummary): { text: string; ok: boolean; canContinue:
 export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   static readonly viewId = 'task-x.chat';
   private view?: vscode.WebviewView;
-  private abort?: AbortController;
+  /** The running task of each chat tab, by tab id. */
+  private readonly runs = new Map<string, Run>();
+  /**
+   * The tab a run's code works for. Several tabs run at once, so `chat`, `items`, and `taskId` resolve
+   * through this (it follows the run across every `await`), not through what is on screen.
+   */
+  private readonly scope = new AsyncLocalStorage<string>();
   private tabs: ChatTab[];
   /** The tab on screen. */
   private activeTab: string;
   /** The chat tab the user works in: the last chat tab on screen. */
   private chatTabId: string;
-  /** The chat tab bound to the agent: the running task's tab. It stays bound after the run until the user acts again. */
-  private runTab: string | undefined;
   /** Night mode runs again in the tab of its last run. */
   private nightTab: string | undefined;
-  /** When the running task started, for the timer in its tab. */
-  private runStarted = 0;
-  /** Approval and question cards of the running task, shown again when its tab comes back on screen. */
-  private readonly cards = new Map<string, object>();
   /** The changed-files list: the edit log, plus edits that arrived after it was loaded. */
   private changes = new Map<string, ChangeRow>();
   private changeSeq = 0;
@@ -492,10 +542,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private readonly listing = new Set<string>();
   // Context window per `kind:model`; 0 means unknown.
   private readonly windows = new Map<string, number>();
-  /** Messages sent while a request was running; each one runs after the one before it. */
-  private readonly queue: { text: string; mode?: ChatMode; images?: ImageInput[]; tab?: string }[] = [];
-  private readonly approvals = new Map<string, (d: ApprovalDecision | 'always') => void>();
-  private readonly questions = new Map<string, { questions: Question[]; done: (res: AskUserResult) => void }>();
+  /** Messages sent to a tab while its task runs (or while every run slot is taken); each runs after the one before it. */
+  private readonly queue: { text: string; mode?: ChatMode; images?: ImageInput[]; tab: string }[] = [];
   private night: boolean;
   /** The last request the user sent; Night mode runs it again until a run completes. */
   private nightRequest: string | undefined;
@@ -505,9 +553,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private nightFailures = 0;
   private nightTimer: NodeJS.Timeout | undefined;
   private nightWatch: NodeJS.Timeout | undefined;
-  /** True when Night mode stopped a stalled run, so the stop is not taken as the user's. */
-  private stalled = false;
-  private lastActivity = 0;
+  /** When Loop Mode started its current request, for `session.loopMaxHours`. */
+  private nightSince: number | undefined;
   private readonly diffs = new Map<string, string>();
   private readonly outputs = new Map<string, string>();
   private readonly wired = new WeakSet<JsonRpcClient>();
@@ -524,8 +571,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   onShowGraph?: () => void;
   private includeEditor: boolean;
   private autoCommit: boolean;
-  /** Messages sent to the running task that it has not read yet. */
-  private steering: string[] = [];
   private files: { at: number; list: string[] } | undefined;
   private indexState: object = { state: 'none' };
 
@@ -557,13 +602,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     view.webview.onDidReceiveMessage((m: Inbound) => this.onMessage(m), undefined, this.ctx.subscriptions);
   }
 
+  /** True while any chat tab runs a task (the status bar, commands). */
   get busy(): boolean {
-    return this.abort !== undefined;
+    return this.runs.size > 0;
+  }
+  /** True while Loop Mode waits to run its request again. */
+  get loopPending(): boolean {
+    return this.nightTimer !== undefined;
   }
 
-  /** The chat that requests and agent events go to: the bound run tab, else the user's chat tab. */
+  /** The chat that requests and agent events go to: the run's tab inside a run, else the user's chat tab. */
   private get chat(): ChatTab {
-    return this.tabs.find((t) => t.id === (this.runTab ?? this.chatTabId)) ?? this.tabs.find((t) => t.kind === 'chat') ?? this.addTab(blankTab());
+    const id = this.scope.getStore() ?? this.chatTabId;
+    return this.tabs.find((t) => t.id === id) ?? this.tabs.find((t) => t.kind === 'chat') ?? this.addTab(blankTab());
+  }
+  /** The running task of `chat`, if it runs. */
+  private get run(): Run | undefined {
+    return this.runs.get(this.chat.id);
+  }
+  /** Runs `fn` for a tab: `chat`, `items`, and `taskId` mean that tab inside it. */
+  private inTab<T>(tab: string, fn: () => T): T {
+    return this.scope.run(tab, fn);
+  }
+  /** The chat tab whose running task owns a runtime task id (its own, a subagent's, or a plan's). */
+  private tabForTask(taskId: string): string | undefined {
+    return this.tabs.find((t) => t.kind === 'chat' && t.taskId && this.runs.has(t.id) && (taskId === t.taskId || taskId.startsWith(`${t.taskId}-`)))?.id;
   }
   private get items(): Item[] {
     return this.chat.items;
@@ -578,25 +641,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.chat.taskId = v;
   }
 
-  cancel(): void {
-    this.abort?.abort();
-    for (const resolve of this.approvals.values()) resolve('deny');
-    this.approvals.clear();
-    for (const p of this.questions.values()) p.done({ answers: null });
-    this.questions.clear();
+  /**
+   * Stops the task of one chat tab (default: the chat on screen, else the only running one) and drops
+   * the messages waiting for that tab. Other tabs keep running.
+   */
+  cancel(tabId?: string): void {
+    const tab = tabId ?? (this.runs.has(this.chatTabId) || this.runs.size !== 1 ? this.chatTabId : [...this.runs.keys()][0]);
+    const r = this.runs.get(tab);
+    if (r) {
+      r.abort.abort();
+      for (const resolve of r.approvals.values()) resolve('deny');
+      r.approvals.clear();
+      for (const p of r.questions.values()) p.done({ answers: null });
+      r.questions.clear();
+    }
+    if (tab === this.nightTab || !this.nightTab) {
+      clearTimeout(this.nightTimer);
+      this.nightTimer = undefined;
+    }
+    for (let i = this.queue.length - 1; i >= 0; i--) if (this.queue[i].tab === tab) this.queue.splice(i, 1);
+    this.postQueue();
+  }
+
+  /** Stops every tab's task and empties the queue (runtime restart, shutdown). */
+  cancelAll(): void {
+    for (const tab of [...this.runs.keys()]) this.cancel(tab);
+    this.queue.length = 0;
     clearTimeout(this.nightTimer);
     this.nightTimer = undefined;
-    this.queue.length = 0;
     this.postQueue();
   }
 
   /** Empties the current chat tab: a new task, no transcript, and the context meter reset. */
   async clear(): Promise<void> {
-    this.cancel();
+    this.cancel(this.chat.id);
     await this.archive();
     this.items = [];
     this.taskId = undefined;
     this.chat.usage = undefined;
+    this.chat.tokens = undefined;
     await this.setNightRequest(undefined);
     await this.persist();
     this.renderChat();
@@ -668,10 +751,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (this.tabs.filter((t) => t.kind === 'chat').length >= MAX_CHAT_TABS) return void vscode.window.showWarningMessage(`task-x: close a chat tab first. Up to ${MAX_CHAT_TABS} chats can be open.`);
     this.showTab(this.addTab(blankTab()).id);
     // A new chat starts clean: no conversation (a new task id), no context meter, plan, or images.
-    if (!this.busy) {
-      this.todos = [];
-      this.postTodos();
-    }
     this.post({ type: 'contextUsage', used: 0, window: 0 });
     this.post({ type: 'clearDraft' });
   }
@@ -686,10 +765,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return;
     this.activeTab = id;
-    if (tab.kind === 'chat') {
-      this.chatTabId = id;
-      if (!this.busy) this.runTab = undefined;
-    }
+    if (tab.kind === 'chat') this.chatTabId = id;
     this.postTabs();
     this.renderTab();
     this.post({ type: 'view', view: 'chat' });
@@ -702,10 +778,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const i = this.tabs.findIndex((t) => t.id === id);
     const tab = this.tabs[i];
     if (!tab) return;
-    if (this.busy && tab.id === this.runTab) return void vscode.window.showWarningMessage('task-x: stop the running task before you close its tab.');
+    if (this.runs.has(tab.id)) return void vscode.window.showWarningMessage('task-x: stop the running task before you close its tab.');
     if (tab.kind === 'chat') await this.archive(tab);
     this.tabs.splice(i, 1);
-    if (this.runTab === id) this.runTab = undefined;
     if (!this.tabs.some((t) => t.kind === 'chat')) this.addTab(blankTab());
     if (this.chatTabId === id) this.chatTabId = (this.tabs.slice(0, i).findLast((t) => t.kind === 'chat') ?? this.tabs.find((t) => t.kind === 'chat'))!.id;
     if (this.activeTab === id) return this.showTab(this.tabs[Math.min(i, this.tabs.length - 1)].id);
@@ -718,6 +793,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     tab.items = [];
     tab.taskId = undefined;
     tab.usage = undefined;
+    tab.tokens = undefined;
     if (tab.id === this.chat.id) await this.setNightRequest(undefined);
     if (tab.id === this.activeTab) this.renderTab();
   }
@@ -728,8 +804,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       kind: t.kind,
       title: tabTitle(t),
       role: t.role ?? null,
-      status: t.kind === 'subagent' ? t.status : this.busy && t.id === this.runTab ? 'running' : null,
-      started: t.kind === 'chat' && this.busy && t.id === this.runTab ? this.runStarted : null,
+      status: t.kind === 'subagent' ? t.status : this.runs.has(t.id) ? 'running' : null,
+      started: t.kind === 'chat' ? (this.runs.get(t.id)?.started ?? null) : null,
     }));
     this.post({ type: 'tabs', tabs, active: this.activeTab });
   }
@@ -737,11 +813,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Draws the tab on screen: its transcript, context meter, waiting messages, and open cards. */
   private renderTab(): void {
     const tab = this.tabs.find((t) => t.id === this.activeTab) ?? this.chat;
-    const live = tab.kind === 'subagent' ? tab.status === 'running' && !!tab.assistant : this.busy && tab.id === this.runTab;
+    const run = this.runs.get(tab.id);
+    const live = tab.kind === 'subagent' ? tab.status === 'running' && !!tab.assistant : !!run;
     this.post({ type: 'history', items: tab.items, streaming: live && tab.items.at(-1)?.kind === 'assistant' });
     this.post({ type: 'contextUsage', used: tab.usage?.used ?? 0, window: tab.usage?.window ?? 0 });
-    if (this.busy && tab.id === this.runTab) for (const c of this.cards.values()) this.post(c);
+    // A subagent tab shows the tokens of the chat it belongs to.
+    const owner = tab.kind === 'chat' ? tab : this.tabs.find((t) => t.id === tab.parent);
+    this.post({ type: 'tokens', ...(owner?.tokens ?? { input: 0, output: 0, cached: 0 }) });
+    for (const c of run?.cards.values() ?? []) this.post(c);
     this.postQueue();
+    this.postTodos();
   }
 
   /** Draws the chat again when it is the tab on screen. */
@@ -765,13 +846,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   refreshStatus(): void {
     const ref = activeRef();
     const claude = engine() === 'claudeCode';
-    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.busy && this.activeTab === this.runTab, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null });
+    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.runs.has(this.activeTab), mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null });
     void this.postModels();
   }
 
   dispose(): void {
     clearInterval(this.nightWatch);
-    this.cancel();
+    this.cancelAll();
   }
 
   private async setNightRequest(text: string | undefined): Promise<void> {
@@ -871,10 +952,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.wire(client);
     const planId = `${taskId}-plan${Date.now()}`;
     const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
-    const off = client.onNotification('agent/event', (p) => {
-      const { taskId: id, event } = p as AgentEventParams;
-      if (id === planId) this.onEvent(event, state);
-    });
+    // Bound to this run's tab: the event arrives outside the run's async context.
+    const off = client.onNotification(
+      'agent/event',
+      AsyncResource.bind((p: unknown) => {
+        const { taskId: id, event } = p as AgentEventParams;
+        if (id === planId) this.onEvent(event, state);
+      }),
+    );
     try {
       const prompt = `${TODO_PROMPT}\n\n${request}`;
       let summary: AgentSummary;
@@ -908,31 +993,70 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return this.items.findLast((i): i is Extract<Item, { kind: 'summary' }> => i.kind === 'summary');
   }
 
-  /** Night mode: stops a run with no progress for NIGHT_STALL_MS so it starts again. Waiting for the user is not a stall. */
+  /** Watches every run (see `watchRuns`). */
   private watchNight(): void {
     clearInterval(this.nightWatch);
-    this.nightWatch = undefined;
-    if (!this.night) return;
-    this.nightWatch = setInterval(() => {
-      if (!this.busy) return;
-      if (this.approvals.size || this.questions.size) return void (this.lastActivity = Date.now());
-      if (Date.now() - this.lastActivity < NIGHT_STALL_MS) return;
-      this.stalled = true;
-      this.lastActivity = Date.now();
-      this.add({ kind: 'context', text: `Loop Mode: no progress for ${NIGHT_STALL_MS / 60_000} minutes. Restarting the request.` });
-      this.abort?.abort();
-    }, NIGHT_CHECK_MS);
+    this.nightWatch = setInterval(() => this.watchRuns(), NIGHT_CHECK_MS);
+  }
+
+  /**
+   * Loop Mode restarts its run after NIGHT_STALL_MS without progress. Any other run stops after
+   * `session.stallMinutes` without progress or after `session.maxRunMinutes`, so no session runs for
+   * hours unseen. Waiting for the user is not a stall.
+   */
+  private watchRuns(): void {
+    const now = Date.now();
+    const { stallMin, maxRunMin } = sessionLimits();
+    for (const [tab, r] of this.runs) {
+      if (r.abort.signal.aborted) continue;
+      if (r.approvals.size || r.questions.size) {
+        r.lastActivity = now;
+        continue;
+      }
+      const idle = now - r.lastActivity;
+      if (this.night && tab === this.nightTab) {
+        if (idle < NIGHT_STALL_MS) continue;
+        r.stalled = true;
+        r.lastActivity = now;
+        this.inTab(tab, () => this.add({ kind: 'context', text: `Loop Mode: no progress for ${NIGHT_STALL_MS / 60_000} minutes. Restarting the request.` }));
+        r.abort.abort();
+        continue;
+      }
+      const why =
+        stallMin && idle >= stallMin * 60_000
+          ? `no progress for ${stallMin} minutes (task-x.session.stallMinutes)`
+          : maxRunMin && now - r.started >= maxRunMin * 60_000
+            ? `it ran for ${maxRunMin} minutes (task-x.session.maxRunMinutes)`
+            : undefined;
+      if (!why) continue;
+      this.inTab(tab, () => this.add({ kind: 'context', text: `Stopped the request: ${why}. Long sessions use many tokens. Send Continue to go on, or /clear to start fresh.` }));
+      r.abort.abort();
+    }
+  }
+
+  /** Loop Mode ends after `session.loopMaxHours` on one request, so it does not run all night unseen. */
+  private loopExpired(): boolean {
+    const h = sessionLimits().loopHours;
+    if (!h || !this.nightSince || Date.now() - this.nightSince < h * 3_600_000) return false;
+    this.nightSince = undefined;
+    clearTimeout(this.nightTimer);
+    this.nightTimer = undefined;
+    this.inTab(this.nightTab ?? this.chatTabId, () => this.add({ kind: 'context', text: `Loop Mode stopped: it worked on this request for ${h} h (task-x.session.loopMaxHours). Send the request again to go on.` }));
+    void this.setNightRequest(undefined).then(() => this.persist());
+    return true;
   }
 
   /** Night mode: after a run that did not complete, runs the last request again with a growing delay. A user Stop ends it. */
-  private afterRun(before: Item | undefined, signal: AbortSignal): void {
-    if (!this.night || !this.nightRequest || this.busy) return;
+  private afterRun(before: Item | undefined, signal: AbortSignal, stalled: boolean): void {
+    // Loop Mode follows one chat: the tab of its last request.
+    if (!this.night || !this.nightRequest || this.chat.id !== this.nightTab || this.runs.has(this.chat.id)) return;
+    if (this.loopExpired()) return;
     const last = this.lastSummary();
     if (last && last !== before && last.ok) {
       this.nightFailures = 0;
       return void this.nextTodo();
     }
-    if (signal.aborted && !this.stalled) return;
+    if (signal.aborted && !stalled) return;
     this.nightFailures++;
     const wait = Math.min(NIGHT_RETRY_MAX_MS, NIGHT_RETRY_BASE_MS * 2 ** Math.min(this.nightFailures - 1, 10));
     this.add({ kind: 'context', text: `Loop Mode: the request did not finish. Retry ${this.nightFailures} in ${Math.round(wait / 1000)} s.` });
@@ -944,7 +1068,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     clearTimeout(this.nightTimer);
     this.nightTimer = setTimeout(async () => {
       this.nightTimer = undefined;
-      if (!this.night || this.busy || !this.nightRequest) return;
+      if (!this.night || !this.nightRequest || (this.nightTab && this.runs.has(this.nightTab))) return;
+      if (this.loopExpired()) return;
       // With a todo list, the transcript and the commit name the item.
       const items = this.nightTodo ? await this.readTodo() : [];
       const n = items.findIndex((i) => !i.done);
@@ -954,11 +1079,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /** Night mode: starts the last request again when this chat's last run did not complete. */
   private resumeNight(): void {
-    if (!this.night || this.busy || this.nightTimer || !this.nightRequest) return;
+    if (!this.night || this.runs.has(this.chat.id) || this.nightTimer || !this.nightRequest) return;
     const lastUser = this.items.findLastIndex((i) => i.kind === 'user');
     const lastDone = this.items.findLastIndex((i) => i.kind === 'summary' && i.ok);
     if (lastUser < 0) return;
     if (lastDone > lastUser) return void this.nextTodo();
+    this.nightSince ??= Date.now();
     this.add({ kind: 'context', text: 'Loop Mode: the last request did not finish. Starting it again.' });
     this.scheduleNight(0);
   }
@@ -975,7 +1101,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /** Saves the open chat tabs. Subagent tabs show live activity only and are not saved. */
   private async saveTabs(): Promise<void> {
-    const tabs = this.tabs.filter((t) => t.kind === 'chat').map(({ id, kind, items, taskId }) => ({ id, kind, items: items.slice(-MAX_ITEMS), taskId }));
+    const tabs = this.tabs.filter((t) => t.kind === 'chat').map(({ id, kind, items, taskId, tokens, lastUsed }) => ({ id, kind, items: items.slice(-MAX_ITEMS), taskId, tokens, lastUsed }));
     const active = this.tabs.find((t) => t.id === this.activeTab)?.kind === 'chat' ? this.activeTab : this.chatTabId;
     await this.ctx.workspaceState.update(TABS_KEY, { tabs, active });
   }
@@ -1012,7 +1138,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     await this.getClient()
       .then((c) => c.request('agent/deleteTask', { taskId: id }))
       .catch((e) => this.log('warn', `deleteTask: ${describeError(e)}`));
-    for (const t of this.tabs) if (t.kind === 'chat' && t.taskId === id && !(this.busy && t.id === this.runTab)) await this.resetTab(t);
+    for (const t of this.tabs) if (t.kind === 'chat' && t.taskId === id && !this.runs.has(t.id)) await this.resetTab(t);
     this.postTabs();
     await this.saveTabs();
     await this.postTasks();
@@ -1031,7 +1157,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.log('warn', `clearHistory: ${describeError(e)}`);
     }
     await this.ctx.workspaceState.update(CHATS_KEY, []);
-    for (const t of this.tabs) if (t.kind === 'chat' && t.taskId && ids.has(t.taskId) && !(this.busy && t.id === this.runTab)) await this.resetTab(t);
+    for (const t of this.tabs) if (t.kind === 'chat' && t.taskId && ids.has(t.taskId) && !this.runs.has(t.id)) await this.resetTab(t);
     this.postTabs();
     await this.saveTabs();
     await this.postTasks();
@@ -1043,9 +1169,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (item.kind === 'user') this.postTabs();
   }
 
-  private setBusy(abort: AbortController | undefined): void {
-    this.abort = abort;
-    if (abort) this.runStarted = Date.now();
+  /** After a tab's task starts or ends: the busy context, the status bar, and the tab strip. */
+  private runsChanged(): void {
     void vscode.commands.executeCommand('setContext', 'task-x.busy', this.busy);
     this.onBusyChange?.(this.busy);
     this.refreshStatus();
@@ -1079,10 +1204,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const complete = !!l && !l.error;
       const models = withSaved(l?.models ?? [], modelFor(ref), complete).slice(0, MAX_PICKER_MODELS).map(row);
       const note = [l?.note, complete ? missingNote(l.models, modelFor(ref), local) : undefined].filter(Boolean).join(' ') || undefined;
-      groups.push({ kind: ref, label: refLabel(ref), local, models, loading: this.listing.has(ref), note, error: l?.models.length ? undefined : l?.error });
+      groups.push({ kind: ref, brand: refKind(ref), label: refLabel(ref), local, models, loading: this.listing.has(ref), note, error: l?.models.length ? undefined : l?.error });
     }
-    if (findClaude()) groups.push({ kind: CLAUDE_KIND, label: CLAUDE_LABEL, local: false, models: withSaved(CLAUDE_MODEL_INFO, claudeModel()).map(row), loading: false });
-    const current = engine() === 'claudeCode' ? { kind: CLAUDE_KIND, model: claudeModel() } : { kind: active, model: modelFor(active), window: this.windowFor(active, modelFor(active)) };
+    if (findClaude()) groups.push({ kind: CLAUDE_KIND, brand: CLAUDE_KIND, label: CLAUDE_LABEL, local: false, models: withSaved(CLAUDE_MODEL_INFO, claudeModel()).map(row), loading: false });
+    // `brand` is the provider kind behind a ref (a custom endpoint is openaiCompatible), for the chip colour.
+    const current = engine() === 'claudeCode'
+      ? { kind: CLAUDE_KIND, brand: CLAUDE_KIND, model: claudeModel() }
+      : { kind: active, brand: refKind(active), local: refKind(active) === 'ollama', model: modelFor(active), window: this.windowFor(active, modelFor(active)) };
     this.post({ type: 'models', active: current, groups });
   }
 
@@ -1142,8 +1270,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   private async onMessage(m: Inbound): Promise<void> {
-    // Between runs, what the user does goes to the tab they work in.
-    if (!this.busy) this.runTab = undefined;
     switch (m?.type) {
       case 'ready':
         this.postTabs();
@@ -1186,7 +1312,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         await this.clearHistory();
         break;
       case 'answerQuestions': {
-        const pending = typeof m.callId === 'string' ? this.questions.get(m.callId) : undefined;
+        const pending = typeof m.callId === 'string' ? this.pendingIn((r) => r.questions.get(m.callId as string)) : undefined;
         pending?.done(sanitizeAnswers(pending.questions, m.answers, m.other));
         break;
       }
@@ -1199,17 +1325,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         break;
       case 'send': {
         if (typeof m.text !== 'string') break;
-        // Steering is text only, so a message with images waits for the running task instead.
-        // A message from another tab while a task runs waits for it, then runs in its own tab.
+        // Each chat tab runs its own task. In a tab whose task runs, Enter steers it (text only); a
+        // message with images, or one sent to be queued, waits for that task.
         const images = imagesFrom(m.images);
-        const here = this.activeTab === this.runTab;
-        await (images.length || !here ? this.send(m.text, undefined, false, images, this.chatTabId) : this.busy && m.queue !== true ? this.steer(m.text) : this.send(m.text));
+        const tab = this.chatTabId;
+        const steer = this.activeTab === tab && this.runs.has(tab) && !images.length && m.queue !== true;
+        const text = m.text;
+        await (steer ? this.inTab(tab, () => this.steer(text)) : this.send(text, undefined, false, images, tab));
         break;
       }
-      case 'cancel':
-        this.cancel();
-        await this.setNightRequest(undefined);
+      case 'cancel': {
+        const tab = typeof m.tab === 'string' && this.tabs.some((t) => t.id === m.tab) ? m.tab : undefined;
+        this.cancel(tab);
+        if (!tab || tab === this.nightTab) await this.setNightRequest(undefined);
         break;
+      }
       case 'clear':
       case 'newTab':
         await this.newChat();
@@ -1255,7 +1385,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.refreshStatus();
         break;
       case 'editWaiting':
-        if (Number.isInteger(m.index) && typeof m.text === 'string') await this.editWaiting(m.kind === 'steer' ? 'steer' : 'queue', m.index, m.text);
+        if (Number.isInteger(m.index) && typeof m.text === 'string') {
+          const [kind, index, text] = [m.kind === 'steer' ? ('steer' as const) : ('queue' as const), m.index as number, m.text];
+          await this.inTab(this.activeTab, () => this.editWaiting(kind, index, text));
+        }
         break;
       case 'signIn':
         await claudeSignIn(() => this.refreshStatus());
@@ -1264,7 +1397,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         await claudeSignOut(() => this.refreshStatus());
         break;
       case 'selectModel':
-        if (this.busy || typeof m.model !== 'string' || !m.model.trim() || m.model.length > 256) this.refreshStatus();
+        // A running task keeps the model it started with, so only the tab on screen must be idle.
+        if (this.runs.has(this.chatTabId) || typeof m.model !== 'string' || !m.model.trim() || m.model.length > 256) this.refreshStatus();
         else if (m.kind === CLAUDE_KIND) {
           await useClaude(m.model.trim());
           this.refreshStatus();
@@ -1276,8 +1410,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         break;
       case 'approve': {
         const d = (['allow', 'allowSession', 'always', 'deny'] as const).find((x) => x === m.decision) ?? 'deny';
-        this.approvals.get(m.callId)?.(d);
-        this.approvals.delete(m.callId);
+        const id = m.callId as string;
+        // The card on screen belongs to the tab on screen; look there first, then in the other runs.
+        const owner = [this.runs.get(this.activeTab), ...this.runs.values()].find((r) => r?.approvals.has(id));
+        owner?.approvals.get(id)?.(d);
+        owner?.approvals.delete(id);
         break;
       }
       case 'selectNight':
@@ -1356,7 +1493,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         break;
       case 'stopTool': {
         const it = this.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === m.id);
-        if (it?.stop && it.ok === undefined && this.busy) await (await this.getClient()).request('agent/cancelTool', it.stop).catch((e) => this.log('warn', `cancelTool: ${describeError(e)}`));
+        if (it?.stop && it.ok === undefined && this.runs.size) await (await this.getClient()).request('agent/cancelTool', it.stop).catch((e) => this.log('warn', `cancelTool: ${describeError(e)}`));
         break;
       }
       case 'stopLane': {
@@ -1457,7 +1594,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Opens a tab for a subagent next to its chat, without leaving the tab on screen. */
   private openSubagentTab(e: Extract<AgentEvent, { type: 'subagentStarted' }>): void {
     const parent = this.chat;
-    const tab: ChatTab = { id: blankTab().id, kind: 'subagent', title: e.name, role: e.role, parent: parent.id, laneTaskId: e.taskId, dir: e.dir, status: 'running', items: [{ kind: 'user', text: e.objective, mode: 'agent' }] };
+    const tab: ChatTab = { id: blankTab().id, kind: 'subagent', title: e.agent || e.name, role: e.role, parent: parent.id, laneTaskId: e.taskId, dir: e.dir, status: 'running', items: [{ kind: 'user', text: e.objective, mode: 'agent' }] };
     let at = this.tabs.indexOf(parent);
     while (this.tabs[at + 1]?.parent === parent.id) at++;
     this.tabs.splice(at + 1, 0, tab);
@@ -1684,31 +1821,115 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private wire(client: JsonRpcClient): void {
     if (this.wired.has(client)) return;
     this.wired.add(client);
-    client.onRequest('agent/requestApproval', (p) =>
-      editMode() === 'auto' ? Promise.resolve({ decision: 'allowSession' as const }) : this.requestApproval(p as ApprovalRequest),
-    );
-    client.onRequest('agent/askUser', (p) => this.askUser(p as AskUserRequest));
+    // Requests from the runtime name their task; each goes to the tab whose run owns that task.
+    client.onRequest('agent/requestApproval', (p) => {
+      const req = p as ApprovalRequest;
+      if (editMode() === 'auto') return Promise.resolve({ decision: 'allowSession' as const });
+      const tab = this.tabForTask(req.taskId);
+      return tab ? this.inTab(tab, () => this.requestApproval(req)) : (this.foreignApproval?.(req) ?? Promise.resolve({ decision: 'deny' as const }));
+    });
+    client.onRequest('agent/askUser', (p) => {
+      const req = p as AskUserRequest;
+      const tab = this.tabForTask(req.taskId);
+      return tab ? this.inTab(tab, () => this.askUser(req)) : Promise.resolve<AskUserResult>({ answers: null });
+    });
     // #15: an MCP server asks the user something while it works.
     client.onRequest('mcp/elicit', (p) => elicit(p));
     setResourceReader(async (server, uri) => (await client.request<{ text: string }>('mcp/readResource', { server, uri })).text);
   }
 
+  /**
+   * The session commands of the task-x engine: `/cost`, `/compact`, `/checkpoints` and `/rewind [n]`
+   * (cut the conversation back to before a prompt and undo its edits), and `/fork [n]`. Returns false
+   * for any other text, which goes to the agent.
+   */
+  private async sessionCommand(text: string): Promise<boolean> {
+    const m = /^\/(cost|compact|checkpoints|rewind|fork)(?:\s+(\d+))?\s*$/.exec(text);
+    if (!m) return false;
+    const [, cmd, arg] = m;
+    const taskId = this.taskId;
+    if (!taskId) {
+      this.add({ kind: 'context', text: `/${cmd}: there is no conversation yet in this chat.` });
+      return true;
+    }
+    const client = await this.getClient();
+    try {
+      if (cmd === 'cost') {
+        const c = await client.request<{ usage: { inputTokens: number | null; outputTokens: number | null; cachedTokens?: number }; costUsd: number; unpricedTokens: number; modelCalls: number; toolCalls: number; prompts: number; subagents: number; subagentCostUsd: number }>('agent/cost', { taskId });
+        const u = c.usage;
+        const money = c.costUsd > 0 ? `about $${c.costUsd.toFixed(4)}` : 'no price known';
+        this.add({
+          kind: 'context',
+          text: `Cost of this conversation: ${money}. ${fmtTokens(u.inputTokens ?? 0)} input tokens (${fmtTokens(u.cachedTokens ?? 0)} cached), ${fmtTokens(u.outputTokens ?? 0)} output tokens, ${c.modelCalls} model calls, ${c.toolCalls} tool calls over ${c.prompts} prompts${c.subagents ? `, ${c.subagents} subagents` : ''}.`,
+        });
+        return true;
+      }
+      if (cmd === 'compact') {
+        const r = await client.request<{ beforeTokens: number; afterTokens: number }>('agent/compact', { taskId });
+        this.add({ kind: 'context', text: `Compressed the conversation: about ${fmtTokens(r.beforeTokens)} tokens before, ${fmtTokens(r.afterTokens)} after.` });
+        return true;
+      }
+      const points = await client.request<{ index: number; prompt: string }[]>('agent/checkpoints', { taskId });
+      if (!points.length) {
+        this.add({ kind: 'context', text: 'This conversation has no checkpoints yet.' });
+        return true;
+      }
+      let at = arg != null ? Number(arg) : undefined;
+      if (at == null) {
+        const items = points.map((p) => ({ label: `${p.index}`, description: p.prompt.split('\n')[0], index: p.index }));
+        const title = cmd === 'fork' ? 'Fork before which prompt? (Esc: fork the whole conversation)' : cmd === 'rewind' ? 'Rewind to before which prompt?' : 'Prompts of this conversation';
+        const pick = await vscode.window.showQuickPick(items, { title: `task-x: ${title}` });
+        if (cmd === 'checkpoints') return true;
+        at = pick?.index;
+        if (at == null && cmd === 'rewind') return true;
+      }
+      if (cmd === 'checkpoints') return true;
+      if (cmd === 'rewind') {
+        const ok = await vscode.window.showWarningMessage(`Rewind to before prompt ${at}? Later messages are removed and their edits are undone (files you changed since are left as they are).`, { modal: true }, 'Rewind');
+        if (ok !== 'Rewind') return true;
+        const r = await client.request<{ undone: number[]; conflicts: unknown[] }>('agent/rewind', { taskId, checkpoint: at });
+        await this.openTask(taskId);
+        this.add({ kind: 'context', text: `Rewound to before prompt ${at}: undid ${r.undone.length} edit${r.undone.length === 1 ? '' : 's'}${r.conflicts.length ? `, ${r.conflicts.length} left as they are` : ''}.` });
+        return true;
+      }
+      const f = await client.request<{ taskId: string; title: string }>('agent/fork', { taskId, ...(at != null ? { checkpoint: at } : {}) });
+      await this.openTask(f.taskId);
+      this.add({ kind: 'context', text: `Forked into a new conversation (${f.title}). The original stays in the history.` });
+    } catch (e) {
+      this.add({ kind: 'context', text: `/${cmd} failed: ${describeError(e)}` });
+    }
+    return true;
+  }
+
+  /** The first value `f` finds in a run: the tab on screen first, then the others. */
+  private pendingIn<T>(f: (r: Run) => T | undefined): T | undefined {
+    for (const r of [this.runs.get(this.activeTab), ...this.runs.values()]) {
+      const v = r && f(r);
+      if (v !== undefined) return v;
+    }
+    return undefined;
+  }
+
   /** Shows the agent's questions in the chat and resolves with the answers, or null when dismissed. */
   private askUser(req: AskUserRequest): Promise<AskUserResult> {
-    if (!this.taskId || !req.taskId.startsWith(this.taskId) || !this.busy) return Promise.resolve<AskUserResult>({ answers: null });
+    const run = this.run;
+    if (!this.taskId || !req.taskId.startsWith(this.taskId) || !run) return Promise.resolve<AskUserResult>({ answers: null });
     this.view?.show?.(true);
     this.notify('input', 'task-x has questions for you', 'Answer');
     if (this.activeTab !== this.chat.id) this.showTab(this.chat.id);
-    const card = { type: 'questions', callId: req.callId, questions: req.questions };
-    this.cards.set(req.callId, card);
-    this.post(card);
+    // Plan steps run in parallel and can reuse a call id; the task id keeps each question card apart.
+    const id = `${req.taskId}:${req.callId}`;
+    run.questions.get(id)?.done({ answers: null });
+    const card = { type: 'questions', callId: id, questions: req.questions };
+    run.cards.set(id, card);
+    this.postChat(card);
     return new Promise((resolve) => {
-      this.questions.set(req.callId, {
+      run.questions.set(id, {
         questions: req.questions,
         done: (res) => {
-          this.questions.delete(req.callId);
-          this.cards.delete(req.callId);
-          this.postChat({ type: 'questionsDone', callId: req.callId });
+          run.questions.delete(id);
+          run.cards.delete(id);
+          this.postChat({ type: 'questionsDone', callId: id });
           this.add({ kind: 'questions', questions: req.questions, answers: res.answers, other: res.other });
           resolve(res);
         },
@@ -1717,7 +1938,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   private requestApproval(req: ApprovalRequest): Promise<{ decision: ApprovalDecision }> {
-    if (!this.taskId || !req.taskId.startsWith(this.taskId) || !this.busy) return this.foreignApproval?.(req) ?? Promise.resolve({ decision: 'deny' });
+    const run = this.run;
+    if (!this.taskId || !req.taskId.startsWith(this.taskId) || !run) return this.foreignApproval?.(req) ?? Promise.resolve({ decision: 'deny' });
     this.view?.show?.(true);
     this.notify('input', `task-x needs your approval to use ${req.tool}`, 'Review');
     if (this.activeTab !== this.chat.id) this.showTab(this.chat.id);
@@ -1729,11 +1951,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       detail: toolDetail(req.tool, req.input),
       preview: req.preview ?? JSON.stringify(req.input, null, 2).slice(0, 6_000),
     };
-    this.cards.set(req.callId, card);
-    this.post(card);
+    run.cards.set(req.callId, card);
+    this.postChat(card);
     return new Promise((resolve) => {
-      this.approvals.set(req.callId, (decision) => {
-        this.cards.delete(req.callId);
+      run.approvals.set(req.callId, (decision) => {
+        run.cards.delete(req.callId);
         this.postChat({ type: 'approvalDone', callId: req.callId, decision });
         if (decision === 'always') {
           // Persist the user's choice; the runtime treats it like a session grant for this run.
@@ -1792,7 +2014,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'compacted': return this.log('info', `${prefix}compacted ${e.folded} messages`);
       case 'hook': return this.log(e.blocked ? 'warn' : 'info', `${prefix}hook ${e.event}${e.blocked ? ' blocked' : ''}: ${e.command}`);
       case 'subagent': return this.trace(e.event, `${prefix}[${e.name}] `);
-      case 'subagentStarted': return this.log('info', `${prefix}subagent ${e.name} started (${e.role}, ${e.kind}/${e.model})`);
+      case 'subagentStarted': return this.log('info', `${prefix}subagent ${e.name} started (${e.agent ? `agent ${e.agent}` : e.role}, ${e.kind}/${e.model})`);
       case 'subagentFinished': return this.log(e.status === 'completed' ? 'info' : 'warn', `${prefix}subagent ${e.name} ${e.status}`);
       case 'planStarted': return this.log('info', `${prefix}plan with ${e.steps.length} steps, up to ${e.maxParallel} in parallel`);
       case 'merged': return this.log(e.ok ? 'info' : 'warn', `${prefix}merge ${e.name}: ${e.ok ? 'ok' : e.error}`);
@@ -1804,7 +2026,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   private onEvent(e: AgentEvent, state: { assistant?: Extract<Item, { kind: 'assistant' }> }): void {
-    this.lastActivity = Date.now();
+    const run = this.run;
+    if (run) run.lastActivity = Date.now();
     this.trace(e);
     switch (e.type) {
       case 'started': {
@@ -1890,10 +2113,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // Token counts per model turn, so the run shows its input and output as it goes. No price:
         // the chat reports what was used, not what it cost.
         this.postChat({ type: 'usage', input: e.usage.inputTokens ?? 0, output: e.usage.outputTokens ?? 0, cached: e.usage.cachedTokens ?? 0 });
+        // The task's total so far; it stays with the tab for the counter above the input.
+        this.chat.tokens = { input: e.usage.inputTokens ?? 0, output: e.usage.outputTokens ?? 0, cached: e.usage.cachedTokens ?? 0 };
+        this.postChat({ type: 'tokens', ...this.chat.tokens });
         break;
       case 'steered': {
-        const i = this.steering.indexOf(e.text);
-        if (i >= 0) this.steering.splice(i, 1);
+        const i = run?.steering.indexOf(e.text) ?? -1;
+        if (i >= 0) run?.steering.splice(i, 1);
         this.add({ kind: 'steer', text: e.text });
         this.postQueue();
         break;
@@ -1913,7 +2139,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.add({ kind: 'context', text: e.message });
         break;
       case 'subagentStarted':
-        this.add({ kind: 'lane', taskId: e.taskId, name: e.name, role: e.role, objective: e.objective, model: e.model, step: e.step, status: 'running', steps: [], dir: e.dir });
+        this.add({ kind: 'lane', taskId: e.taskId, name: e.name, role: e.role, agent: e.agent ?? null, objective: e.objective, model: e.model, step: e.step, status: 'running', steps: [], dir: e.dir });
         this.openSubagentTab(e);
         break;
       case 'subagentFinished': {
@@ -2031,7 +2257,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Sends a prompt from a command (context menu etc.), optionally in a specific mode. */
   async submit(text: string, mode?: ChatMode): Promise<void> {
     await vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
-    if (this.busy) return void vscode.window.showWarningMessage('task-x is busy. Stop the current request first.');
+    // The chat on screen is busy: the request gets its own tab and runs beside it.
+    if (this.runs.has(this.chatTabId)) {
+      if (this.tabs.filter((t) => t.kind === 'chat').length >= MAX_CHAT_TABS) return void vscode.window.showWarningMessage('task-x: this chat is busy and no tab is free. Stop its task, or close a tab.');
+      this.showTab(this.addTab(blankTab()).id);
+    }
     await this.send(text, mode);
   }
 
@@ -2039,7 +2269,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   async openTask(taskId: string): Promise<void> {
     const open = this.tabs.find((t) => t.kind === 'chat' && t.taskId === taskId);
     const cur = this.tabs.find((t) => t.id === this.chatTabId);
-    const reuse = !open && cur && !cur.items.length && !cur.taskId && !(this.busy && cur.id === this.runTab) ? cur : undefined;
+    const reuse = !open && cur && !cur.items.length && !cur.taskId && !this.runs.has(cur.id) ? cur : undefined;
     if (!open && !reuse && this.tabs.filter((t) => t.kind === 'chat').length >= MAX_CHAT_TABS) {
       return void vscode.window.showWarningMessage(`task-x: close a chat tab first. Up to ${MAX_CHAT_TABS} chats can be open.`);
     }
@@ -2079,34 +2309,65 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return this.taskId;
   }
 
-  /** Runs a request in a chat tab (`tabId`, else the current chat). While a task runs, the request waits in the queue. */
-  private async send(raw: string, modeOverride?: ChatMode, retry = false, images: ImageInput[] = [], tabId?: string): Promise<void> {
+  /**
+   * Runs a request in a chat tab (`tabId`, else the current chat). Each tab runs its own task, beside
+   * the others; a request to a tab whose task runs waits in that tab's queue.
+   */
+  private send(raw: string, modeOverride?: ChatMode, retry = false, images: ImageInput[] = [], tabId?: string): Promise<void> {
+    const tab = tabId && this.tabs.some((t) => t.id === tabId && t.kind === 'chat') ? tabId : this.chat.id;
+    return this.inTab(tab, () => this.sendIn(raw, modeOverride, retry, images));
+  }
+
+  /** `send` inside the tab's scope: `chat`, `items`, and `taskId` are that tab's for the whole run. */
+  private async sendIn(raw: string, modeOverride: ChatMode | undefined, retry: boolean, images: ImageInput[]): Promise<void> {
     const text = raw.trim() || (images.length ? `Look at the attached image${images.length > 1 ? 's' : ''}.` : '');
     if (!text) return;
+    const tab = this.chat.id;
     if (text.length > MAX_INPUT_CHARS) return void vscode.window.showWarningMessage(`task-x: the message is longer than ${MAX_INPUT_CHARS} characters.`);
-    if (this.busy) {
-      if (this.queue.length >= MAX_QUEUE) return void vscode.window.showWarningMessage(`task-x: only ${MAX_QUEUE} messages can wait. Stop the task or wait for one to finish.`);
-      this.queue.push({ text, mode: modeOverride, images, tab: tabId ?? this.chat.id });
+    // This tab's task runs, or every run slot is taken: the request waits its turn.
+    if (this.runs.has(tab) || this.runs.size >= MAX_PARALLEL_RUNS) {
+      if (this.queue.length >= MAX_QUEUE) return void vscode.window.showWarningMessage(`task-x: only ${MAX_QUEUE} messages can wait. Stop a task or wait for one to finish.`);
+      this.queue.push({ text, mode: modeOverride, images, tab });
+      if (!this.runs.has(tab)) void vscode.window.showInformationMessage(`task-x: ${MAX_PARALLEL_RUNS} chats are running. This request starts when one finishes.`);
       return void this.postQueue();
     }
-    this.runTab = this.nightTab = tabId && this.tabs.some((t) => t.id === tabId && t.kind === 'chat') ? tabId : this.chat.id;
-    const mode: ChatMode = modeOverride ?? 'agent';
+    // `/clear` (or `/new`): a fresh conversation in this chat, for either engine.
+    if (!images.length && /^\/(clear|new)\s*$/i.test(text)) return this.clear();
+    if (!images.length && engine() !== 'claudeCode' && (await this.sessionCommand(text))) return;
+    // A chat idle for `session.freshAfterIdleMinutes` starts a new conversation: an old history is
+    // sent again with every turn, and a new topic seldom needs it. The old one stays in History.
+    const freshMin = sessionLimits().freshMin;
+    const cur = this.chat;
+    if (!retry && !this.night && freshMin && cur.taskId && cur.lastUsed && Date.now() - cur.lastUsed >= freshMin * 60_000 && !this.runs.has(tab)) {
+      const idle = Date.now() - cur.lastUsed;
+      const old = { ...cur, items: [...cur.items] };
+      Object.assign(cur, { items: [], taskId: undefined, usage: undefined, tokens: undefined, todos: [], lastUsed: undefined });
+      this.add({ kind: 'context', text: `New conversation: this chat was idle for ${fmtIdle(idle)}, so task-x started fresh to send fewer tokens (task-x.session.freshAfterIdleMinutes). The earlier conversation is in History.` });
+      if (cur.id === this.activeTab) this.renderTab();
+      await this.archive(old);
+      if (this.runs.has(tab)) return this.sendIn(raw, modeOverride, retry, images);
+    }
+    // The run is registered before anything waits, so a second request to this tab queues behind it.
     const abort = new AbortController();
-    this.setBusy(abort);
+    const run: Run = { abort, started: Date.now(), cards: new Map(), approvals: new Map(), questions: new Map(), steering: [], stalled: false, lastActivity: Date.now() };
+    this.runs.set(tab, run);
+    if (this.night) this.nightTab = tab;
+    this.runsChanged();
+    const mode: ChatMode = modeOverride ?? 'agent';
     // A new request starts without the old plan.
     this.todos = [];
     this.postTodos();
     const sent = sentContext(this.editorContext(text));
     const request: Extract<Item, { kind: 'user' }> = { kind: 'user', text, mode, id: randomBytes(6).toString('hex'), ...(images.length ? { images: images.length } : {}), ...(sent.length ? { context: sent } : {}) };
     this.add(request);
-    this.lastRequest = request;
+    run.lastRequest = request;
     const before = this.lastSummary();
-    this.stalled = false;
-    this.lastActivity = Date.now();
-    if (!retry) {
+    // Loop Mode follows the tab of the newest request.
+    if (!retry && (this.night || !this.nightTab)) {
       this.nightFailures = 0;
       clearTimeout(this.nightTimer);
       this.nightTimer = undefined;
+      if (this.night) this.nightSince = Date.now();
       void this.setNightRequest(text);
     }
     let off = () => {};
@@ -2124,12 +2385,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.add({ kind: 'error', text: describeError(e), retryText: e instanceof RpcError && e.cancelled ? undefined : text });
       } finally {
         off();
-        const tab = this.chat.id;
-        this.queue.push(...this.steering.splice(0).map((text) => ({ text, tab })));
-        this.setBusy(undefined);
+        this.queue.push(...run.steering.splice(0).map((text) => ({ text, tab })));
+        this.runs.delete(tab);
+        this.markUsed(tab);
+        this.runsChanged();
         await this.persist();
         this.drain();
-        this.afterRun(before, abort.signal);
+        this.afterRun(before, abort.signal, run.stalled);
       }
       return;
     }
@@ -2142,10 +2404,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const provider = worker && isProviderRef(worker.kind) ? await providerConfigWith(this.ctx.secrets, worker.kind, worker.model) : undefined;
       const params = await runParams(this.ctx.secrets, { prompt, mode, taskId, editor: this.editorContext(text), provider, images });
       const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
-      off = client.onNotification('agent/event', (p) => {
-        const { taskId: id, event } = p as AgentEventParams;
-        if (id === taskId) this.onEvent(event, state);
-      });
+      // Bound to this run's tab: the event arrives outside the run's async context.
+      off = client.onNotification(
+        'agent/event',
+        AsyncResource.bind((p: unknown) => {
+          const { taskId: id, event } = p as AgentEventParams;
+          if (id === taskId) this.onEvent(event, state);
+        }),
+      );
       let summary = await client.request<AgentSummary>('agent/run', params, { signal: abort.signal });
       // At the turn limit, the same task continues on its own a few times (task-x.agent.autoContinue).
       const auto = Math.min(5, Math.max(0, Math.floor(vscode.workspace.getConfiguration(SECTION).get<number>('agent.autoContinue', 2))));
@@ -2163,30 +2429,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.add({ kind: 'error', text: describeError(e), retryText: e instanceof RpcError && e.cancelled ? undefined : text });
     } finally {
       off();
-      const tab = this.chat.id;
       for (const it of this.items) if (it.kind === 'lane' && it.status === 'running') it.status = 'cancelled';
       for (const t of this.tabs) {
         if (t.parent !== tab || t.status !== 'running') continue;
         t.status = 'cancelled';
         t.assistant = undefined;
       }
-      this.approvals.clear();
-      this.cards.clear();
+      run.approvals.clear();
+      run.cards.clear();
       // Steers the task never read are sent again as the next message, so nothing is lost.
-      this.queue.push(...this.steering.splice(0).map((text) => ({ text, tab })));
-      this.setBusy(undefined);
+      this.queue.push(...run.steering.splice(0).map((text) => ({ text, tab })));
+      this.runs.delete(tab);
+      this.markUsed(tab);
+      this.runsChanged();
       await this.persist();
       this.drain();
-      this.afterRun(before, abort.signal);
+      this.afterRun(before, abort.signal, run.stalled);
     }
   }
 
-  /** The request that is running now, so its edits can be restored from its message (#11). */
-  private lastRequest?: Extract<Item, { kind: 'user' }>;
+  private markUsed(tab: string): void {
+    const t = this.tabs.find((x) => x.id === tab);
+    if (t) t.lastUsed = Date.now();
+  }
 
   /** Remembers which edit operations a request made; its message then offers "Restore to here". */
   private noteOperations(summary: AgentSummary): void {
-    const r = this.lastRequest;
+    const r = this.run?.lastRequest;
     if (!r || !summary.operations?.length) return;
     r.operations = [...new Set([...(r.operations ?? []), ...summary.operations])];
     this.postChat({ type: 'restorable', id: r.id });
@@ -2230,23 +2499,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     (kept.length ? vscode.window.showWarningMessage : vscode.window.showInformationMessage)(msg);
   }
 
-  /** The newest plan checklist of the running (or last) task. */
-  private todos: Todo[] = [];
+  /** The plan checklist of this chat's newest task. */
+  private get todos(): Todo[] {
+    return this.chat.todos ?? [];
+  }
+  private set todos(v: Todo[]) {
+    this.chat.todos = v;
+  }
+  /** Shows the checklist of the chat on screen. */
   private postTodos(): void {
-    this.post({ type: 'todos', todos: this.todos });
+    const tab = this.tabs.find((t) => t.id === this.activeTab);
+    this.post({ type: 'todos', todos: (tab?.kind === 'chat' ? tab.todos : this.tabs.find((t) => t.id === tab?.parent)?.todos) ?? [] });
   }
 
   /** Shows the messages waiting in the tab on screen: steers of its running task first, then its queued messages. */
   private postQueue(): void {
     const tab = this.activeTab;
-    const running = this.busy && tab === this.runTab;
-    this.post({ type: 'queue', items: this.queue.filter((q) => (q.tab ?? this.runTab) === tab).map((q) => q.text), steering: running ? this.steering : [] });
+    this.post({ type: 'queue', items: this.queue.filter((q) => q.tab === tab).map((q) => q.text), steering: this.runs.get(tab)?.steering ?? [] });
   }
 
   /** While a task runs, Enter steers it: the agent reads the message at its next step. Otherwise it is queued. */
   private async steer(text: string): Promise<void> {
     const t = text.trim();
-    if (!t || !this.taskId || this.steering.length >= MAX_STEERS) return this.send(text);
+    const run = this.run;
+    if (!t || !this.taskId || !run || run.steering.length >= MAX_STEERS) return this.send(text);
     let accepted = false;
     try {
       accepted = await (await this.getClient()).request<boolean>('agent/steer', { taskId: this.taskId, text: t });
@@ -2254,7 +2530,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.log('warn', `steer failed: ${describeError(e)}`);
     }
     if (!accepted) return this.send(text);
-    this.steering.push(t);
+    run.steering.push(t);
     this.postQueue();
   }
 
@@ -2265,7 +2541,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private async editWaiting(kind: 'steer' | 'queue', index: number, raw: string): Promise<void> {
     const text = raw.trim().slice(0, MAX_INPUT_CHARS);
     if (kind === 'queue') {
-      const mine = this.queue.filter((q) => (q.tab ?? this.runTab) === this.activeTab);
+      const mine = this.queue.filter((q) => q.tab === this.activeTab);
       const item = mine[index];
       if (item) {
         if (text) item.text = text;
@@ -2273,7 +2549,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
       return this.postQueue();
     }
-    const old = this.steering[index];
+    const steering = this.run?.steering ?? [];
+    const old = steering[index];
     if (old === undefined || !this.taskId) return this.postQueue();
     let ok = false;
     try {
@@ -2281,19 +2558,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     } catch (e) {
       this.log('warn', `editSteer failed: ${describeError(e)}`);
     }
-    const at = this.steering.indexOf(old);
+    const at = steering.indexOf(old);
     if (ok && at >= 0) {
-      if (text) this.steering[at] = text;
-      else this.steering.splice(at, 1);
+      if (text) steering[at] = text;
+      else steering.splice(at, 1);
     } else if (!ok) vscode.window.showInformationMessage('task-x: the agent already read that message, so it can no longer change.');
     this.postQueue();
   }
 
-  /** Runs the next queued message once the request before it has finished. */
+  /**
+   * Starts waiting messages once a run ends: the next one of each tab whose task is not running, oldest
+   * first, up to the free run slots. `send` registers a run before it waits, so one tab never starts twice.
+   */
   private drain(): void {
-    const next = this.queue.shift();
+    for (const next of [...this.queue]) {
+      if (this.runs.size >= MAX_PARALLEL_RUNS) break;
+      if (this.runs.has(next.tab) || !this.tabs.some((t) => t.id === next.tab)) continue;
+      this.queue.splice(this.queue.indexOf(next), 1);
+      void this.send(next.text, next.mode, false, next.images, next.tab);
+    }
+    // Messages for a tab that was closed in the meantime are dropped.
+    for (let i = this.queue.length - 1; i >= 0; i--) if (!this.tabs.some((t) => t.id === this.queue[i].tab)) this.queue.splice(i, 1);
     this.postQueue();
-    if (next) void this.send(next.text, next.mode, false, next.images, next.tab);
   }
 
   /** Hooks for a finished task, and a notification when the chat is not on screen. */
@@ -2321,9 +2607,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Files the `/` menu may open, by the key it sent to the webview; the webview never sends a path. */
   private slashFiles = new Map<string, string>();
   private mcpPrompts: { server: string; name: string; description: string; arguments: string[] }[] = [];
-  private slashPlugins = new Map<string, PluginEntry>();
+  private slashPlugins = new Map<string, PluginEntry & { source?: string; name?: string }>();
 
-  /** Skills, agents, and plugins for the `/` menu in the input. */
+  /** Skills, commands, agents, and plugins for the `/` menu in the input. */
   private async postSkills(): Promise<void> {
     this.slashFiles.clear();
     this.slashPlugins.clear();
@@ -2333,12 +2619,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.slashFiles.set(key, p);
       return key;
     };
-    let skills: SkillInfo[] = [];
-    try {
-      skills = await (await this.getClient()).request<SkillInfo[]>('skills/list');
-    } catch (e) {
-      this.log('warn', `skills/list failed: ${describeError(e)}`);
-    }
+    const client = await this.getClient();
+    const ask = async <T>(method: string, fallback: T): Promise<T> => {
+      try {
+        return await client.request<T>(method);
+      } catch (e) {
+        this.log('warn', `${method} failed: ${describeError(e)}`);
+        return fallback;
+      }
+    };
+    const [skills, agentList, pluginList] = await Promise.all([ask<SkillInfo[]>('skills/list', []), ask<AgentInfo[] | null>('agents/list', null), ask<PluginInfo[] | null>('plugins/list', null)]);
     const cat = await catalog(WorkspaceSync.root());
     const known = new Set(skills.map((s) => s.name));
     // #15: prompt templates and resources from the running MCP servers.
@@ -2352,18 +2642,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.post({
       type: 'skills',
       skills: [
-        ...skills.map((s) => ({ name: s.name, description: s.description, params: s.params, source: skillOrigin(s.source), view: file(s.source) })),
+        ...skills
+          .filter((s) => s.kind !== 'command')
+          .map((s) => ({ name: s.name, description: s.description, params: s.params, source: skillOrigin(s.source), view: file(s.source) })),
         ...cat.pluginSkills.filter((s) => !known.has(s.name)).map((s) => ({ name: s.name, description: s.description, source: s.source, view: file(s.path) })),
       ],
-      agents: cat.agents.map((a) => ({ name: a.name, description: a.description, source: a.source, view: file(a.path) })),
+      commands: skills
+        .filter((s) => s.kind === 'command')
+        .map((s) => ({ name: s.name, description: s.description, hint: s.argumentHint ?? '', source: skillOrigin(s.source) || (s.name.includes(':') ? s.name.split(':')[0] : ''), view: file(s.source) })),
+      agents: agentList
+        ? agentList.map((a) => ({ name: a.name, description: a.description, source: a.name.includes(':') ? a.name.split(':')[0] : skillOrigin(a.source), writes: a.writes, model: a.model, view: file(a.source) }))
+        : cat.agents.map((a) => ({ name: a.name, description: a.description, source: a.source, view: file(a.path) })),
       modes: chatModes().map((m) => ({ name: m.name, description: m.description, view: file(m.path), active: m.name === activeChatMode()?.name })),
       mcpPrompts: mcp.prompts.map((p, i) => ({ key: String(i), name: `${p.server}:${p.name}`, description: p.description, params: p.arguments })),
       mcpResources: mcp.resources.map((r) => ({ name: `${r.server}:${r.name}`, token: `mcp:${r.server}:${r.uri}`, description: r.description || r.uri })),
-      plugins: cat.plugins.map((p) => {
+      plugins: (pluginList
+        ? pluginList.map((p) => ({ id: p.id, name: p.name, version: p.version, enabled: p.enabled, path: p.path, mcpServers: p.mcpServers, source: p.source, description: p.description, counts: { skills: p.skills, agents: p.agents, commands: p.commands } }))
+        : cat.plugins.map((p) => ({ ...p, name: p.id.split('@')[0], source: 'claude', description: '', counts: undefined }))
+      ).map((p) => {
         this.slashPlugins.set(p.id, p);
-        return { id: p.id, version: p.version, enabled: p.enabled };
+        return { id: p.id, version: p.version, enabled: p.enabled, description: p.description, source: p.source, counts: p.counts };
       }),
     });
+  }
+
+  /**
+   * Turns a plugin on or off. Claude Code's plugins go through `claude plugin enable|disable`, so
+   * Claude Code agrees; the others through `task-x.plugins.disabled`.
+   */
+  private async togglePlugin(p: PluginEntry & { source?: string; name?: string }, enable: boolean): Promise<boolean> {
+    if (p.source === 'claude' && findClaude()) return setPlugin(p.id, enable);
+    const c = vscode.workspace.getConfiguration(SECTION);
+    const off = new Set(c.get<string[]>('plugins.disabled', []));
+    for (const n of [p.id, p.name].filter((x): x is string => !!x)) enable ? off.delete(n) : off.add(n);
+    await c.update('plugins.disabled', [...off].sort(), vscode.ConfigurationTarget.Global);
+    return true;
   }
 
   /** The built-in tools for the Tools chip (#10), with the ones turned off for this window's chats. */
@@ -2385,7 +2698,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private async postMcp(): Promise<void> {
     const origins = mcpOrigins(this.ctx);
     const off = new Set(disabledMcp());
-    let status: { name: string; running: boolean; tools: string[]; error?: string }[] = [];
+    let status: { name: string; running: boolean; tools: string[]; error?: string; authRequired?: boolean; signedIn?: boolean }[] = [];
     try {
       status = (await (await this.getClient()).request<{ servers: typeof status }>('mcp/status')).servers;
     } catch (e) {
@@ -2396,14 +2709,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       type: 'mcp',
       servers: names.map((name) => {
         const s = status.find((x) => x.name === name);
-        return { name, origin: origins[name] ?? 'task-x', enabled: !off.has(name), running: !!s?.running, tools: s?.tools.length ?? 0, error: s?.error ?? null };
+        return { name, origin: origins[name] ?? 'task-x', enabled: !off.has(name), running: !!s?.running, tools: s?.tools.length ?? 0, error: s?.error ?? null, authRequired: !!s?.authRequired, signedIn: !!s?.signedIn };
       }),
     });
   }
 
-  /** The MCP chip's actions: turn a server on or off, reload all, add one, or show the details. */
+  /** The MCP chip's actions: turn a server on or off, connect or disconnect it, reload all, add one, or show the details. */
   private async mcpAction(m: { action: string; name?: string; enable?: boolean }): Promise<void> {
+    const name = typeof m.name === 'string' && /^[\w.-]{1,64}$/.test(m.name) ? m.name : undefined;
     switch (m.action) {
+      case 'connect':
+      case 'disconnect': {
+        if (!name) return this.postMcp();
+        try {
+          const s = (await (await this.getClient()).request<{ servers: { name: string; authRequired?: boolean; signedIn?: boolean }[] }>('mcp/status')).servers.find((x) => x.name === name);
+          const off = disabledMcp().includes(name);
+          if (m.action === 'connect') {
+            // Off: turn it on (the settings change starts it). Needs sign-in: the browser flow. Else: start the servers again.
+            if (off) await setMcpDisabled(name, false);
+            else if (s?.authRequired) await vscode.commands.executeCommand('task-x.mcpSignIn', name);
+            else await vscode.commands.executeCommand('task-x.reloadMcp');
+          } else if (s?.signedIn) await vscode.commands.executeCommand('task-x.mcpSignOut', name);
+          else await setMcpDisabled(name, true);
+        } catch (e) {
+          vscode.window.showErrorMessage(`task-x: ${name}: ${describeError(e)}`);
+        }
+        setTimeout(() => void this.postMcp(), 1500);
+        return this.postMcp();
+      }
       case 'toggle':
         if (typeof m.name === 'string' && /^[\w.-]{1,64}$/.test(m.name)) await setMcpDisabled(m.name, m.enable !== true);
         // The settings change restarts the servers; the list shows the new state at once.
@@ -2457,13 +2790,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         return newSkill(root);
       case 'newAgent':
         return newAgent(root);
+      case 'newCommand':
+        return newCommand(root);
       case 'installPlugin':
-        return installPlugin();
+        await vscode.commands.executeCommand('task-x.installPlugin');
+        return this.postSkills();
       case 'viewPlugin':
         if (plugin) await viewPlugin(plugin);
         return;
+      case 'managePlugin':
+        if (plugin && (await managePlugin(await this.getClient(), plugin.name ?? plugin.id, plugin.source ?? ''))) {
+          await vscode.commands.executeCommand('task-x.reloadMcp');
+          await this.postSkills();
+        }
+        return;
       case 'togglePlugin':
-        if (plugin && (await setPlugin(plugin.id, m.enable === true))) await this.postSkills();
+        if (plugin && (await this.togglePlugin(plugin, m.enable === true))) setTimeout(() => void this.postSkills(), 500);
         return;
     }
   }
@@ -2513,10 +2855,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     prompt = await this.withSkills(client, prompt, [ed.selection?.path, ed.activeFile].filter((p): p is string => !!p));
     const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
     setOff(
-      client.onNotification('agent/event', (p) => {
-        const { taskId: id, event } = p as AgentEventParams;
-        if (id === taskId) this.onEvent(event, state);
-      }),
+      client.onNotification(
+        'agent/event',
+        // Bound to this run's tab: the event arrives outside the run's async context.
+        AsyncResource.bind((p: unknown) => {
+          const { taskId: id, event } = p as AgentEventParams;
+          if (id === taskId) this.onEvent(event, state);
+        }),
+      ),
     );
     const budget = c.get<number>('claudeCode.maxBudgetUsd', 0);
     const model = claudeModel();
@@ -2540,7 +2886,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       },
       { signal },
     );
-    if (summary.sessionId) await this.ctx.workspaceState.update(CLAUDE_SESSIONS_KEY, { ...sessions, [taskId]: summary.sessionId });
+    // Read again: another tab's Claude Code run may have saved its session in the meantime.
+    if (summary.sessionId) await this.ctx.workspaceState.update(CLAUDE_SESSIONS_KEY, { ...this.ctx.workspaceState.get<Record<string, string>>(CLAUDE_SESSIONS_KEY, {}), [taskId]: summary.sessionId });
     this.add({ kind: 'summary', ...summaryText(summary) });
     this.noteOperations(summary);
     await this.commitTask(summary, text);
@@ -2587,6 +2934,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <ul id="changesList"></ul>
 </section>
 <form id="form">
+  <div id="tokenBar" class="token-bar" role="status" aria-live="polite" hidden></div>
   <div id="slash" role="listbox" aria-label="Skills" hidden></div>
   <div id="todos" class="todos" aria-label="The agent's plan" hidden></div>
   <div id="queue" class="queue" aria-label="Queued messages" hidden></div>
