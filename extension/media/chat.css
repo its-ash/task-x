@@ -475,7 +475,7 @@ button:disabled { opacity: .38; cursor: default; }
 .row.browser .browser-icon { flex: none; color: var(--accent); }
 .row.browser .label { color: var(--accent); font-weight: 600; }
 .request-images { display: flex; align-items: center; gap: 4px; margin-top: 4px; font-size: 11px; color: var(--muted); }
-textarea { width: 100%; resize: none; min-height: 40px; max-height: 40vh; padding: 2px 4px; border: none; outline: none; font: inherit; line-height: 1.45; color: var(--on-surface); background: transparent; }
+textarea { width: 100%; resize: none; min-height: 100px; max-height: 40vh; padding: 2px 4px; border: none; outline: none; font: inherit; line-height: 1.45; color: var(--on-surface); background: transparent; }
 textarea:focus-visible { outline: none; }
 textarea::placeholder { color: var(--on-surface-variant); }
 .toolbar { display: flex; align-items: center; gap: 4px; min-width: 0; }
