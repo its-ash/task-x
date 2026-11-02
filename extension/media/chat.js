@@ -1231,7 +1231,7 @@
     const role = el('span', 'lane-role');
     role.append(icon(it.agent ? 'hubot' : ROLE_ICONS[it.role] || 'person'), el('span', null, [it.step, it.agent || it.role].filter(Boolean).join(' · ')));
     head.append(role, el('span', 'lane-model', it.model), el('span', 'spacer'), el('span', 'lane-status', LANE_STATUS[it.status] || it.status));
-    if (it.status === 'running') head.append(button('action stop-btn', icon('debug-stop'), () => vscode.postMessage({ type: 'stopLane', taskId: it.taskId }), 'Stop this subagent'));
+    if (it.status === 'running' && it.stoppable !== false) head.append(button('action stop-btn', icon('debug-stop'), () => vscode.postMessage({ type: 'stopLane', taskId: it.taskId }), 'Stop this subagent'));
     card.append(head, el('div', 'lane-goal', it.objective));
     const body = el('details', 'lane-body');
     body.open = it.status === 'running';

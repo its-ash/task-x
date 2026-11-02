@@ -425,10 +425,42 @@ fn clip(s: &str, n: usize) -> String {
     format!("{}\n… [{} more characters]", &s[..cut], s.len() - cut)
 }
 
+/// Claude Code's subagent tools: their calls show as subagent lanes, and lines with a
+/// `parent_tool_use_id` are the subagent's own steps.
+const SUBAGENT_TOOLS: &[&str] = &["Task", "Agent"];
+const MAX_OBJECTIVE: usize = 2_000;
+
+/// The task-x role closest to a Claude Code `subagent_type`.
+fn role_of(agent: &str) -> &'static str {
+    let a = agent.to_ascii_lowercase();
+    let has = |ks: &[&str]| ks.iter().any(|k| a.contains(k));
+    if has(&["review", "audit", "analyz", "evaluat", "check"]) {
+        "review"
+    } else if has(&["test", "e2e", "qa"]) {
+        "testing"
+    } else if has(&["doc", "writer", "codemap"]) {
+        "documentation"
+    } else if has(&["explore", "research", "plan", "search", "lookup", "architect", "general"]) {
+        "research"
+    } else {
+        "implementation"
+    }
+}
+
+struct Sub {
+    name: String,
+    role: &'static str,
+    agent: String,
+    background: bool,
+    done: bool,
+}
+
 /// Converts one stream-json line into agent events. Keeps tool names and streaming state.
 #[derive(Default)]
 pub struct Mapper {
     tool_names: HashMap<String, String>,
+    /// Subagent calls by tool-use id.
+    subagents: HashMap<String, Sub>,
     /// Reply text that already streamed in this message; the full message adds only what is missing.
     streamed: String,
     /// Whether any reply text reached the chat since the last `result`; without it the result's
@@ -445,11 +477,90 @@ pub struct Mapper {
 }
 
 impl Mapper {
+    fn tool_started(&mut self, block: &Value) -> Value {
+        let id = block["id"].as_str().unwrap_or_default().to_owned();
+        // task-x tools show under their own names (read_file, replace_text, …).
+        let raw = block["name"].as_str().unwrap_or("tool");
+        let name = raw.strip_prefix(TASK_TOOL_PREFIX).unwrap_or(raw).to_owned();
+        self.tool_names.insert(id.clone(), name.clone());
+        self.tool_calls += 1;
+        json!({ "type": "toolStarted", "callId": id, "tool": name, "input": block["input"], "permission": "claude" })
+    }
+
+    fn tool_finished(&self, block: &Value) -> Value {
+        let id = block["tool_use_id"].as_str().unwrap_or_default();
+        let name = self.tool_names.get(id).cloned().unwrap_or_else(|| "tool".into());
+        let ok = !block["is_error"].as_bool().unwrap_or(false);
+        json!({ "type": "toolFinished", "callId": id, "tool": name, "ok": ok, "output": clip(&text_of(&block["content"]), MAX_TOOL_OUTPUT) })
+    }
+
+    fn subagent_started(&mut self, block: &Value) -> Value {
+        let id = block["id"].as_str().unwrap_or_default().to_owned();
+        let input = &block["input"];
+        let agent = input["subagent_type"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or("general-purpose").to_owned();
+        let desc = input["description"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let name = input["name"].as_str().map(str::trim).filter(|s| !s.is_empty()).or(desc).unwrap_or(agent.as_str()).to_owned();
+        let objective = input["prompt"].as_str().map(str::trim).filter(|s| !s.is_empty()).or(desc).unwrap_or_default();
+        let role = role_of(&agent);
+        let model = input["model"].as_str().map(str::to_owned).or_else(|| self.model.clone()).unwrap_or_default();
+        self.tool_names.insert(id.clone(), block["name"].as_str().unwrap_or("Agent").to_owned());
+        self.tool_calls += 1;
+        let background = input["run_in_background"] == true;
+        let ev = json!({
+            "type": "subagentStarted", "name": name, "taskId": id, "role": role, "agent": agent,
+            "objective": clip(objective, MAX_OBJECTIVE), "kind": "claudeCode", "model": model, "dir": null, "step": null,
+        });
+        self.subagents.insert(id, Sub { name, role, agent, background, done: false });
+        ev
+    }
+
+    fn subagent_finished(&mut self, id: &str, ok: bool, error: Option<String>) -> Option<Value> {
+        let s = self.subagents.get_mut(id).filter(|s| !s.done)?;
+        s.done = true;
+        Some(json!({
+            "type": "subagentFinished", "name": s.name, "taskId": id, "role": s.role, "agent": s.agent,
+            "status": if ok { "completed" } else { "failed" }, "error": error, "worktree": null,
+        }))
+    }
+
+    /// The events of a line a subagent wrote, each wrapped as a `subagent` event of its lane.
+    fn map_child(&mut self, parent: &str, v: &Value) -> Vec<Value> {
+        let mut inner = Vec::new();
+        match v["type"].as_str() {
+            Some("assistant") => {
+                for block in v["message"]["content"].as_array().into_iter().flatten() {
+                    match block["type"].as_str() {
+                        Some("text") => {
+                            if let Some(t) = block["text"].as_str().filter(|t| !t.trim().is_empty()) {
+                                inner.push(json!({ "type": "textDelta", "text": t }));
+                            }
+                        }
+                        Some("tool_use") => inner.push(self.tool_started(block)),
+                        _ => {}
+                    }
+                }
+            }
+            Some("user") => {
+                for block in v["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
+                    inner.push(self.tool_finished(block));
+                }
+            }
+            _ => {}
+        }
+        let name = self.subagents.get(parent).map_or("subagent", |s| s.name.as_str());
+        inner.into_iter().map(|e| json!({ "type": "subagent", "name": name, "taskId": parent, "event": e })).collect()
+    }
+
     pub fn map(&mut self, line: &str, chat_mode: &str) -> Vec<Value> {
         let Ok(v) = serde_json::from_str::<Value>(line) else { return Vec::new() };
         let mut out = Vec::new();
         if let Some(s) = v["session_id"].as_str() {
             self.session_id = Some(s.to_owned());
+        }
+        // A subagent's lines go to its lane; its streamed text never mixes with the lead's reply.
+        if let Some(parent) = v["parent_tool_use_id"].as_str().filter(|p| !p.is_empty()) {
+            let parent = parent.to_owned();
+            return self.map_child(&parent, &v);
         }
         match v["type"].as_str() {
             Some("system") if v["subtype"] == "init" => {
@@ -501,15 +612,10 @@ impl Mapper {
                                 out.push(json!({ "type": "textDelta", "text": rest }));
                             }
                         }
-                        Some("tool_use") => {
-                            let id = block["id"].as_str().unwrap_or_default().to_owned();
-                            // task-x tools show under their own names (read_file, replace_text, …).
-                            let raw = block["name"].as_str().unwrap_or("tool");
-                            let name = raw.strip_prefix(TASK_TOOL_PREFIX).unwrap_or(raw).to_owned();
-                            self.tool_names.insert(id.clone(), name.clone());
-                            self.tool_calls += 1;
-                            out.push(json!({ "type": "toolStarted", "callId": id, "tool": name, "input": block["input"], "permission": "claude" }));
+                        Some("tool_use") if block["name"].as_str().is_some_and(|n| SUBAGENT_TOOLS.contains(&n)) => {
+                            out.push(self.subagent_started(block));
                         }
+                        Some("tool_use") => out.push(self.tool_started(block)),
                         _ => {}
                     }
                 }
@@ -517,12 +623,23 @@ impl Mapper {
             Some("user") => {
                 for block in v["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
                     let id = block["tool_use_id"].as_str().unwrap_or_default();
-                    let name = self.tool_names.get(id).cloned().unwrap_or_else(|| "tool".into());
+                    let Some(bg) = self.subagents.get(id).map(|s| s.background) else {
+                        out.push(self.tool_finished(block));
+                        continue;
+                    };
                     let ok = !block["is_error"].as_bool().unwrap_or(false);
-                    out.push(json!({ "type": "toolFinished", "callId": id, "tool": name, "ok": ok, "output": clip(&text_of(&block["content"]), MAX_TOOL_OUTPUT) }));
+                    // A background subagent's call returns at once; its lane ends with the run's result.
+                    if !bg || !ok {
+                        let error = (!ok).then(|| clip(&text_of(&block["content"]), 500));
+                        out.extend(self.subagent_finished(id, ok, error));
+                    }
                 }
             }
             Some("result") => {
+                let open: Vec<String> = self.subagents.iter().filter(|(_, s)| !s.done).map(|(id, _)| id.clone()).collect();
+                for id in open {
+                    out.extend(self.subagent_finished(&id, true, None));
+                }
                 let usage = &v["usage"];
                 // Claude Code reports cached prompt tokens apart from `input_tokens`; all of them were sent.
                 let input = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
@@ -1147,6 +1264,36 @@ mod tests {
         let late = m.map(r#"{"type":"result","subtype":"success","result":"Also done.","usage":{"input_tokens":30,"output_tokens":7}}"#, "agent");
         assert_eq!(late[0]["text"], "Also done.");
         assert_eq!((m.results, m.input_tokens, m.output_tokens), (2, Some(150), Some(12)), "a steered message adds a result");
+    }
+
+    #[test]
+    fn subagent_calls_become_lanes_with_their_own_steps() {
+        let mut m = Mapper::default();
+        let lines = [
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"description":"Find tests","prompt":"List the test files","subagent_type":"code-reviewer"}},{"type":"tool_use","id":"a2","name":"Task","input":{"description":"Look around","prompt":"Map the repo","subagent_type":"Explore","run_in_background":true}}]}}"#,
+            r#"{"type":"stream_event","parent_tool_use_id":"a1","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"sub"}}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"a1","message":{"content":[{"type":"text","text":"Searching."},{"type":"tool_use","id":"c1","name":"mcp__task-x__find_files","input":{"pattern":"*test*"}}]}}"#,
+            r#"{"type":"user","parent_tool_use_id":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"c1","content":"a_test.rs"}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a1","content":"a_test.rs"},{"type":"tool_result","tool_use_id":"a2","content":"Async agent launched"}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"Done.","usage":{}}"#,
+        ];
+        let evs: Vec<Value> = lines.iter().flat_map(|l| m.map(l, "agent")).collect();
+        let types: Vec<&str> = evs.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            ["subagentStarted", "subagentStarted", "subagent", "subagent", "subagent", "subagentFinished", "subagentFinished", "textDelta"],
+            "streamed subagent text is dropped; the full message carries it"
+        );
+        assert_eq!((evs[0]["taskId"].as_str(), evs[0]["name"].as_str(), evs[0]["role"].as_str()), (Some("a1"), Some("Find tests"), Some("review")));
+        assert_eq!((evs[0]["agent"].as_str(), evs[0]["objective"].as_str(), evs[0]["kind"].as_str()), (Some("code-reviewer"), Some("List the test files"), Some("claudeCode")));
+        assert_eq!(evs[1]["role"], "research");
+        assert_eq!((evs[2]["taskId"].as_str(), evs[2]["event"]["type"].as_str()), (Some("a1"), Some("textDelta")));
+        assert_eq!((evs[3]["event"]["type"].as_str(), evs[3]["event"]["tool"].as_str()), (Some("toolStarted"), Some("find_files")));
+        assert_eq!((evs[4]["event"]["type"].as_str(), evs[4]["event"]["ok"].as_bool()), (Some("toolFinished"), Some(true)));
+        assert_eq!((evs[5]["taskId"].as_str(), evs[5]["status"].as_str()), (Some("a1"), Some("completed")));
+        assert_eq!(evs[6]["taskId"], "a2", "the background subagent ends with the result");
+        assert_eq!(evs[7]["text"], "Done.", "subagent text does not count as the lead's reply");
+        assert!(m.map(r#"{"type":"result","result":"","usage":{}}"#, "agent").is_empty(), "a lane ends once");
     }
 
     #[test]

@@ -212,6 +212,8 @@ type Lane = {
   dir?: string | null;
   merge?: 'merged' | 'conflict' | 'discarded';
   mergeError?: string;
+  /** False for Claude Code subagents: the CLI cannot stop one subagent alone. */
+  stoppable?: boolean;
 };
 
 type Inbound =
@@ -2139,7 +2141,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.add({ kind: 'context', text: e.message });
         break;
       case 'subagentStarted':
-        this.add({ kind: 'lane', taskId: e.taskId, name: e.name, role: e.role, agent: e.agent ?? null, objective: e.objective, model: e.model, step: e.step, status: 'running', steps: [], dir: e.dir });
+        this.add({ kind: 'lane', taskId: e.taskId, name: e.name, role: e.role, agent: e.agent ?? null, objective: e.objective, model: e.model, step: e.step, status: 'running', steps: [], dir: e.dir, stoppable: e.kind !== 'claudeCode' });
         this.openSubagentTab(e);
         break;
       case 'subagentFinished': {

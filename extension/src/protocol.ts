@@ -410,7 +410,7 @@ export type AgentEvent =
   | { type: 'compacted'; folded: number; pruned?: number; droppedRetrieval?: boolean; beforeTokens?: number; afterTokens?: number; windowTokens?: number }
   | { type: 'context'; usedTokens: number; windowTokens: number }
   | { type: 'hook'; event: string; command: string; blocked: boolean; message: string }
-  | { type: 'subagentStarted'; name: string; taskId: string; role: Role; agent?: string | null; objective: string; kind: ProviderKind; model: string; dir: string | null; step: string | null }
+  | { type: 'subagentStarted'; name: string; taskId: string; role: Role; agent?: string | null; objective: string; kind: ProviderKind | 'claudeCode'; model: string; dir: string | null; step: string | null }
   | { type: 'subagentFinished'; name: string; taskId: string; role: Role; agent?: string | null; status: TaskStatus; error?: string | null; costUsd?: number; unpricedTokens?: number; tokens?: number; files?: string[]; added?: number; removed?: number; worktree?: string | null }
   | { type: 'planStarted'; callId: string; maxParallel: number; steps: { id: string; role: Role; agent?: string | null; objective: string; dependsOn: string[] }[] }
   | { type: 'stepSkipped'; step: string; reason: string }

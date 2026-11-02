@@ -310,6 +310,8 @@ Claude Code always runs with `sandbox.allowUnsandboxedCommands: false`, so a com
 
 The prompt goes to Claude Code's stdin as a stream-json user message (`--input-format stream-json`). Stdin stays open while the run takes `agent/steer` messages: waiting messages are sent as one more user message, and each is reported by a `steered` event. When Claude Code has answered every message and none waits, the runtime closes stdin and the run ends. The summary has the text of the last answer and the summed token counts.
 
+A `Task` or `Agent` call of Claude Code is reported as `subagentStarted` (`taskId` is the tool-use id, `kind` is `claudeCode`, `agent` is the `subagent_type`, `role` is the closest task-x role, `dir` and `step` are null), not as `toolStarted`. Lines with a `parent_tool_use_id` are that subagent's steps: their text and tool calls come as `subagent` events. The call's `tool_result` sends `subagentFinished`. A background subagent (`run_in_background`) and any subagent still open end with the next `result` line.
+
 The MCP server can also be used by any MCP client: `task-x-runtime --mcp-server [--root DIR]`.
 
 ### Costs
