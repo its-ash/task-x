@@ -2,7 +2,7 @@
   "name": "task-x",
   "displayName": "task-x",
   "description": "Model-agnostic AI coding agent with a Rust runtime. Works with Claude, OpenAI, Ollama, and OpenAI-compatible endpoints.",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "publisher": "its-ash",
   "license": "MIT",
   "private": true,
@@ -846,14 +846,18 @@
         },
         "task-x.plugins.dirs": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "markdownDescription": "Extra plugin folders (absolute paths) in the Claude Code plugin layout: `skills/`, `agents/`, `commands/`, and `.mcp.json`. task-x also reads the plugins Claude Code installed, `~/.task-x/plugins/`, and `.task-x/plugins/` in the workspace.",
           "scope": "machine-overridable"
         },
         "task-x.plugins.disabled": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "markdownDescription": "Plugins to turn off, by name or id (`name@marketplace`). Their skills, agents, and commands are not loaded.",
           "scope": "machine-overridable"

@@ -55,7 +55,7 @@ deploy: bump build
 	cp $(VSIX) $(EXT)/$(ASSET)
 	git checkout main
 	git add -A
-	git diff --cached --quiet || git commit -m "$$(copilot -sp 'Analyze the staged git changes and generate a concise commit message. Output ONLY the commit message. Do not execute any commands. Do not include quotes, markdown, explanation, or bullet points.')"
+	git diff --cached --quiet || { msg="$$(node scripts/commit-msg.mjs)" && git commit -m "$$msg"; }
 	git push origin main
 	gh release create v$(VERSION) $(VSIX) $(EXT)/$(ASSET) --repo $(REPO) --target main --title "task-x $(VERSION)" --latest \
 		--notes "Download $(ASSET), then run: code --install-extension $(ASSET)"
