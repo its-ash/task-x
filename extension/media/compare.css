@@ -18,8 +18,8 @@ body { margin: 0; padding: 20px 24px; font-family: var(--vscode-font-family); fo
 .top p { margin: 4px 0 0; color: var(--muted); max-width: 80ch; line-height: 1.5; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 14px; }
 .card { display: flex; flex-direction: column; gap: 12px; padding: 16px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); box-shadow: 0 1px 2px var(--shadow); animation: md-enter var(--md-duration-medium4) var(--md-motion-emphasized-decelerate) both; animation-delay: calc(var(--i, 0) * 60ms); }
-.card.bad { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
-.card.kept { border-color: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); animation: md-pop var(--md-duration-medium2) var(--md-motion-emphasized); }
+.card.bad { border-color: transparent; background: color-mix(in srgb, var(--warn) 12%, var(--surface)); }
+.card.kept { border-color: transparent; background: color-mix(in srgb, var(--ok) 14%, var(--surface)); animation: md-pop var(--md-duration-medium2) var(--md-motion-emphasized); }
 .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
 .model h2 { margin: 0; font-size: 1.05em; font-family: var(--mono); font-weight: 600; word-break: break-all; }
 .kind { font-size: 11px; color: var(--muted); }
