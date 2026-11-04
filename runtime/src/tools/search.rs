@@ -1,9 +1,9 @@
 //! Search tools over the in-memory index (fast, and they respect index exclusions).
 
-use super::fs::read_text;
+use super::fs::{large_file, read_text};
 use super::schema::{int, object, path};
-use super::{Permission, ToolCtx, ToolDef, ToolError, ToolErrorKind, ToolResult, parse, tool};
-use crate::context::index::globset;
+use super::{Permission, ToolCtx, ToolDef, ToolError, ToolErrorKind, ToolResult, json_in, normalize_input, parse, stream, tool};
+use crate::context::index::{MAX_FILE_BYTES, globset};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -45,7 +45,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool(
             "multi_search",
-            "Run up to 10 searches in one call (each a regex, or literal text with literal: true, with an optional glob). One call instead of several saves turns.",
+            "Run up to 10 searches in one call (each a regex, or literal text with literal: true, with an optional glob). Top-level glob, literal, and caseSensitive apply to searches that do not set them. One call instead of several saves turns.",
             Read,
             || {
                 object(
@@ -56,6 +56,9 @@ pub fn tools() -> Vec<ToolDef> {
                             "glob": { "type": "string" },
                             "caseSensitive": { "type": "boolean" }
                         }, "required": ["pattern"], "additionalProperties": false } },
+                        "glob": { "type": "string", "description": "Default glob for every search" },
+                        "literal": { "type": "boolean" },
+                        "caseSensitive": { "type": "boolean" },
                         "limit": int("Max matches per search (default 30)", 1)
                     }),
                     &["searches"],
@@ -163,15 +166,21 @@ struct SearchIn {
 }
 
 fn excerpt(line: &str) -> String {
-    let t = line.trim();
+    excerpt_at(line, 0)
+}
+
+/// The trimmed line, or a window of it that shows the byte offset `at` when the line is long.
+fn excerpt_at(line: &str, at: usize) -> String {
+    let t = line.trim_start();
+    let at = at.saturating_sub(line.len() - t.len());
+    let t = t.trim_end();
     if t.len() <= MAX_EXCERPT {
         return t.to_owned();
     }
-    let mut cut = MAX_EXCERPT;
-    while !t.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}…", &t[..cut])
+    let floor = |i: usize| (0..=i.min(t.len())).rev().find(|&i| t.is_char_boundary(i)).unwrap_or(0);
+    let from = floor(at.saturating_sub(MAX_EXCERPT / 3));
+    let to = floor(from + MAX_EXCERPT);
+    format!("{}{}{}", if from > 0 { "…" } else { "" }, &t[from..to], if to < t.len() { "…" } else { "" })
 }
 
 pub(super) fn build_regex(pattern: &str, literal: bool, case_sensitive: bool) -> Result<Regex, ToolError> {
@@ -191,26 +200,36 @@ fn grep(c: &ToolCtx, re: &Regex, glob: Option<&str>, limit: usize, offset: usize
     grep_where(c, re, |rel| !filter.as_ref().is_some_and(|g| !g.is_match(rel)), limit, offset)
 }
 
-/// Matching lines in the indexed files whose path `keep` accepts.
+/// Matching lines in the indexed files whose path `keep` accepts. Files too large for the index
+/// hold no content there, so they are streamed from disk.
 pub(super) fn grep_where(c: &ToolCtx, re: &Regex, keep: impl Fn(&str) -> bool, limit: usize, offset: usize) -> ToolResult {
     c.with_workspace(|w| {
         let mut matches = Vec::new();
         let mut total = 0usize;
+        let mut add = |rel: &str, n: usize, line: &str| {
+            if let Some(m) = re.find(line) {
+                if total >= offset && matches.len() < limit {
+                    matches.push(json!({ "path": rel, "line": n, "excerpt": excerpt_at(line, m.start()) }));
+                }
+                total += 1;
+            }
+        };
         for f in w.index.files() {
             if !keep(&f.rel) {
                 continue;
             }
-            let Some(text) = f.content.as_deref() else { continue };
-            if !re.is_match(text) {
-                continue;
-            }
-            for (n, line) in text.lines().enumerate() {
-                if re.is_match(line) {
-                    if total >= offset && matches.len() < limit {
-                        matches.push(json!({ "path": f.rel, "line": n + 1, "excerpt": excerpt(line) }));
+            match f.content.as_deref() {
+                Some(text) if re.is_match(text) => text.lines().enumerate().for_each(|(n, l)| add(&f.rel, n + 1, l)),
+                None if f.size > MAX_FILE_BYTES && f.size <= stream::MAX_BYTES => {
+                    let abs = w.index.root().join(&f.rel);
+                    if stream::is_text(&abs).unwrap_or(false) {
+                        let _ = stream::each_line(&abs, &c.cancel, |n, l| {
+                            add(&f.rel, n, l);
+                            true
+                        });
                     }
-                    total += 1;
                 }
+                _ => {}
             }
         }
         json!({ "matches": matches, "total": total, "offset": offset, "more": total > offset + matches.len() })
@@ -226,6 +245,28 @@ fn run_search(c: &ToolCtx, input: Value, literal: bool) -> ToolResult {
 const MAX_SEARCHES: usize = 10;
 const MULTI_LIMIT: usize = 30;
 
+/// Search items sent as bare strings (`["foo", "bar"]`), one item for the list, or the list as
+/// JSON text become `{ "pattern": ... }` objects.
+fn normalize_searches(input: Value) -> Value {
+    let mut input = normalize_input(input);
+    let Some(o) = input.as_object_mut() else { return input };
+    for k in ["searches", "queries", "patterns"] {
+        let Some(v) = o.get_mut(k) else { continue };
+        if let Some(j) = v.as_str().and_then(json_in) {
+            *v = j;
+        }
+        if !v.is_array() {
+            *v = json!([v.take()]);
+        }
+        for item in v.as_array_mut().into_iter().flatten() {
+            if let Value::String(s) = item {
+                *item = json!({ "pattern": std::mem::take(s) });
+            }
+        }
+    }
+    input
+}
+
 fn multi_search(c: &ToolCtx, input: Value) -> ToolResult {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -233,21 +274,27 @@ fn multi_search(c: &ToolCtx, input: Value) -> ToolResult {
         #[serde(alias = "query", alias = "regex")]
         pattern: String,
         #[serde(default)]
-        literal: bool,
+        literal: Option<bool>,
         #[serde(default)]
         glob: Option<String>,
         #[serde(default)]
-        case_sensitive: bool,
+        case_sensitive: Option<bool>,
     }
     #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct In {
-        #[serde(alias = "queries")]
+        #[serde(alias = "queries", alias = "patterns")]
         searches: Vec<One>,
         #[serde(default)]
         limit: Option<usize>,
+        #[serde(default)]
+        glob: Option<String>,
+        #[serde(default)]
+        literal: bool,
+        #[serde(default)]
+        case_sensitive: bool,
     }
-    let i: In = parse(input)?;
+    let i: In = parse(normalize_searches(input))?;
     if i.searches.is_empty() || i.searches.len() > MAX_SEARCHES {
         return Err(ToolError::invalid(format!("searches must have 1..={MAX_SEARCHES} items")));
     }
@@ -256,7 +303,9 @@ fn multi_search(c: &ToolCtx, input: Value) -> ToolResult {
         .searches
         .iter()
         .map(|s| {
-            let r = build_regex(&s.pattern, s.literal, s.case_sensitive).and_then(|re| grep(c, &re, s.glob.as_deref(), limit, 0));
+            let glob = s.glob.as_deref().or(i.glob.as_deref());
+            let r = build_regex(&s.pattern, s.literal.unwrap_or(i.literal), s.case_sensitive.unwrap_or(i.case_sensitive))
+                .and_then(|re| grep(c, &re, glob, limit, 0));
             match r {
                 Ok(mut v) => {
                     v["pattern"] = json!(s.pattern);
@@ -288,14 +337,24 @@ fn find_all(c: &ToolCtx, input: Value) -> ToolResult {
     }
     let i: In = parse(input)?;
     let re = build_regex(&i.query, true, i.case_sensitive)?;
-    let (rel, text) = read_text(c, &i.path)?;
     let mut out = Vec::new();
-    for (n, line) in text.lines().enumerate() {
+    let mut add = |n: usize, line: &str| {
         for m in re.find_iter(line) {
-            out.push(json!({ "line": n + 1, "column": line[..m.start()].chars().count() + 1, "excerpt": excerpt(line) }));
             if out.len() >= MAX_LIMIT {
-                break;
+                return false;
             }
+            out.push(json!({ "line": n, "column": line[..m.start()].chars().count() + 1, "excerpt": excerpt_at(line, m.start()) }));
+        }
+        out.len() < MAX_LIMIT
+    };
+    if let Some((abs, rel)) = large_file(c, &i.path)? {
+        stream::each_line(&abs, &c.cancel, add).map_err(|e| ToolError::io(e, &rel))?;
+        return Ok(json!({ "path": rel, "count": out.len(), "matches": out, "streamed": true }));
+    }
+    let (rel, text) = read_text(c, &i.path)?;
+    for (n, line) in text.lines().enumerate() {
+        if !add(n + 1, line) {
+            break;
         }
     }
     Ok(json!({ "path": rel, "count": out.len(), "matches": out }))

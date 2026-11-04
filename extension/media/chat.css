@@ -485,6 +485,8 @@ textarea::placeholder { color: var(--on-surface-variant); }
 .pick[hidden] { display: none; }
 .pick .codicon-chevron-down { font-size: 12px !important; }
 #modelBtn { flex: 0 1 auto; }
+#agentBtn { flex: 0 1 auto; max-width: 160px; }
+#agentBtn.on { color: var(--on-surface); background: color-mix(in srgb, var(--fg) var(--md-state-hover), transparent); }
 /* Brand colours: the model chip and the picker take the colour of the provider or model family. */
 [data-brand=claude] { --brand: #d97757; }
 [data-brand=openai] { --brand: #10a37f; }

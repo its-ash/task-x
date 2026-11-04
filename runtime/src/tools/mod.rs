@@ -13,6 +13,7 @@ pub mod patch;
 pub mod repomap;
 pub mod search;
 pub mod shell_search;
+pub mod stream;
 pub mod validate;
 pub mod web;
 

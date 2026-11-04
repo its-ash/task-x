@@ -39,7 +39,7 @@ import { commitPaths, commitSubject } from './autoCommit.js';
 import { WorkspaceSync } from './workspace.js';
 import { claudeDisabledMcp, claudeMcpServers, disabledMcp, mcpOrigins, setMcpDisabled } from './mcpSources.js';
 import { setResourceReader, withHashContext } from './hashContext.js';
-import { activeChatMode, chatModes, setChatMode, withChatMode } from './chatModes.js';
+import { activeChatMode, chatModes, setAgent, setChatMode, withAgent, withChatMode } from './chatModes.js';
 import { elicit } from './mcpElicit.js';
 import { type DocsSource, listDocs, withDocs } from './docs.js';
 
@@ -243,6 +243,7 @@ type Inbound =
   | { type: 'selectAutoCommit'; enabled: boolean }
   | { type: 'selectEditMode'; mode: string }
   | { type: 'selectEffort'; effort: string }
+  | { type: 'selectAgent'; name: string }
   | { type: 'slashAction'; action: string; key?: string; enable?: boolean }
   | { type: 'editWaiting'; kind: string; index: number; text: string }
   | { type: 'selectSandbox'; enabled: boolean }
@@ -848,7 +849,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   refreshStatus(): void {
     const ref = activeRef();
     const claude = engine() === 'claudeCode';
-    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.runs.has(this.activeTab), mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null });
+    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.runs.has(this.activeTab), mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null, agent: windowChoice().agent ?? null });
     void this.postModels();
   }
 
@@ -1202,6 +1203,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     for (const ref of await this.pickerRefs()) {
       const l = this.listed.get(ref);
       const local = refKind(ref) === 'ollama';
+      // Ollama that does not answer (not installed or not running) is left out, unless it is the chat provider.
+      if (local && ref !== active && l?.error && !l.models.length) continue;
       // A list the endpoint answered is complete: the saved model shows only if it is really there.
       const complete = !!l && !l.error;
       const models = withSaved(l?.models ?? [], modelFor(ref), complete).slice(0, MAX_PICKER_MODELS).map(row);
@@ -1443,6 +1446,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'selectEffort':
         // An unknown value (the slider's "Default" stop) clears the choice.
         await setWindowChoice({ effort: EFFORTS.includes(m.effort as Effort) ? (m.effort as Effort) : undefined });
+        this.refreshStatus();
+        break;
+      case 'selectAgent':
+        await setAgent(typeof m.name === 'string' ? m.name : undefined);
         this.refreshStatus();
         break;
       case 'selectAutoCommit':
@@ -2378,8 +2385,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // #9 `#` items and #12 the chat mode: the model gets their context; the message shows the user's words.
     // MCP resources (`#mcp:`) are read through the runtime, so it is connected first.
     await this.getClient().then((c) => this.wire(c), () => undefined);
-    const full = await withHashContext(withDocs(withChatMode(text)));
-    if (engine() === 'claudeCode' && !worker) {
+    const claudeRun = engine() === 'claudeCode' && !worker;
+    const full = await withHashContext(withDocs(withChatMode(withAgent(text, claudeRun))));
+    if (claudeRun) {
       try {
         const task = this.night ? await this.nightTask(full, retry, abort.signal) : full;
         await this.sendClaude(text, mode, abort.signal, (o) => (off = o), task, images);
@@ -2601,9 +2609,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    */
   private notify(kind: 'done' | 'stopped' | 'input', text: string, action: string): void {
     const when = vscode.workspace.getConfiguration(SECTION).get<string>('notifications', 'whenHidden');
-    if (when === 'off' || (when !== 'always' && this.view?.visible && vscode.window.state.focused)) return;
-    const show = kind === 'done' ? vscode.window.showInformationMessage : vscode.window.showWarningMessage;
-    void show(text, action).then((pick) => pick && vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`));
+    if (when === 'off') return;
+    const show = () => {
+      const fn = kind === 'done' ? vscode.window.showInformationMessage : vscode.window.showWarningMessage;
+      void fn(text, action).then((pick) => pick && vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`));
+    };
+    if (when === 'always' || !vscode.window.state.focused || !this.view?.visible) show();
   }
 
   /** Files the `/` menu may open, by the key it sent to the webview; the webview never sends a path. */
@@ -2946,6 +2957,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <textarea id="input" rows="1"></textarea>
   <div class="toolbar" role="toolbar" aria-label="Chat options">
     <button type="button" id="modelBtn" class="pick"></button>
+    <button type="button" id="agentBtn" class="pick agent-pick"></button>
     <button type="button" id="nightPlanBtn" class="pick" hidden></button>
     <button type="button" id="nightLoopBtn" class="pick" hidden></button>
     <button type="button" id="settingsBtn" class="pick settings-pick"></button>

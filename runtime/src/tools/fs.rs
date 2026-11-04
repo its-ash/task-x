@@ -1,6 +1,7 @@
 //! File discovery and reading tools.
 
 use super::schema::{int, object, path};
+use super::stream;
 use super::{Permission, ToolCtx, ToolDef, ToolError, ToolErrorKind, ToolResult, parse, tool};
 use crate::context::index::{MAX_FILE_BYTES, globset};
 use crate::context::symbols;
@@ -238,10 +239,12 @@ fn skill_file(raw: &str) -> Option<PathBuf> {
         None if Path::new(raw).is_absolute() => PathBuf::from(raw),
         None => return None,
     };
+    let p = super::lexical(&p);
     let real = p.canonicalize().ok().filter(|r| r.is_file())?;
-    let in_dir = |d: &Path| d.canonicalize().is_ok_and(|d| real.starts_with(d));
+    // A skill linked into the folder (`~/.claude/skills/x -> ~/src/x`) counts by the path it was given.
+    let in_dir = |d: &Path| p.starts_with(d) || d.canonicalize().is_ok_and(|d| real.starts_with(&d) || p.starts_with(&d));
     let plugins = home.join(".claude").join("plugins");
-    let in_plugin_skills = in_dir(&plugins) && real.components().any(|c| c.as_os_str() == "skills");
+    let in_plugin_skills = in_dir(&plugins) && p.components().chain(real.components()).any(|c| c.as_os_str() == "skills");
     (crate::agent::skills::user_dirs().iter().any(|d| in_dir(d)) || in_plugin_skills).then_some(real)
 }
 
@@ -262,7 +265,10 @@ pub fn read_text(c: &ToolCtx, raw: &str) -> Result<(String, String), ToolError> 
         return Err(ToolError::invalid(format!("{rel} is not a file")));
     }
     if meta.len() > MAX_FILE_BYTES * 4 {
-        return Err(ToolError::invalid(format!("{rel} is {} bytes; too large to read", meta.len())));
+        return Err(ToolError::invalid(format!(
+            "{rel} is {} bytes; too large to load whole. read_file, read_range, find_all, and search_text stream it",
+            meta.len()
+        )));
     }
     let bytes = std::fs::read(&abs).map_err(|e| ToolError::io(e, &rel))?;
     if bytes[..bytes.len().min(8192)].contains(&0) {
@@ -273,24 +279,60 @@ pub fn read_text(c: &ToolCtx, raw: &str) -> Result<(String, String), ToolError> 
     Ok((rel, text))
 }
 
+/// A workspace text file above the whole-load limit, as (absolute, relative) path: reads and
+/// searches stream it line by line. `None` for every other file.
+pub fn large_file(c: &ToolCtx, raw: &str) -> Result<Option<(PathBuf, String)>, ToolError> {
+    if skill_file(raw.trim()).is_some() {
+        return Ok(None);
+    }
+    let (abs, rel) = c.resolve_existing(raw)?;
+    let meta = std::fs::metadata(&abs).map_err(|e| ToolError::io(e, &rel))?;
+    if !meta.is_file() || meta.len() <= MAX_FILE_BYTES * 4 {
+        return Ok(None);
+    }
+    if meta.len() > stream::MAX_BYTES {
+        return Err(ToolError::invalid(format!("{rel} is {} bytes; above the {} byte stream limit", meta.len(), stream::MAX_BYTES)));
+    }
+    if !stream::is_text(&abs).map_err(|e| ToolError::io(e, &rel))? {
+        return Err(ToolError::invalid(format!("{rel} is a binary file")));
+    }
+    Ok(Some((abs, rel)))
+}
+
+fn number_line(n: usize, l: &str) -> String {
+    if l.len() <= MAX_LINE_CHARS {
+        return format!("{n:>6}\t{l}");
+    }
+    let mut cut = MAX_LINE_CHARS;
+    while !l.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{n:>6}\t{}… [line truncated]", &l[..cut])
+}
+
 fn numbered(text: &str, start: usize, end: usize) -> String {
-    text.lines()
-        .enumerate()
-        .skip(start - 1)
-        .take(end + 1 - start)
-        .map(|(n, l)| {
-            if l.len() > MAX_LINE_CHARS {
-                let mut cut = MAX_LINE_CHARS;
-                while !l.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                format!("{:>6}\t{}… [line truncated]", n + 1, &l[..cut])
-            } else {
-                format!("{:>6}\t{l}", n + 1)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    text.lines().enumerate().skip(start - 1).take(end + 1 - start).map(|(n, l)| number_line(n + 1, l)).collect::<Vec<_>>().join("\n")
+}
+
+/// `range_result` for a large file: one streamed pass keeps the range and counts all lines.
+fn stream_range(c: &ToolCtx, abs: &Path, rel: &str, start: usize, end: usize) -> ToolResult {
+    let end = end.min(start + MAX_READ_LINES - 1);
+    let mut lines = Vec::new();
+    let total = stream::each_line(abs, &c.cancel, |n, l| {
+        if (start..=end).contains(&n) {
+            lines.push(number_line(n, l));
+        }
+        true
+    })
+    .map_err(|e| ToolError::io(e, rel))?;
+    if total == 0 {
+        return Ok(json!({ "path": rel, "totalLines": 0, "content": "", "streamed": true }));
+    }
+    if start > total {
+        return Err(ToolError::invalid(format!("{rel} has {total} lines; start {start} is past the end (valid 1..={total})")));
+    }
+    let end = end.min(total);
+    Ok(json!({ "path": rel, "startLine": start, "endLine": end, "totalLines": total, "content": lines.join("\n"), "more": end < total, "streamed": true }))
 }
 
 fn range_result(rel: &str, text: &str, start: usize, end: usize) -> ToolResult {
@@ -324,7 +366,6 @@ fn read_file(c: &ToolCtx, input: Value) -> ToolResult {
         end: Option<usize>,
     }
     let i: In = parse(input)?;
-    let (rel, text) = read_text(c, &i.path)?;
     let start = i.offset.unwrap_or(1).max(1);
     let whole = i.end.is_none() && i.limit.is_none();
     let end = match i.end {
@@ -332,6 +373,17 @@ fn read_file(c: &ToolCtx, input: Value) -> ToolResult {
         Some(end) => end,
         None => start + i.limit.unwrap_or(DEFAULT_READ_LINES).clamp(1, MAX_READ_LINES) - 1,
     };
+    if let Some((abs, rel)) = large_file(c, &i.path)? {
+        let mut r = stream_range(c, &abs, &rel, start, end)?;
+        if whole && r["more"] == true {
+            r["note"] = json!(format!(
+                "{rel} is too large to load whole; lines {start}-{} of {} were streamed. Read other lines with read_range, or find them with find_all or search_text.",
+                r["endLine"], r["totalLines"]
+            ));
+        }
+        return Ok(r);
+    }
+    let (rel, text) = read_text(c, &i.path)?;
     let mut r = range_result(&rel, &text, start, end)?;
     if whole && r["more"] == true {
         if let Some(outline) = outline(c, &rel, &text) {
@@ -374,6 +426,12 @@ fn read_range(c: &ToolCtx, input: Value) -> ToolResult {
         .end
         .or_else(|| i.limit.map(|n| start + n.max(1) - 1))
         .ok_or_else(|| ToolError::invalid("read_range: give end (the last line) or limit (the number of lines)"))?;
+    if let Some((abs, rel)) = large_file(c, &i.path)? {
+        if start == 0 || end < start {
+            return Err(ToolError::invalid(format!("read_range: need 1 <= start <= end, got start {start}, end {end}")));
+        }
+        return stream_range(c, &abs, &rel, start, end);
+    }
     let (rel, text) = read_text(c, &i.path)?;
     let total = text.lines().count();
     if start == 0 {
@@ -407,7 +465,10 @@ fn read_multiple_files(c: &ToolCtx, input: Value) -> ToolResult {
     let files: Vec<Value> = i
         .paths
         .iter()
-        .map(|p| match read_text(c, p).and_then(|(rel, t)| range_result(&rel, &t, 1, MAX_READ_LINES / 4)) {
+        .map(|p| match large_file(c, p).and_then(|big| match big {
+            Some((abs, rel)) => stream_range(c, &abs, &rel, 1, MAX_READ_LINES / 4),
+            None => read_text(c, p).and_then(|(rel, t)| range_result(&rel, &t, 1, MAX_READ_LINES / 4)),
+        }) {
             Ok(v) => v,
             Err(e) => json!({ "path": p, "error": e }),
         })

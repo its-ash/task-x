@@ -64,10 +64,30 @@ export async function setChatMode(name: string | undefined): Promise<void> {
   await setWindowChoice({ chatMode: name && chatModes().some((m) => m.name === name) ? name : undefined });
 }
 
+/** Agent names the picker accepts: `name` or `plugin:name`. */
+const AGENT_NAME = /^[\w.:-]{1,128}$/;
+
+export async function setAgent(name: string | undefined): Promise<void> {
+  const n = name?.trim();
+  await setWindowChoice({ agent: n && AGENT_NAME.test(n) ? n : undefined });
+}
+
+/**
+ * The message for the picked agent, when the message names none itself: `@agent …` for task-x, and
+ * a delegation line for Claude Code, which has no `@agent` prefix in print mode.
+ */
+export function withAgent(text: string, claude = false): string {
+  const a = windowChoice().agent;
+  if (!a || text.trimStart().startsWith('@')) return text;
+  return claude ? `Use the ${a} subagent to do this task.\n\n${text}` : `@${a} ${text}`;
+}
+
 /** The message with the active mode's instructions in front of it; unchanged without a mode. */
 export function withChatMode(text: string): string {
   const m = activeChatMode();
   if (!m) return text;
   const tools = m.tools.length ? `\nUse only these tools in this mode: ${m.tools.join(', ')}.` : '';
-  return `<chat_mode name="${m.name}">\n${m.instructions}${tools}\n</chat_mode>\n\n${text}`;
+  // A leading `@agent` stays first: the runtime reads it only at the start of the message.
+  const lead = /^\s*@[\w.:-]+\s+/.exec(text)?.[0] ?? '';
+  return `${lead}<chat_mode name="${m.name}">\n${m.instructions}${tools}\n</chat_mode>\n\n${text.slice(lead.length)}`;
 }

@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Designer — Sidebar Agent</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = { theme: { extend: { fontFamily: { sans: ['Inter','ui-sans-serif','system-ui','sans-serif'], mono: ['JetBrains Mono','ui-monospace','SFMono-Regular','Menlo','monospace'] } } } }
+</script>
+<style>
+  :root { --bg:#07070a; --panel:#0c0c11; --line:rgba(255,255,255,.08); --glass:rgba(255,255,255,.04); --glass-2:rgba(255,255,255,.07); --cyan:#5ee7ff; --violet:#8b7bff; --pink:#ff7ad9; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body { background:var(--bg); color:#fff; font-family:Inter,ui-sans-serif,system-ui,sans-serif; -webkit-font-smoothing:antialiased; overflow:hidden; }
+  .scroll::-webkit-scrollbar { width:8px; }
+  .scroll::-webkit-scrollbar-thumb { background:rgba(255,255,255,.12); border-radius:8px; border:2px solid transparent; background-clip:padding-box; }
+  .grad { background:linear-gradient(135deg,var(--cyan),var(--violet) 55%,var(--pink)); }
+  .grad-soft { background:linear-gradient(135deg,rgba(94,231,255,.18),rgba(139,123,255,.18) 55%,rgba(255,122,217,.18)); }
+  .ring-grad { position:relative; }
+  .ring-grad::before { content:""; position:absolute; inset:0; padding:1px; border-radius:inherit; background:linear-gradient(135deg,rgba(94,231,255,.7),rgba(139,123,255,.5),rgba(255,122,217,.7)); -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0); -webkit-mask-composite:xor; mask-composite:exclude; pointer-events:none; }
+  .glass { background:var(--glass); border:1px solid var(--line); backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px); }
+  .grid-bg { background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px); background-size:32px 32px; mask-image:radial-gradient(ellipse at 50% 0%,#000 20%,transparent 75%); -webkit-mask-image:radial-gradient(ellipse at 50% 0%,#000 20%,transparent 75%); }
+  @keyframes orb { 0%{transform:rotate(0)} 100%{transform:rotate(360deg)} }
+  @keyframes pulse-dot { 0%,100%{opacity:1; transform:scale(1)} 50%{opacity:.4; transform:scale(.7)} }
+  @keyframes shimmer { 0%{background-position:-200% 0} 100%{background-position:200% 0} }
+  @keyframes rise { from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:none} }
+  @keyframes caret { 50%{opacity:0} }
+  .orb-spin { animation:orb 8s linear infinite; }
+  .dot-pulse { animation:pulse-dot 1.6s ease-in-out infinite; }
+  .rise { animation:rise .5s cubic-bezier(.2,.8,.2,1) both; }
+  .shimmer { background:linear-gradient(90deg,rgba(255,255,255,.05) 25%,rgba(255,255,255,.14) 50%,rgba(255,255,255,.05) 75%); background-size:200% 100%; animation:shimmer 2.4s linear infinite; }
+  .caret { animation:caret 1s steps(1) infinite; }
+  .mode-btn[aria-selected="true"] { color:#000; }
+  .mode-btn[aria-selected="false"] { color:#fff; }
+  .mode-btn[aria-selected="false"]:hover { background:var(--glass-2); }
+  .btn:focus-visible,.mode-btn:focus-visible,textarea:focus-visible { outline:2px solid #fff; outline-offset:2px; }
+  @media (prefers-reduced-motion:reduce){ *{animation:none!important; transition:none!important} }
+</style>
+</head>
+<body>
+
+<!-- Editor backdrop (VS Code mock) -->
+<div class="h-full w-full flex">
+  <!-- Activity bar -->
+  <nav class="hidden md:flex w-12 shrink-0 flex-col items-center gap-2 py-2 border-r" style="background:#050507;border-color:var(--line)" aria-label="Activity bar">
+    <button class="btn h-12 w-12 grid place-items-center relative" aria-label="Designer" aria-current="true">
+      <span class="absolute left-0 top-2 bottom-2 w-0.5 bg-white rounded-r"></span>
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg>
+    </button>
+    <button class="btn h-12 w-12 grid place-items-center" aria-label="Files"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg></button>
+    <button class="btn h-12 w-12 grid place-items-center" aria-label="Search"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg></button>
+    <button class="btn h-12 w-12 grid place-items-center" aria-label="Source control"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round"><circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="9" r="2"/><path d="M6 8v8M18 11c0 4-6 3-12 5"/></svg></button>
+  </nav>
+
+  <!-- SIDEBAR -->
+  <aside class="relative w-full md:w-[400px] md:shrink-0 h-full flex flex-col overflow-hidden border-r" style="background:var(--panel);border-color:var(--line)" aria-label="Designer agent">
+    <!-- ambient -->
+    <div class="pointer-events-none absolute inset-0 grid-bg"></div>
+    <div class="pointer-events-none absolute -top-24 -left-16 h-64 w-64 rounded-full blur-3xl opacity-40" style="background:radial-gradient(circle,rgba(94,231,255,.5),transparent 70%)"></div>
+    <div class="pointer-events-none absolute -top-16 -right-24 h-64 w-64 rounded-full blur-3xl opacity-40" style="background:radial-gradient(circle,rgba(255,122,217,.45),transparent 70%)"></div>
+
+    <!-- Header -->
+    <header class="relative z-10 flex items-center justify-between h-12 px-4 border-b" style="border-color:var(--line)">
+      <div class="flex items-center gap-2">
+        <div class="relative h-6 w-6">
+          <div class="absolute inset-0 rounded-full grad orb-spin"></div>
+          <div class="absolute inset-0.5 rounded-full" style="background:#0c0c11"></div>
+          <div class="absolute inset-2 rounded-full grad"></div>
+        </div>
+        <h1 class="text-sm font-semibold tracking-tight text-white">Designer</h1>
+        <span class="h-6 px-2 inline-flex items-center rounded-full text-[10px] leading-4 font-semibold tracking-widest uppercase text-black bg-white">Beta</span>
+      </div>
+      <div class="flex items-center gap-1">
+        <button class="btn h-8 w-8 grid place-items-center rounded-lg hover:bg-white/10 transition" aria-label="New chat"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>
+        <button class="btn h-8 w-8 grid place-items-center rounded-lg hover:bg-white/10 transition" aria-label="History"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg></button>
+        <button class="btn h-8 w-8 grid place-items-center rounded-lg hover:bg-white/10 transition" aria-label="More"><svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
+      </div>
+    </header>
+
+    <!-- Mode switcher -->
+    <div class="relative z-10 px-4 pt-4">
+      <div id="modes" role="tablist" aria-label="Agent mode" class="glass relative grid grid-cols-3 p-1 rounded-2xl h-12 shadow-[0_8px_32px_rgba(0,0,0,.4)]">
+        <span id="thumb" class="absolute top-1 bottom-1 left-1 rounded-xl bg-white shadow-[0_0_24px_rgba(139,123,255,.55)] transition-all duration-300" style="width:calc((100% - 8px)/3);transition-timing-function:cubic-bezier(.3,1.2,.4,1)"></span>
+        <button role="tab" aria-selected="true" data-i="0" class="mode-btn relative z-10 rounded-xl text-xs font-semibold flex items-center justify-center gap-1 transition">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/></svg>Design
+        </button>
+        <button role="tab" aria-selected="false" data-i="1" class="mode-btn relative z-10 rounded-xl text-xs font-semibold flex items-center justify-center gap-1 transition">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M8 8l-5 4 5 4M16 8l5 4-5 4M14 5l-4 14"/></svg>Build
+        </button>
+        <button role="tab" aria-selected="false" data-i="2" class="mode-btn relative z-10 rounded-xl text-xs font-semibold flex items-center justify-center gap-1 transition">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>Review
+        </button>
+      </div>
+      <p id="modeHint" class="mt-2 text-xs leading-4 text-white">Explore layouts, type and color. Generates one screen at a time.</p>
+    </div>
+
+    <!-- Conversation -->
+    <main class="scroll relative z-10 flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-4" aria-live="polite">
+
+      <!-- Context chips -->
+      <div class="flex flex-wrap gap-2 rise">
+        <span class="glass h-8 pl-2 pr-3 rounded-full inline-flex items-center gap-2 text-xs font-medium text-white">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
+          Sidebar.tsx
+        </span>
+        <span class="glass h-8 pl-2 pr-3 rounded-full inline-flex items-center gap-2 text-xs font-medium text-white">
+          <span class="h-2 w-2 rounded-full grad"></span>tokens.css
+        </span>
+        <span class="glass h-8 pl-2 pr-3 rounded-full inline-flex items-center gap-2 text-xs font-medium text-white">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8"/></svg>
+          Desktop · 1440
+        </span>
+      </div>
+
+      <!-- User message -->
+      <div class="flex justify-end rise" style="animation-delay:.08s">
+        <div class="max-w-[85%] rounded-2xl rounded-br-md px-4 py-2 text-sm leading-6 text-black bg-white shadow-[0_8px_24px_rgba(255,255,255,.08)]">
+          Design a pricing screen. Dark, calm, a little futuristic.
+        </div>
+      </div>
+
+      <!-- Agent message -->
+      <div class="flex gap-2 rise" style="animation-delay:.16s">
+        <div class="h-8 w-8 shrink-0 rounded-xl grad grid place-items-center">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8z"/></svg>
+        </div>
+        <div class="flex-1 min-w-0 flex flex-col gap-2">
+          <!-- Thinking timeline -->
+          <div class="glass rounded-2xl p-4 flex flex-col gap-2">
+            <div class="flex items-center justify-between">
+              <span class="text-[10px] leading-4 font-semibold tracking-widest uppercase text-white">Plan</span>
+              <span class="font-mono text-[10px] leading-4 text-white">00:07</span>
+            </div>
+            <ol class="flex flex-col gap-2 text-xs leading-4 text-white">
+              <li class="flex items-center gap-2"><span class="h-4 w-4 rounded-full bg-white grid place-items-center"><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-10"/></svg></span>Read design tokens</li>
+              <li class="flex items-center gap-2"><span class="h-4 w-4 rounded-full bg-white grid place-items-center"><svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l5 5 9-10"/></svg></span>Set 8pt grid and type scale</li>
+              <li class="flex items-center gap-2"><span class="relative h-4 w-4 rounded-full grad grid place-items-center"><span class="h-2 w-2 rounded-full bg-black dot-pulse"></span></span><span class="font-semibold">Composing layout</span><span class="caret">▍</span></li>
+              <li class="flex items-center gap-2"><span class="h-4 w-4 rounded-full border border-white/40"></span>Export pricing_1.html</li>
+            </ol>
+          </div>
+
+          <p class="text-sm leading-6 text-white">Direction: <span class="font-semibold">Quiet Neon</span>. Deep ink surface, glass cards, one gradient accent. Here is the first pass.</p>
+
+          <!-- Design preview card -->
+          <div class="ring-grad rounded-2xl p-px shadow-[0_16px_48px_rgba(139,123,255,.25)]">
+            <div class="rounded-2xl overflow-hidden" style="background:#0a0a0f">
+              <div class="flex items-center justify-between h-8 px-2 border-b" style="border-color:var(--line)">
+                <div class="flex items-center gap-1"><i class="h-2 w-2 rounded-full bg-white/30"></i><i class="h-2 w-2 rounded-full bg-white/30"></i><i class="h-2 w-2 rounded-full bg-white/30"></i></div>
+                <span class="font-mono text-[10px] leading-4 text-white">pricing_1.html</span>
+                <span class="h-4 w-4"></span>
+              </div>
+              <!-- CSS placeholder screen -->
+              <div class="relative p-4 h-48">
+                <div class="absolute inset-0 opacity-60" style="background:radial-gradient(circle at 50% 0%,rgba(139,123,255,.45),transparent 60%)"></div>
+                <div class="relative flex flex-col items-center gap-2">
+                  <div class="h-2 w-16 rounded-full bg-white/70"></div>
+                  <div class="h-4 w-32 rounded-full bg-white"></div>
+                  <div class="h-2 w-24 rounded-full bg-white/30"></div>
+                </div>
+                <div class="relative mt-4 grid grid-cols-3 gap-2">
+                  <div class="glass h-24 rounded-xl p-2 flex flex-col gap-2"><div class="h-2 w-6 rounded-full bg-white/60"></div><div class="h-4 w-8 rounded bg-white/90"></div><div class="mt-auto h-4 rounded-md bg-white/10"></div></div>
+                  <div class="h-24 rounded-xl p-2 flex flex-col gap-2 ring-grad grad-soft" style="background-color:rgba(255,255,255,.06)"><div class="h-2 w-6 rounded-full bg-white/80"></div><div class="h-4 w-10 rounded bg-white"></div><div class="mt-auto h-4 rounded-md grad"></div></div>
+                  <div class="glass h-24 rounded-xl p-2 flex flex-col gap-2"><div class="h-2 w-6 rounded-full bg-white/60"></div><div class="h-4 w-8 rounded bg-white/90"></div><div class="mt-auto h-4 rounded-md bg-white/10"></div></div>
+                </div>
+              </div>
+              <div class="flex items-center gap-2 p-2 border-t" style="border-color:var(--line)">
+                <button class="btn h-8 px-4 rounded-lg bg-white text-black text-xs font-semibold hover:shadow-[0_0_24px_rgba(255,255,255,.35)] transition">Open preview</button>
+                <button class="btn h-8 px-4 rounded-lg glass text-xs font-semibold text-white hover:bg-white/10 transition">Apply to code</button>
+                <button class="btn ml-auto h-8 w-8 grid place-items-center rounded-lg hover:bg-white/10 transition" aria-label="Copy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Quick refine -->
+          <div class="flex flex-wrap gap-2 pt-1">
+            <button class="btn glass h-8 px-3 rounded-full text-xs font-medium text-white hover:bg-white/10 transition">Bolder type</button>
+            <button class="btn glass h-8 px-3 rounded-full text-xs font-medium text-white hover:bg-white/10 transition">Add annual toggle</button>
+            <button class="btn glass h-8 px-3 rounded-full text-xs font-medium text-white hover:bg-white/10 transition">Mobile view</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Generating skeleton -->
+      <div class="flex gap-2 rise" style="animation-delay:.24s">
+        <div class="h-8 w-8 shrink-0"></div>
+        <div class="flex-1 glass rounded-2xl p-4 flex flex-col gap-2">
+          <div class="flex items-center gap-2 text-xs leading-4 text-white"><span class="h-2 w-2 rounded-full grad dot-pulse"></span>Generating variant 2</div>
+          <div class="shimmer h-2 rounded-full w-full"></div>
+          <div class="shimmer h-2 rounded-full w-3/4"></div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Composer -->
+    <footer class="relative z-10 p-4 pt-2">
+      <div class="ring-grad rounded-2xl shadow-[0_16px_48px_rgba(0,0,0,.6)]">
+        <div class="rounded-2xl p-2 flex flex-col gap-2" style="background:rgba(12,12,17,.92);backdrop-filter:blur(16px)">
+          <label for="prompt" class="sr-only">Describe your design</label>
+          <textarea id="prompt" rows="2" placeholder="Describe the screen you want…" class="w-full resize-none bg-transparent px-2 pt-2 text-sm leading-6 text-white placeholder:text-white/50 outline-none"></textarea>
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-1">
+              <button class="btn h-8 w-8 grid place-items-center rounded-lg hover:bg-white/10 transition" aria-label="Attach"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11l-9 9a5 5 0 0 1-7-7l9-9a3.5 3.5 0 0 1 5 5l-9 9a2 2 0 0 1-3-3l8-8"/></svg></button>
+              <button class="btn h-8 px-2 inline-flex items-center gap-1 rounded-lg hover:bg-white/10 transition text-xs font-medium text-white" aria-label="Model">
+                <span class="h-2 w-2 rounded-full grad"></span>Auto
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10l5 5 5-5"/></svg>
+              </button>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="hidden sm:inline font-mono text-[10px] leading-4 text-white">⏎ send</span>
+              <button class="btn h-8 w-8 grid place-items-center rounded-xl bg-white hover:shadow-[0_0_24px_rgba(94,231,255,.6)] transition" aria-label="Send"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="mt-2 flex items-center justify-between text-[10px] leading-4 text-white">
+        <span class="inline-flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-white dot-pulse"></span>Connected · 128k context</span>
+        <span class="font-mono">Design mode</span>
+      </div>
+    </footer>
+  </aside>
+
+  <!-- Editor (desktop only) -->
+  <section class="hidden md:flex flex-1 flex-col min-w-0" style="background:#09090c" aria-hidden="true">
+    <div class="flex h-8 border-b" style="border-color:var(--line);background:#050507">
+      <div class="px-4 flex items-center gap-2 text-xs text-white border-r" style="border-color:var(--line);background:#09090c"><span class="h-2 w-2 rounded-full grad"></span>Sidebar.tsx</div>
+      <div class="px-4 flex items-center text-xs text-white">tokens.css</div>
+    </div>
+    <div class="flex-1 p-6 font-mono text-xs leading-6 text-white overflow-hidden">
+      <div class="flex flex-col gap-2 max-w-xl">
+        <div class="flex gap-4"><span class="w-4 text-right">1</span><div class="h-2 w-40 rounded bg-white/20 self-center"></div></div>
+        <div class="flex gap-4"><span class="w-4 text-right">2</span><div class="h-2 w-64 rounded bg-white/10 self-center"></div></div>
+        <div class="flex gap-4"><span class="w-4 text-right">3</span><div class="h-2 w-48 rounded bg-white/20 self-center ml-4"></div></div>
+        <div class="flex gap-4"><span class="w-4 text-right">4</span><div class="h-2 w-56 rounded bg-white/10 self-center ml-4"></div></div>
+        <div class="flex gap-4"><span class="w-4 text-right">5</span><div class="h-2 w-24 rounded bg-white/20 self-center"></div></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const hints = [
+    'Explore layouts, type and color. Generates one screen at a time.',
+    'Turn approved designs into production components in your repo.',
+    'Audit spacing, contrast and consistency against your tokens.'
+  ];
+  const label = ['Design mode','Build mode','Review mode'];
+  const tabs = [...document.querySelectorAll('.mode-btn')];
+  const thumb = document.getElementById('thumb');
+  const hint = document.getElementById('modeHint');
+  const lbl = document.querySelector('footer .font-mono:last-child');
+  const set = i => {
+    tabs.forEach((t, k) => t.setAttribute('aria-selected', String(k === i)));
+    thumb.style.transform = `translateX(${i * 100}%)`;
+    hint.textContent = hints[i];
+    lbl.textContent = label[i];
+  };
+  tabs.forEach(t => t.addEventListener('click', () => set(+t.dataset.i)));
+  document.getElementById('modes').addEventListener('keydown', e => {
+    const cur = tabs.findIndex(t => t.getAttribute('aria-selected') === 'true');
+    const n = e.key === 'ArrowRight' ? (cur + 1) % 3 : e.key === 'ArrowLeft' ? (cur + 2) % 3 : -1;
+    if (n < 0) return;
+    set(n); tabs[n].focus();
+  });
+})();
+</script>
+</body>
+</html>

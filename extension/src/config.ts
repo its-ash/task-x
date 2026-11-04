@@ -77,6 +77,8 @@ export interface WindowChoice {
   effort?: Effort;
   /** The custom chat mode in use (a `.chatmode.md` name); unset is the default mode. */
   chatMode?: string;
+  /** The custom agent every task runs as (an `agents/list` name); unset is the default lead. */
+  agent?: string;
   /** Tools and MCP servers turned off for this window's chats (the tools chip). */
   offTools?: string[];
 }

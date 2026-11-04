@@ -3,7 +3,7 @@
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
   const log = $('log'), input = $('input'), send = $('send'), progress = $('progress');
-  const modelBtn = $('modelBtn'), settingsBtn = $('settingsBtn'), effortBtn = $('effortBtn'), mcpBtn = $('mcpBtn');
+  const modelBtn = $('modelBtn'), agentBtn = $('agentBtn'), settingsBtn = $('settingsBtn'), effortBtn = $('effortBtn'), mcpBtn = $('mcpBtn');
   const nightPlanBtn = $('nightPlanBtn'), nightLoopBtn = $('nightLoopBtn');
   const refineBtn = $('refineBtn');
 
@@ -297,6 +297,49 @@
   modelBtn.addEventListener('click', () => openModelMenu(modelBtn, 'main'));
   nightPlanBtn.addEventListener('click', () => openModelMenu(nightPlanBtn, 'planner'));
   nightLoopBtn.addEventListener('click', () => openModelMenu(nightLoopBtn, 'worker'));
+  // ---------- Agent picker: every task runs as the picked custom agent (`@name`) ----------
+  const pickAgent = (name) => { state.agent = name; vscode.postMessage({ type: 'selectAgent', name: name ?? '' }); renderToolbar(); };
+  const agentDesc = (a) => [a.writes === false ? 'read-only' : '', a.model ? `model ${a.model}` : '', a.description].filter(Boolean).join(' · ');
+  let agentMenu = null;
+  // Redrawn on each key and when the agent list arrives; the search box stays.
+  function fillAgents() {
+    if (!agentMenu) return;
+    const { list, input: q } = agentMenu;
+    const s = q.value.trim().toLowerCase();
+    const hit = (a) => !s || [a.name, a.description, a.source, a.model].some((x) => String(x || '').toLowerCase().includes(s));
+    const found = agents.filter(hit);
+    list.replaceChildren();
+    if (!s) menuItem(list, { icon: 'robot', title: 'Default', desc: 'task-x leads the task and picks subagents itself.', checked: !state.agent, onSelect: () => pickAgent(null) });
+    for (const a of found) menuItem(list, { icon: a.writes === false ? 'eye' : 'person', title: a.name, desc: agentDesc(a), checked: state.agent === a.name, onSelect: () => pickAgent(a.name) });
+    if (!agents.length) list.append(el('div', 'menu-empty', 'No custom agents. Add one as .claude/agents/<name>.md.'));
+    else if (!found.length) list.append(el('div', 'menu-empty', `No agent matches “${q.value.trim()}”.`));
+    agentMenu.menu.place?.();
+  }
+  agentBtn.addEventListener('click', () => {
+    vscode.postMessage({ type: 'listSkills' });
+    openMenu(agentBtn, (menu) => {
+      menu.setAttribute('aria-label', 'Agent');
+      menu.classList.add('searchable');
+      const box = el('div', 'menu-search');
+      const q = el('input');
+      q.type = 'search';
+      q.placeholder = 'Search agents';
+      q.setAttribute('aria-label', 'Search agents');
+      q.maxLength = 256;
+      q.addEventListener('input', fillAgents);
+      q.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        list.querySelector('.menu-item')?.click();
+      });
+      box.append(icon('search'), q);
+      const list = el('div', 'menu-list');
+      menu.addEventListener('toggle', (e) => { if (e.newState === 'closed' && agentMenu?.menu === menu) agentMenu = null; });
+      menu.append(box, list);
+      agentMenu = { menu, list, input: q };
+      fillAgents();
+    });
+  });
   // ---------- Settings dialog: edit mode, Loop Mode, and auto-commit ----------
   const EDIT_MODES = {
     auto: ['rocket', 'Auto', 'Edits, deletes, commands, and tools run without asking. Commands stay in the sandbox.'],
@@ -542,6 +585,7 @@
   renderCapsChip();
   vscode.postMessage({ type: 'listMcp' });
   vscode.postMessage({ type: 'listTools' });
+  vscode.postMessage({ type: 'listSkills' });
   let settingsMenu = null;
   function toggleRow(menu, { key, ic, title, desc, on, disabled, onToggle }) {
     const b = el('button', 'menu-item setting-row');
@@ -1587,6 +1631,11 @@
     else delete modelBtn.dataset.brand;
     modelBtn.replaceChildren(...(act?.model ? [icon(groupIcon(act), 'brand-icon')] : []), el('span', 'text', model), ...(win ? [el('span', 'model-window', fmtWindow(win))] : []), icon('chevron-down'));
     modelBtn.title = win ? `Model: ${model}. Context window: ${win.toLocaleString()} tokens.` : `Model: ${model}`;
+    agentBtn.replaceChildren(icon(state.agent ? 'person' : 'robot'), el('span', 'text', state.agent || 'Agent'), icon('chevron-down'));
+    agentBtn.title = state.agent ? `Agent: ${state.agent}. Every task runs as this agent: its instructions, tools, and model. Start a message with @name to use another one.` : 'Agent: default. Pick a custom agent to run every task as it.';
+    agentBtn.setAttribute('aria-label', agentBtn.title);
+    agentBtn.classList.toggle('on', !!state.agent);
+    agentBtn.disabled = state.busy;
     // Loop Mode shows only its Think and Loop models in place of the chat model.
     nightPlanBtn.hidden = nightLoopBtn.hidden = !state.night;
     modelBtn.hidden = !!state.night;
@@ -1628,7 +1677,7 @@
     form.setAttribute('aria-busy', String(state.busy));
     input.placeholder = state.busy ? 'Enter steers the running task. Ctrl+Enter queues the next message. Stop ends the task.' : `${PLACEHOLDER} (Enter to send, Shift+Enter for a new line)`;
   }
-  for (const b of [modelBtn, nightPlanBtn, nightLoopBtn]) { b.setAttribute('aria-haspopup', 'menu'); b.setAttribute('aria-expanded', 'false'); }
+  for (const b of [modelBtn, agentBtn, nightPlanBtn, nightLoopBtn]) { b.setAttribute('aria-haspopup', 'menu'); b.setAttribute('aria-expanded', 'false'); }
 
   // ---------- Context chips: the active file and selection that go with the message ----------
   const ctxRow = $('ctx'), indexBtn = $('indexBtn');
@@ -2423,7 +2472,7 @@
         scroll(true);
         break;
       case 'status':
-        state = { ...state, busy: m.busy, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker, refineModel: 'refineModel' in m ? m.refineModel : state.refineModel, helperModel: 'helperModel' in m ? m.helperModel : state.helperModel, effort: 'effort' in m ? m.effort : state.effort, sandbox: m.sandbox ?? state.sandbox, chatMode: 'chatMode' in m ? m.chatMode : state.chatMode };
+        state = { ...state, busy: m.busy, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker, refineModel: 'refineModel' in m ? m.refineModel : state.refineModel, helperModel: 'helperModel' in m ? m.helperModel : state.helperModel, agent: 'agent' in m ? m.agent : state.agent, effort: 'effort' in m ? m.effort : state.effort, sandbox: m.sandbox ?? state.sandbox, chatMode: 'chatMode' in m ? m.chatMode : state.chatMode };
         renderToolbar();
         fillSettings();
         break;
@@ -2502,6 +2551,7 @@
         mcpResources = m.mcpResources || [];
         if (slashOpen) renderSlash();
         fillCaps();
+        fillAgents();
         break;
       case 'files':
         if (m.query === fileQuery) { fileItems = m.items; if (slashOpen && menuKind === 'file') renderFiles(m.query); }

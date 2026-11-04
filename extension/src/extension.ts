@@ -94,9 +94,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
       const m = await rt.client.request<{ servers: McpServerStatus[] }>('mcp/configure', { servers, workspaceTrusted });
       for (const sv of m.servers) sv.error ? out.warn(`MCP ${sv.name}: ${sv.error}`) : out.info(`MCP ${sv.name}: ${sv.tools.length} tools`);
       const locked = m.servers.filter((s) => s.authRequired).map((s) => s.name);
-      if (locked.length) {
-        void vscode.window.showWarningMessage(`task-x: ${locked.join(', ')} ${locked.length > 1 ? 'need' : 'needs'} sign-in.`, 'Sign In').then((pick) => pick && signIn(rt.client, locked.length === 1 ? locked[0] : undefined));
-      }
+      // No pop-up: the tools chip shows "Needs sign-in", and the user signs in from there.
+      if (locked.length) out.info(`MCP ${locked.join(', ')}: ${locked.length > 1 ? 'need' : 'needs'} sign-in`);
     } catch (e) {
       vscode.window.showErrorMessage(`task-x MCP: ${describeError(e)}`);
     }
