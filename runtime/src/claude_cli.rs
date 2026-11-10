@@ -30,8 +30,11 @@ pub const APPROVAL_ENV: &str = "TASK_X_APPROVAL";
 /// The MCP tool Claude Code calls (`--permission-prompt-tool`) when a tool call needs permission.
 pub const APPROVE_TOOL: &str = "approve";
 const MAX_APPROVAL_BYTES: u64 = 1024 * 1024;
-/// Token budget of the index excerpts sent with each prompt.
-const CONTEXT_BUDGET_TOKENS: usize = 6_000;
+/// Token budget of the index excerpts sent with a prompt. They stay in the session's history, so
+/// every later turn pays for them again.
+const CONTEXT_BUDGET_TOKENS: usize = 2_500;
+/// Claude Code's model for its subagents (`Task`/`Agent` calls).
+const SUBAGENT_MODEL_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -79,6 +82,9 @@ pub struct Params {
     /// `.mcp.json`, plugins), so these are denied by name: their tools never run.
     #[serde(default)]
     pub disabled_mcp: Vec<String>,
+    /// Model for Claude Code's subagents (for example `sonnet` or `haiku`). Unset: the main model.
+    #[serde(default)]
+    pub subagent_model: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -180,7 +186,7 @@ pub fn validate(p: &Params) -> Result<(), String> {
     if !PERMISSION_MODES.contains(&p.permission_mode.as_str()) {
         return Err(format!("permissionMode must be one of {PERMISSION_MODES:?}"));
     }
-    for t in p.model.iter().chain(p.session_id.iter()).chain(p.allowed_tools.iter()) {
+    for t in p.model.iter().chain(p.subagent_model.iter()).chain(p.session_id.iter()).chain(p.allowed_tools.iter()) {
         if !valid_token(t) {
             return Err(format!("invalid value '{t}'"));
         }
@@ -975,19 +981,55 @@ fn instruction_note(host: &Host) -> String {
     [guidance, (!memory.is_empty()).then_some(memory)].into_iter().flatten().collect::<Vec<_>>().join("\n\n")
 }
 
+/// True when the text names something in the index: a file (`src/a.rs`, `a.rs:12`), or an
+/// identifier written as code (snake_case, camelCase, PascalCase with an inner capital, or in
+/// backticks) that the index defines. Plain words ("do the recommended") name nothing.
+fn names_code(index: &crate::context::index::Index, text: &str) -> bool {
+    for raw in text.split(|c: char| c.is_whitespace() || "()[]{},;:'\"<>!?=".contains(c)) {
+        let tok = raw.trim_matches(|c: char| "`*.#@".contains(c)).trim_start_matches("./");
+        if tok.len() < 3 {
+            continue;
+        }
+        let ext = tok.rsplit_once('.').is_some_and(|(stem, e)| !stem.is_empty() && (1..=5).contains(&e.len()) && e.chars().all(|c| c.is_ascii_alphanumeric()));
+        if tok.contains('/') || ext {
+            if index.files().any(|f| f.rel == tok || f.rel.ends_with(&format!("/{tok}"))) {
+                return true;
+            }
+            continue;
+        }
+        let code_shaped = tok.contains('_') || tok.chars().skip(1).any(char::is_uppercase) || raw.starts_with('`');
+        if code_shaped && tok.chars().all(|c| c.is_alphanumeric() || c == '_') && !index.definitions(tok).is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
 /// The workspace summary and the index excerpts that match the request, so Claude Code does not
-/// have to explore the file tree first.
-fn repo_context(host: &Host, request: &str) -> String {
+/// have to explore the file tree first. A resumed session already has the summary, and its
+/// follow-ups ("do it", "looks good") rarely match useful code: it gets excerpts only when the
+/// request names a file or symbol of the index.
+fn repo_context(host: &Host, request: &str, resumed: bool) -> String {
     use crate::context::retrieve;
     let ws = host.workspace.read().expect("workspace lock");
     let Some(ws) = ws.as_ref() else { return String::new() };
-    let langs: Vec<String> = ws.project.languages.iter().take(5).map(|l| format!("{} ({})", l.language, l.files)).collect();
-    let mut out = format!(
-        "<repository_context>\nWorkspace: {} files indexed. Languages: {}.\nExcerpts selected automatically from the task-x index for this request. They may be incomplete; read files with tools before editing them. Use the task-x search tools (search_regex, find_symbol, find_references) instead of listing the file tree.\n",
-        ws.index.stats().files,
-        if langs.is_empty() { "unknown".into() } else { langs.join(", ") },
-    );
+    if resumed && !names_code(&ws.index, request) {
+        return String::new();
+    }
     let r = retrieve::retrieve(&ws.index, request, &retrieve::Options { budget_tokens: CONTEXT_BUDGET_TOKENS, focus_paths: &[] });
+    let mut out = if resumed {
+        if r.snippets.is_empty() {
+            return String::new();
+        }
+        "<repository_context>\nExcerpts from the task-x index for this request. They may be incomplete; read files with tools before editing them.\n".to_owned()
+    } else {
+        let langs: Vec<String> = ws.project.languages.iter().take(5).map(|l| format!("{} ({})", l.language, l.files)).collect();
+        format!(
+            "<repository_context>\nWorkspace: {} files indexed. Languages: {}.\nExcerpts selected automatically from the task-x index for this request. They may be incomplete; read files with tools before editing them. Use the task-x search tools (search_regex, find_symbol, find_references) instead of listing the file tree.\n",
+            ws.index.stats().files,
+            if langs.is_empty() { "unknown".into() } else { langs.join(", ") },
+        )
+    };
     for s in &r.snippets {
         let f = crate::agent::prompt::fence_for(&s.text);
         out.push_str(&format!("\n{}:{}-{} ({})\n{f}\n{}\n{f}\n", s.path, s.start_line, s.end_line, s.reason, s.text));
@@ -1025,7 +1067,11 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
         };
         approvals = Some(tokio::spawn(serve_approvals(listener, token, p.task_id.clone(), ah)));
     }
-    let mut child = Command::new(&p.cli_path)
+    let mut cmd = Command::new(&p.cli_path);
+    if let Some(m) = &p.subagent_model {
+        cmd.env(SUBAGENT_MODEL_ENV, m);
+    }
+    let mut child = cmd
         .args(args(&p, exe.as_deref().map(|e| (e, root.as_path())), &instruction_note(&host), approval.as_deref()))
         .current_dir(&root)
         .stdin(Stdio::piped())
@@ -1036,7 +1082,7 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
         .map_err(|e| format!("could not start Claude Code: {e}"))?;
     // The prompt goes through stdin so it can never be read as a CLI flag. Stdin stays open for steering.
     let mut stdin = child.stdin.take();
-    if !write_user(&mut stdin, prompt_content(&p, &repo_context(&host, &p.prompt))).await {
+    if !write_user(&mut stdin, prompt_content(&p, &repo_context(&host, &p.prompt, p.session_id.is_some()))).await {
         return Err("could not send the prompt to Claude Code".into());
     }
     let inbox = Inbox::open(host.steers.clone(), &p.task_id);
@@ -1267,6 +1313,23 @@ mod tests {
     }
 
     #[test]
+    fn follow_ups_get_excerpts_only_when_they_name_code() {
+        let root = crate::context::index::tests::temp_repo(&[
+            ("src/config.rs", "pub struct RunParams;\npub fn parse_config() {}\npub fn Recommended() {}\n"),
+            ("web/chat.js", "function recommended() {}\n"),
+        ]);
+        let mut idx = crate::context::index::Index::new(root.clone(), &[]).unwrap();
+        idx.refresh();
+        for named in ["fix parse_config", "see `Recommended`", "RunParams is wrong", "look at src/config.rs:2", "open chat.js."] {
+            assert!(names_code(&idx, named), "{named}");
+        }
+        for plain in ["do Recommended", "looks good, go ahead", "use_tabs please", "edit missing.rs", "e.g. this"] {
+            assert!(!names_code(&idx, plain), "{plain}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn subagent_calls_become_lanes_with_their_own_steps() {
         let mut m = Mapper::default();
         let lines = [
@@ -1329,8 +1392,10 @@ mod tests {
             effort: Some(crate::provider::types::Effort::Xhigh),
             sandbox: true,
             disabled_mcp: Vec::new(),
+            subagent_model: Some("haiku".into()),
         };
         validate(&p).unwrap();
+        assert!(validate(&Params { subagent_model: Some("--model opus".into()), ..p.clone() }).is_err(), "no flags through the model name");
         assert_eq!(prompt_content(&p, ""), json!("--help me"));
         let mut with = p.clone();
         with.images = vec![crate::provider::types::ImageInput { media_type: "image/png".into(), data: "iVBORw0KGgo=".into() }];

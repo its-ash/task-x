@@ -37,6 +37,9 @@ export const engine = (): 'anvil' | 'claudeCode' => ((chosenEngine() ?? vscode.w
 
 export const claudeModel = () => (chosenClaudeModel() ?? vscode.workspace.getConfiguration(SECTION).get<string>('claudeCode.model', '')).trim() || 'default';
 
+/** Model for Claude Code's subagents (`claude/run` `subagentModel`); undefined: the main model. */
+export const claudeSubagentModel = () => vscode.workspace.getConfiguration(SECTION).get<string>('claudeCode.subagentModel', 'sonnet').trim() || undefined;
+
 /**
  * Agent mode edits and runs sandboxed shell commands without asking in the auto and safe edit modes
  * (Claude Code keeps every command in its sandbox); in ask mode each edit and command goes to the

@@ -30,7 +30,7 @@ import {
   type SkillInfo,
 } from './protocol.js';
 import { type PluginEntry, catalog, managePlugin, newAgent, newCommand, newSkill, setPlugin, viewPlugin } from './catalog.js';
-import { CLAUDE_KIND, CLAUDE_LABEL, claudeAuth, claudeModel, claudePermissions, claudeSignIn, claudeSignOut, engine, findClaude, useClaude } from './claudeCode.js';
+import { CLAUDE_KIND, CLAUDE_LABEL, claudeAuth, claudeModel, claudePermissions, claudeSignIn, claudeSubagentModel, claudeSignOut, engine, findClaude, useClaude } from './claudeCode.js';
 import { CLAUDE_MODEL_INFO, type Listed, MODEL_LIST_TTL_MS, formatTokens, listModels, missingNote, withSaved } from './models.js';
 import { type JsonRpcClient, RpcError } from './rpc.js';
 import { diffStats, formatOutput } from './output.js';
@@ -2899,6 +2899,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         cliPath,
         chatMode: mode,
         model: model === 'default' ? undefined : model,
+        subagentModel: claudeSubagentModel(),
         sessionId: sessions[taskId],
         maxBudgetUsd: budget > 0 ? budget : undefined,
         useTaskTools: c.get<boolean>('claudeCode.useTaskXTools', true),
