@@ -38,7 +38,7 @@ There are three ways a skill applies:
 
 Run **task-x: List Skills** to see what task-x found.
 
-task-x comes with one on-demand skill, `vector-design`. It covers logos, icons, and other SVG graphics: the model writes the SVG, then checks it with the `render_svg` tool, which returns a PNG and a list of problems. A skill file named `vector-design` replaces it.
+task-x comes with one on-demand skill, `vector-design`. It covers logos, icons, and other SVG graphics: the model writes the SVG, then checks it with the `render_svg` tool, which returns a PNG and a list of problems. `export_png` writes PNG sizes (favicons, app icons) next to the SVG. In the chat, the newest render of each SVG shows as a preview under its step, with a light or dark background, **Open**, and **Export PNG…**. A skill file named `vector-design` replaces it.
 
 To write a skill from a prompt, run `/create-skill <what the skill does>`. The agent reads the project, writes `.claude/skills/<name>/SKILL.md`, and copies the skill folder to `.github/skills/<name>/`, so Claude Code and Copilot both read it.
 
@@ -76,7 +76,8 @@ maxIterations: 20
 You are a code reviewer. Report each defect with file:line and severity.
 ```
 
-- Locations, lowest precedence first: plugin `agents/` folders (named `<plugin>:<name>`), `~/.claude/agents/`, `~/.copilot/agents/`, `~/.task-x/agents/`, then `.claude/agents/`, `.github/agents/`, and `.task-x/agents/` in the workspace.
+- Built in: `designer` designs logos, icons, and other SVG graphics with the `vector-design` skill. It checks each version with `render_svg` and exports PNG sizes with `export_png`. It uses the selected model and has no shell. Run `@designer a logo for Acme`, or let the lead delegate to it. A file named `designer` in any agents folder replaces it.
+- Locations, lowest precedence first: the built-in agents, plugin `agents/` folders (named `<plugin>:<name>`), `~/.claude/agents/`, `~/.copilot/agents/`, `~/.task-x/agents/`, then `.claude/agents/`, `.github/agents/`, and `.task-x/agents/` in the workspace.
 - `tools` uses Claude Code names (`Read`, `Grep`, `Glob`, `Edit`, `Write`, `Bash`, `WebFetch`, `WebSearch`) or task-x tool names. An agent whose tools only read is read-only. `mode: read` or `mode: write` sets it directly.
 - `model` is a model id for the current provider, or `sonnet`, `opus`, or `haiku` on Anthropic. Other providers ignore those aliases.
 - **Delegation:** in Agent and Team mode, the lead sees the agents by name and description and calls `run_subagent { agent, objective }`. Several run at the same time, and each writing agent works in its own git worktree. In Team mode, each `run_plan` step can name an agent.

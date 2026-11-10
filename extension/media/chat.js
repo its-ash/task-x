@@ -18,7 +18,7 @@
     delete_file: 'Deleted', git_status: 'Git status', git_diff: 'Git diff', git_log: 'Git log', git_show: 'Git show', get_changed_files: 'Changed files',
     get_file_history: 'File history', format_code: 'Formatted', run_linter: 'Linted', run_tests: 'Ran tests', check_build: 'Built',
     get_diagnostics: 'Checked problems', run_command: 'Ran', read_skill: 'Loaded skill', web_fetch: 'Fetched',
-    multi_search: 'Searched', read_log: 'Read log', remember: 'Remembered', find_tool: 'Loaded tools', summarize_file: 'Summarized', render_svg: 'Rendered SVG',
+    multi_search: 'Searched', read_log: 'Read log', remember: 'Remembered', find_tool: 'Loaded tools', summarize_file: 'Summarized', render_svg: 'Rendered SVG', export_png: 'Exported PNG',
     Read: 'Read', Write: 'Wrote', Edit: 'Edited', MultiEdit: 'Edited', NotebookEdit: 'Edited notebook', Bash: 'Ran', BashOutput: 'Read output',
     KillShell: 'Stopped shell', Grep: 'Searched', Glob: 'Found files', LS: 'Listed', TodoWrite: 'Updated todos', WebFetch: 'Fetched',
     WebSearch: 'Searched web', browser: 'VS Code browser', Skill: 'Used skill', Task: 'Subagent', ExitPlanMode: 'Finished plan', run_subagent: 'Subagent', worktree_apply: 'Applied worktree', worktree_discard: 'Discarded worktree',
@@ -1143,6 +1143,7 @@
         if (it.stop && it.ok === undefined && state.busy) stopDot(row);
         attachOutput(row, it.id, it.tool, it.ok !== false, it.output, it.outputCut, it.ok === undefined && state.busy);
         tokenChip(row, it.tokens);
+        if (it.svg && it.ok) svgPreview(row, it.id, it.svg);
         current = null;
         break;
       }
@@ -1349,6 +1350,33 @@
     const after = row.querySelector(':scope > .detail');
     after ? after.after(chip) : row.append(chip);
   }
+  // A rendered SVG under its render_svg row: the file as it is now, with Open and Export PNG. One per
+  // file: a newer render of the same file replaces the older preview. The image comes from the
+  // extension (`svgImage`) and is never saved with the chat.
+  function svgPreview(row, id, path) {
+    log.querySelectorAll('.svg-preview').forEach((p) => { if (p.dataset.path === path) p.remove(); });
+    const box = el('div', 'svg-preview loading');
+    box.dataset.id = id;
+    box.dataset.path = path;
+    const frame = el('div', 'svg-frame');
+    const img = el('img');
+    img.alt = `Preview of ${path}`;
+    frame.append(img, el('span', 'svg-status', 'Rendering…'));
+    const bar = el('div', 'svg-bar');
+    const name = el('span', 'svg-name', path.split('/').pop());
+    name.title = path;
+    bar.append(
+      icon('file-media'), name, el('span', 'spacer'),
+      button('action', icon('color-mode'), () => box.classList.toggle('dark'), 'Switch between a light and a dark background'),
+      button('btn small secondary', [icon('go-to-file'), 'Open'], () => vscode.postMessage({ type: 'openFile', path }), `Open ${path}`),
+      button('btn small secondary', [icon('export'), 'Export PNG…'], () => vscode.postMessage({ type: 'exportSvg', path }), 'Save PNG files at the sizes you pick'),
+    );
+    box.append(frame, bar);
+    const term = row.nextElementSibling?.classList.contains('term') ? row.nextElementSibling : null;
+    (term || row).after(box);
+    vscode.postMessage({ type: 'svgPreview', id, path });
+  }
+
   // Shell commands always get a block: "Running…" until the result comes, then the output (or a note that it printed nothing).
   function attachOutput(row, id, tool, ok, output, cut, running = false) {
     const shell = EXPANDED.has(tool.split(' › ').pop());
@@ -2506,7 +2534,29 @@
           if (m.browser && !row.querySelector('.browser-where')) row.querySelector('.label')?.after(browserChip(m.browser));
           attachOutput(row, m.id, row.querySelector('.label')?.dataset.tool || '', m.ok, m.output, m.outputCut);
           tokenChip(row, m.tokens);
+          if (m.svg && m.ok) svgPreview(row, m.id, m.svg);
           scroll();
+        }
+        break;
+      }
+      case 'svgImage': {
+        const box = log.querySelector(`.svg-preview[data-id="${CSS.escape(m.id)}"]`);
+        if (!box) break;
+        box.classList.remove('loading');
+        const status = box.querySelector('.svg-status');
+        if (m.data) {
+          box.querySelector('img').src = `data:image/png;base64,${m.data}`;
+          status?.remove();
+        } else {
+          box.classList.add('failed');
+          if (status) status.textContent = m.error ? `No preview: ${m.error}` : 'No preview';
+        }
+        box.querySelector('.svg-warn')?.remove();
+        if (m.warnings?.length) {
+          const warn = el('span', 'svg-warn');
+          warn.append(icon('warning'), el('span', null, `${m.warnings.length} warning${m.warnings.length > 1 ? 's' : ''}`));
+          warn.title = m.warnings.join('\n');
+          box.querySelector('.svg-name')?.after(warn);
         }
         break;
       }

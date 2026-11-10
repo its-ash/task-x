@@ -905,8 +905,18 @@ pub fn specs(filter: impl Fn(&ToolDef) -> bool) -> Vec<ToolSpec> {
         .collect()
 }
 
-/// Truncates large results so one tool call cannot flood the model context.
-pub fn limit_output(v: Value) -> Value {
+/// Truncates large results so one tool call cannot flood the model context. An image result keeps
+/// its data whole: `fs::take_image` moves it out into an image part before it reaches the model.
+pub fn limit_output(mut v: Value) -> Value {
+    if v["image"] == true {
+        if let Some(data) = v.as_object_mut().and_then(|o| o.remove("base64")) {
+            let mut rest = limit_output(v);
+            if let Some(o) = rest.as_object_mut().filter(|o| !o.contains_key("truncated")) {
+                o.insert("base64".into(), data);
+            }
+            return rest;
+        }
+    }
     let s = v.to_string();
     if s.len() <= MAX_OUTPUT_CHARS {
         return v;
@@ -1210,6 +1220,9 @@ pub(crate) mod tests {
 
     #[test]
     fn limits_large_output() {
+        let big = "A".repeat(MAX_OUTPUT_CHARS * 3);
+        let img = limit_output(json!({ "image": true, "mediaType": "image/png", "base64": big }));
+        assert_eq!(img["base64"].as_str().map(str::len), Some(MAX_OUTPUT_CHARS * 3), "image data is not cut");
         let v = limit_output(json!({ "s": "x".repeat(MAX_OUTPUT_CHARS * 2) }));
         assert_eq!(v["truncated"], true);
     }

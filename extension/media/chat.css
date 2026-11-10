@@ -313,6 +313,21 @@ body[data-view="history"] #log, body[data-view="history"] #changes, body[data-vi
 .term.running .term-body { color: #8a8a8a; font-style: italic; }
 .term-note { padding: 4px 12px; font-size: 11px; color: #8a8a8a; background: #151515; border-top: 1px solid #262626; }
 
+/* SVG preview under a render_svg row: a checkerboard shows transparency; .dark checks it on black. */
+.svg-preview { margin: 4px 0 10px 18px; max-width: 360px; border-radius: var(--radius); background: var(--surface-high); overflow: hidden; }
+.svg-frame { position: relative; display: flex; align-items: center; justify-content: center; min-height: 120px; padding: 12px;
+  background-color: #fff; background-image: conic-gradient(#eee 25%, #fff 0 50%, #eee 0 75%, #fff 0); background-size: 16px 16px; }
+.svg-preview.dark .svg-frame { background-color: #111; background-image: conic-gradient(#1c1c1c 25%, #111 0 50%, #1c1c1c 0 75%, #111 0); }
+.svg-frame img { display: block; max-width: 100%; max-height: 240px; object-fit: contain; }
+.svg-preview.loading img, .svg-preview.failed img { display: none; }
+.svg-status { font-size: 12px; color: #666; }
+.svg-preview.dark .svg-status { color: #aaa; }
+.svg-preview.failed .svg-status { color: var(--warn); }
+.svg-bar { display: flex; align-items: center; gap: 6px; padding: 4px 6px 4px 10px; font-size: 12px; color: var(--on-surface-variant); }
+.svg-bar .spacer { flex: 1; }
+.svg-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--on-surface); }
+.svg-warn { display: inline-flex; align-items: center; gap: 3px; color: var(--warn); cursor: help; white-space: nowrap; }
+
 /* Approval */
 .approval { margin: 8px 0; border: 1px solid var(--border); border-radius: var(--radius); color: var(--on-surface); overflow: hidden; }
 .approval.resolved { border-color: var(--border); }

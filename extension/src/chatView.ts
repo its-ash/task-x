@@ -34,6 +34,7 @@ import { CLAUDE_KIND, CLAUDE_LABEL, claudeAuth, claudeModel, claudePermissions, 
 import { CLAUDE_MODEL_INFO, type Listed, MODEL_LIST_TTL_MS, formatTokens, listModels, missingNote, withSaved } from './models.js';
 import { type JsonRpcClient, RpcError } from './rpc.js';
 import { diffStats, formatOutput } from './output.js';
+import { EXPORT_SIZES, PREVIEW_SIZE, exportedFiles, isWorkspaceSvg, svgPathFrom } from './vector.js';
 import { formatCost, limits, routes, runParams } from './runParams.js';
 import { commitPaths, commitSubject } from './autoCommit.js';
 import { WorkspaceSync } from './workspace.js';
@@ -177,7 +178,7 @@ const MAX_LANE_STEPS = 30;
 type Item =
   | { kind: 'user'; text: string; mode: ChatMode; images?: number; context?: SentContext[]; id?: string; operations?: number[] }
   | { kind: 'assistant'; text: string }
-  | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string }; tokens?: number; browser?: string }
+  | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string }; tokens?: number; browser?: string; svg?: string }
   | { kind: 'file'; path: string; operation: number | null; diffKey: string; added: number; removed: number; diff: string; diffCut: boolean; undone?: boolean; kept?: boolean }
   | { kind: 'context'; text: string }
   | { kind: 'steer'; text: string }
@@ -270,7 +271,9 @@ type Inbound =
   | { type: 'openTask'; id: string }
   | { type: 'deleteTask'; id: string }
   | { type: 'clearHistory' }
-  | { type: 'answerQuestions'; callId: string; answers: unknown; other?: unknown };
+  | { type: 'answerQuestions'; callId: string; answers: unknown; other?: unknown }
+  | { type: 'svgPreview'; id: string; path: string }
+  | { type: 'exportSvg'; path: string };
 
 /** One saved task in the History tab. */
 interface TaskRow {
@@ -1493,6 +1496,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'openFile':
         await this.openFile(m.path);
         break;
+      case 'svgPreview':
+        if (typeof m.id === 'string' && typeof m.path === 'string') await this.svgPreview(m.id, m.path);
+        break;
+      case 'exportSvg':
+        if (typeof m.path === 'string') await this.exportSvg(m.path);
+        break;
       case 'undo':
         if (Number.isInteger(m.operation)) await this.undo(m.operation);
         break;
@@ -1638,7 +1647,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (!ev.background && isBackgroundStart(ev.output)) break;
         const id = `${tab.laneTaskId}:${ev.callId}`;
         const it = tab.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === id);
-        const out = { ...this.captureOutput(id, ev.tool, ev.ok, ev.output), tokens: ev.tokens };
+        // A subagent in a worktree drew its SVG there, not in the workspace: no preview until it merges.
+        const out = { ...this.captureOutput(id, ev.tool, ev.ok, ev.output), tokens: ev.tokens, svg: tab.dir ? undefined : svgPathFrom(ev.tool, ev.ok, ev.output) };
         if (it) Object.assign(it, { ok: ev.ok }, out);
         else push({ kind: 'tool', id, tool: ev.tool, detail: 'not run', ok: false, ...out });
         if (it) show({ type: 'toolDone', id, ok: ev.ok, ...out });
@@ -1808,6 +1818,55 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (named) this.lastBrowser = named;
     // A screenshot's image can push the name past the event's cut-off; it ran where the calls before it did.
     return named ?? (ok ? this.lastBrowser : undefined);
+  }
+
+  /** Only an SVG that a `render_svg` call in an open chat drew; never just any path from the webview. */
+  private knownSvg(rel: string): boolean {
+    return isWorkspaceSvg(rel) && this.allItems().some((i) => i.kind === 'tool' && i.svg === rel);
+  }
+
+  /** Renders the SVG as it is now (through the runtime, so it matches what the model saw) for the chat preview. */
+  private async svgPreview(id: string, rel: string): Promise<void> {
+    if (!this.knownSvg(rel)) return;
+    try {
+      const client = await this.getClient();
+      const r = await client.request<{ base64?: string; warnings?: string[] }>('tools/call', { name: 'render_svg', input: { path: rel, size: PREVIEW_SIZE, background: 'transparent' } });
+      this.post({ type: 'svgImage', id, path: rel, data: r.base64 ?? null, warnings: r.warnings ?? [] });
+    } catch (e) {
+      this.post({ type: 'svgImage', id, path: rel, data: null, error: describeError(e) });
+    }
+  }
+
+  /** Exports the SVG as PNG files at the sizes the user picks; the files join the review list and can be undone. */
+  private async exportSvg(rel: string): Promise<void> {
+    if (!this.knownSvg(rel)) return;
+    const picks = await vscode.window.showQuickPick(
+      EXPORT_SIZES.map((s) => ({ label: `${s.size} px`, description: s.label, picked: s.picked, size: s.size })),
+      { canPickMany: true, title: `Export ${rel.split('/').pop()} as PNG`, placeHolder: 'Pick the sizes; each becomes <name>-<size>.png next to the SVG' },
+    );
+    if (!picks?.length) return;
+    const sizes = picks.map((p) => p.size);
+    try {
+      const client = await this.getClient();
+      const run = (overwrite: boolean) => client.request<unknown>('tools/call', { name: 'export_png', input: { path: rel, sizes, overwrite } });
+      let r: unknown;
+      try {
+        r = await run(false);
+      } catch (e) {
+        const exists = /^(.+?) already exists/.exec(describeError(e));
+        if (!exists) throw e;
+        const ok = await vscode.window.showWarningMessage(`${exists[1].split('/').pop()} already exists. Replace the existing PNG files?`, { modal: true }, 'Replace');
+        if (ok !== 'Replace') return;
+        r = await run(true);
+      }
+      const files = exportedFiles(r);
+      void this.refreshChanges();
+      const root = WorkspaceSync.root();
+      const pick = await vscode.window.showInformationMessage(`task-x: exported ${files.map((f) => f.split('/').pop()).join(', ')}`, 'Reveal in Explorer');
+      if (pick && root && files[0]) await vscode.commands.executeCommand('revealInExplorer', vscode.Uri.joinPath(vscode.Uri.file(root), ...files[0].split('/')));
+    } catch (e) {
+      vscode.window.showErrorMessage(`task-x: PNG export failed: ${describeError(e)}`);
+    }
   }
 
   private async openFile(rel: string): Promise<void> {
@@ -2120,7 +2179,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (!e.background && isBackgroundStart(e.output)) break;
         const it = this.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === e.callId);
         // `tokens`: about how much this result adds to every later turn.
-        const out = { ...this.captureOutput(e.callId, e.tool, e.ok, e.output), tokens: e.tokens };
+        const out = { ...this.captureOutput(e.callId, e.tool, e.ok, e.output), tokens: e.tokens, svg: svgPathFrom(e.tool, e.ok, e.output) };
         if (it) {
           Object.assign(it, { ok: e.ok }, out);
           this.postChat({ type: 'toolDone', id: e.callId, ok: e.ok, ...out });

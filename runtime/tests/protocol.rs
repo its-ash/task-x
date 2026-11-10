@@ -293,7 +293,7 @@ async fn plugins_bring_agents_skills_and_commands() {
     rt.send(json!({"jsonrpc":"2.0","id":4,"method":"agents/list"})).await;
     let agents = rt.recv().await["result"].clone();
     let names: Vec<&str> = agents.as_array().unwrap().iter().filter_map(|a| a["name"].as_str()).collect();
-    assert_eq!(names, ["scout", "kit:fixer"], "the user's agents before plugin agents");
+    assert_eq!(names, ["scout", "kit:fixer", "designer"], "the user's agents, then plugin agents, then built-in ones");
     assert_eq!(agents[0]["writes"], false);
     rt.send(json!({"jsonrpc":"2.0","id":5,"method":"skills/list"})).await;
     let skills = rt.recv().await["result"].clone();
@@ -304,7 +304,7 @@ async fn plugins_bring_agents_skills_and_commands() {
     rt.send(json!({"jsonrpc":"2.0","id":7,"method":"plugins/configure","params":{"dirs":[plug],"disabled":["kit"]}})).await;
     assert_eq!(rt.recv().await["result"]["enabled"], 0);
     rt.send(json!({"jsonrpc":"2.0","id":8,"method":"agents/list"})).await;
-    assert_eq!(rt.recv().await["result"].as_array().unwrap().len(), 1, "a disabled plugin's agents are gone");
+    assert_eq!(rt.recv().await["result"].as_array().unwrap().len(), 2, "a disabled plugin's agents are gone");
     std::fs::remove_dir_all(base).ok();
 }
 

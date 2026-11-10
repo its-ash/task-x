@@ -6,7 +6,8 @@
 //! machine, and the SVG may not load other files or URLs.
 
 use super::schema::{int, object};
-use super::{Permission, ToolCtx, ToolDef, ToolError, ToolResult, parse, tool};
+use super::edit::{Change, record};
+use super::{Permission, ToolCtx, ToolDef, ToolError, ToolErrorKind, ToolResult, parse, tool};
 use regex::Regex;
 use resvg::tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
 use resvg::usvg;
@@ -19,6 +20,9 @@ const MAX_SVG_BYTES: u64 = 2 * 1024 * 1024;
 const DEFAULT_SIZE: u32 = 512;
 const MIN_SIZE: u32 = 16;
 const MAX_SIZE: u32 = 1024;
+/// Exports may be larger than what the model looks at (a 2048 px app icon).
+const MAX_EXPORT_SIZE: u32 = 4096;
+const MAX_EXPORTS: usize = 12;
 /// More distinct colours than this is unusual for a logo or an icon.
 const MANY_COLORS: usize = 6;
 /// A pixel counts as drawn above this alpha (0–255).
@@ -41,6 +45,24 @@ pub fn tools() -> Vec<ToolDef> {
             )
         },
         render_svg,
+    ),
+    tool(
+        "export_png",
+        "Export an SVG file as PNG files at the given sizes, written as <name>-<size>.png next to the SVG (or in `out`). Use it for favicons and app icons (16, 32, 48, 180, 192, 512) once the SVG looks right.",
+        Permission::Write,
+        || {
+            object(
+                json!({
+                    "path": { "type": "string", "description": "The .svg file" },
+                    "sizes": { "type": "array", "items": { "type": "integer", "minimum": 16, "maximum": 4096 }, "description": "Long side of each PNG in pixels (default [512]; at most 12 sizes)" },
+                    "background": { "type": "string", "description": "transparent (default), white, black, or #rrggbb" },
+                    "out": { "type": "string", "description": "Folder for the PNGs, inside the workspace (default: the SVG's folder)" },
+                    "overwrite": { "type": "boolean", "description": "Replace PNGs that exist (default false)" },
+                }),
+                &["path"],
+            )
+        },
+        export_png,
     )]
 }
 
@@ -182,9 +204,9 @@ fn options(with_fonts: bool) -> usvg::Options<'static> {
     opt
 }
 
-fn render_svg(c: &ToolCtx, input: Value) -> ToolResult {
-    let p: RenderInput = parse(input)?;
-    let (abs, rel) = c.resolve_read(&p.path)?;
+/// An SVG file read within limits: (path, label, text).
+fn load_svg(c: &ToolCtx, raw: &str) -> Result<(std::path::PathBuf, String, String), ToolError> {
+    let (abs, rel) = c.resolve_read(raw)?;
     let meta = std::fs::metadata(&abs).map_err(|e| ToolError::io(e, &rel))?;
     if !meta.is_file() {
         return Err(ToolError::invalid(format!("{rel} is not a file")));
@@ -193,19 +215,50 @@ fn render_svg(c: &ToolCtx, input: Value) -> ToolResult {
         return Err(ToolError::invalid(format!("{rel} is {} bytes; an SVG can be up to {MAX_SVG_BYTES} bytes here", meta.len())));
     }
     let bytes = std::fs::read(&abs).map_err(|e| ToolError::io(e, &rel))?;
-    let text = String::from_utf8(bytes).map_err(|_| ToolError::invalid(format!("{rel} is not UTF-8 text; render_svg takes an .svg file")))?;
+    let text = String::from_utf8(bytes).map_err(|_| ToolError::invalid(format!("{rel} is not UTF-8 text; give an .svg file")))?;
+    Ok((abs, rel, text))
+}
+
+fn parse_tree(text: &str, rel: &str) -> Result<usvg::Tree, ToolError> {
+    let opt = options(text.contains("<text") || text.contains("<tspan"));
+    usvg::Tree::from_str(text, &opt).map_err(|e| ToolError::invalid(format!("{rel} is not a valid SVG: {e}")))
+}
+
+/// The drawing on a transparent canvas whose long side is `size` pixels.
+fn rasterize(tree: &usvg::Tree, size: u32, rel: &str) -> Result<Pixmap, ToolError> {
+    let s = tree.size();
+    let scale = size as f32 / s.width().max(s.height());
+    let (w, h) = (((s.width() * scale).round() as u32).max(1), ((s.height() * scale).round() as u32).max(1));
+    let mut art = Pixmap::new(w, h).ok_or_else(|| ToolError::invalid(format!("cannot render {rel} at {w}×{h}")))?;
+    resvg::render(tree, Transform::from_scale(scale, scale), &mut art.as_mut());
+    Ok(art)
+}
+
+/// The drawing over a background colour; unchanged for a transparent one.
+fn on_background(art: Pixmap, bg: Option<Color>) -> Pixmap {
+    let Some(color) = bg else { return art };
+    let Some(mut out) = Pixmap::new(art.width(), art.height()) else { return art };
+    out.fill(color);
+    out.draw_pixmap(0, 0, art.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+    out
+}
+
+fn encode(p: &Pixmap) -> Result<Vec<u8>, ToolError> {
+    p.encode_png().map_err(|e| ToolError::invalid(format!("cannot encode the PNG: {e}")))
+}
+
+fn render_svg(c: &ToolCtx, input: Value) -> ToolResult {
+    let p: RenderInput = parse(input)?;
+    let (_, rel, text) = load_svg(c, &p.path)?;
     let size = p.size.unwrap_or(DEFAULT_SIZE).clamp(MIN_SIZE, MAX_SIZE);
     let bg = background(p.background.as_deref())?;
     c.check_cancel()?;
 
     let (mut report, mut warnings) = inspect(&text);
-    let opt = options(report["elements"].get("text").is_some());
-    let tree = usvg::Tree::from_str(&text, &opt).map_err(|e| ToolError::invalid(format!("{rel} is not a valid SVG: {e}")))?;
+    let tree = parse_tree(&text, &rel)?;
     let svg_size = tree.size();
-    let scale = size as f32 / svg_size.width().max(svg_size.height());
-    let (w, h) = (((svg_size.width() * scale).round() as u32).max(1), ((svg_size.height() * scale).round() as u32).max(1));
-    let mut art = Pixmap::new(w, h).ok_or_else(|| ToolError::invalid(format!("cannot render {rel} at {w}×{h}")))?;
-    resvg::render(&tree, Transform::from_scale(scale, scale), &mut art.as_mut());
+    let art = rasterize(&tree, size, &rel)?;
+    let (w, h) = (art.width(), art.height());
     c.check_cancel()?;
 
     match content_box(&art) {
@@ -222,28 +275,85 @@ fn render_svg(c: &ToolCtx, input: Value) -> ToolResult {
             report["contentBox"] = json!({ "x": pct(x, w), "y": pct(y, h), "width": pct(bw, w), "height": pct(bh, h), "unit": "% of canvas" });
         }
     }
-    let png_source = match bg {
-        None => art,
-        Some(color) => {
-            let mut out = Pixmap::new(w, h).ok_or_else(|| ToolError::invalid(format!("cannot render {rel} at {w}×{h}")))?;
-            out.fill(color);
-            out.draw_pixmap(0, 0, art.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
-            out
-        }
-    };
     let obj = report.as_object_mut().expect("report is an object");
     obj.insert("path".into(), json!(rel));
-    obj.insert("bytes".into(), json!(meta.len()));
+    obj.insert("bytes".into(), json!(text.len()));
     obj.insert("svgSize".into(), json!({ "width": svg_size.width(), "height": svg_size.height() }));
     obj.insert("rendered".into(), json!({ "width": w, "height": h, "background": p.background.as_deref().unwrap_or("white") }));
     obj.insert("warnings".into(), json!(warnings));
     if p.image != Some(false) {
-        let png = png_source.encode_png().map_err(|e| ToolError::invalid(format!("cannot encode the PNG: {e}")))?;
+        let png = encode(&on_background(art, bg))?;
         obj.insert("image".into(), json!(true));
         obj.insert("mediaType".into(), json!("image/png"));
         obj.insert("base64".into(), json!(super::fs::base64(&png)));
     }
     Ok(report)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExportInput {
+    #[serde(alias = "file")]
+    path: String,
+    #[serde(default, alias = "size")]
+    sizes: Vec<u32>,
+    #[serde(default, alias = "bg")]
+    background: Option<String>,
+    #[serde(default, alias = "dir", alias = "folder")]
+    out: Option<String>,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// Writes `<stem>-<size>.png` for each size. The files join the edit log as one operation (as
+/// binary files: no diff, and undo removes them).
+fn export_png(c: &ToolCtx, input: Value) -> ToolResult {
+    let p: ExportInput = parse(input)?;
+    let mut sizes = if p.sizes.is_empty() { vec![DEFAULT_SIZE] } else { p.sizes };
+    sizes.sort_unstable();
+    sizes.dedup();
+    if sizes.len() > MAX_EXPORTS {
+        return Err(ToolError::invalid(format!("at most {MAX_EXPORTS} sizes at once")));
+    }
+    if let Some(bad) = sizes.iter().find(|s| !(MIN_SIZE..=MAX_EXPORT_SIZE).contains(*s)) {
+        return Err(ToolError::invalid(format!("size {bad} is out of range; sizes go from {MIN_SIZE} to {MAX_EXPORT_SIZE}")));
+    }
+    let bg = background(Some(p.background.as_deref().unwrap_or("transparent")))?;
+    let (abs, rel, text) = load_svg(c, &p.path)?;
+    let stem = abs.file_stem().and_then(|s| s.to_str()).unwrap_or("image").to_owned();
+    let folder = match &p.out {
+        Some(o) => o.trim_end_matches('/').to_owned(),
+        None => std::path::Path::new(&rel).parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default(),
+    };
+    let mut targets = Vec::new();
+    for s in &sizes {
+        let name = format!("{stem}-{s}.png");
+        let (t_abs, t_rel) = c.resolve(&if folder.is_empty() { name } else { format!("{folder}/{name}") })?;
+        if t_abs.exists() && !p.overwrite {
+            return Err(ToolError::new(ToolErrorKind::Conflict, format!("{t_rel} already exists; pass overwrite: true to replace it")));
+        }
+        targets.push((*s, t_abs, t_rel));
+    }
+    let tree = parse_tree(&text, &rel)?;
+    let mut pngs = Vec::new();
+    for (s, _, _) in &targets {
+        c.check_cancel()?;
+        pngs.push(encode(&on_background(rasterize(&tree, *s, &rel)?, bg))?);
+    }
+    let mut written: Vec<&std::path::PathBuf> = Vec::new();
+    for ((_, t_abs, t_rel), png) in targets.iter().zip(&pngs) {
+        let res = t_abs.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(t_abs, png));
+        if let Err(e) = res {
+            written.iter().for_each(|w| drop(std::fs::remove_file(w)));
+            return Err(ToolError::io(e, &format!("writing {t_rel} (nothing was kept)")));
+        }
+        written.push(t_abs);
+    }
+    let changes: Vec<Change> = targets.iter().map(|(_, a, r)| Change { abs: a.clone(), rel: r.clone(), before: None, after: None }).collect();
+    let mut out = record(c, "export_png", &changes);
+    out["from"] = json!(rel);
+    out["files"] = json!(targets.iter().zip(&pngs).map(|((s, _, r), png)| json!({ "path": r, "size": s, "bytes": png.len() })).collect::<Vec<_>>());
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -310,6 +420,37 @@ mod tests {
         assert!(loaded.root().has_children(), "control: usvg's default resolver reads the file");
         let ours = usvg::Tree::from_str(&svg, &options(false)).unwrap();
         assert!(!ours.root().has_children(), "render_svg's options refuse it");
+        std::fs::remove_dir_all(&c.root).ok();
+    }
+
+    fn png_size(bytes: &[u8]) -> (u32, u32) {
+        let be = |i: usize| u32::from_be_bytes(bytes[i..i + 4].try_into().unwrap());
+        (be(16), be(20))
+    }
+
+    #[test]
+    fn exports_pngs_at_each_size_as_one_undoable_operation() {
+        let wide = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><rect x="10" y="10" width="180" height="80"/></svg>"#;
+        let c = ctx(&[("assets/logo/acme.svg", LOGO), ("wide.svg", wide)]);
+        let r = run(&c, "export_png", json!({ "path": "assets/logo/acme.svg", "sizes": [32, 16, 32] })).unwrap();
+        let files: Vec<&str> = r["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(files, ["assets/logo/acme-16.png", "assets/logo/acme-32.png"], "sorted, without repeats, next to the SVG");
+        assert_eq!(png_size(&std::fs::read(c.root.join("assets/logo/acme-32.png")).unwrap()), (32, 32));
+        assert!(r["operation"].is_u64(), "recorded in the edit log: {r}");
+        let e = run(&c, "export_png", json!({ "path": "assets/logo/acme.svg", "sizes": [16] })).unwrap_err();
+        assert_eq!(e.kind, ToolErrorKind::Conflict, "an existing PNG needs overwrite");
+        run(&c, "export_png", json!({ "path": "assets/logo/acme.svg", "sizes": [16], "overwrite": true })).unwrap();
+
+        let r = run(&c, "export_png", json!({ "path": "wide.svg", "sizes": [400], "out": "public/img" })).unwrap();
+        assert_eq!(r["files"][0]["path"], "public/img/wide-400.png");
+        assert_eq!(png_size(&std::fs::read(c.root.join("public/img/wide-400.png")).unwrap()), (400, 200), "the long side is the size");
+
+        let undo = crate::tools::undo(&c, r["operation"].as_u64().unwrap() as usize);
+        assert!(undo.is_ok(), "{undo:?}");
+        assert!(!c.root.join("public/img/wide-400.png").exists(), "undo removes the exported file");
+
+        assert!(run(&c, "export_png", json!({ "path": "wide.svg", "out": "../outside" })).is_err(), "PNGs stay in the workspace");
+        assert!(run(&c, "export_png", json!({ "path": "wide.svg", "sizes": [8] })).unwrap_err().message.contains("out of range"));
         std::fs::remove_dir_all(&c.root).ok();
     }
 

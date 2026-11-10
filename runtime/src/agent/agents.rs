@@ -164,20 +164,52 @@ pub fn user_dirs() -> Vec<PathBuf> {
     [".claude", ".copilot", ".task-x"].iter().map(|d| Path::new(&home).join(d).join("agents")).collect()
 }
 
+/// Agents that come with task-x: (name, description, tools, instructions). They use the caller's
+/// model, so they work with any provider. A file with the same name replaces one.
+const BUILTIN: &[(&str, &str, &[&str], &str)] = &[(
+    "designer",
+    "Designs logos, icons, and other vector graphics as SVG files, checks each one by rendering it, and exports PNG sizes on request.",
+    &["create_file", "replace_text", "edit_files", "apply_patch", "render_svg", "export_png"],
+    "You are a graphic designer who works in hand-written SVG.\n\n\
+Start with read_skill { name: \"vector-design\" } and follow it for every graphic.\n\n\
+- Work only on the graphics the objective asks for. Do not change code, configuration, or other assets.\n\
+- Write each SVG with create_file and fix it with replace_text or edit_files; never paste the SVG into your reply instead of writing the file.\n\
+- Check every version with render_svg. Fix every warning and anything that looks wrong, then render again; stop after 4 rounds.\n\
+- When asked for PNGs, favicons, or app icons, call export_png once the SVG is final (favicon: 16, 32, 48; Apple touch: 180; Android: 192, 512).\n\
+- Finish with a short report: the files, the concept in one line, the colours, and anything the user should check by eye.",
+)];
+
+fn builtin(out: &mut BTreeMap<String, (u8, AgentDef)>) {
+    for (name, description, tools, body) in BUILTIN {
+        let a = AgentDef {
+            name: (*name).to_owned(),
+            description: (*description).to_owned(),
+            tools: tools.iter().map(|t| (*t).to_owned()).collect(),
+            writes: true,
+            model: None,
+            max_iterations: None,
+            source: "built-in".into(),
+            body: (*body).to_owned(),
+        };
+        out.insert(a.name.clone(), (0, a));
+    }
+}
+
 /// Every agent found; `plugins` are `(name, path)` of the enabled plugins. Workspace agents come
-/// first, then the user's, then plugin agents (each group by name), so the index the lead sees
-/// keeps the project's own agents when it has to cut the list.
+/// first, then the user's, then plugin agents, then the built-in ones (each group by name), so the
+/// index the lead sees keeps the project's own agents when it has to cut the list.
 pub fn load(workspace: Option<&Path>, user_dirs: &[PathBuf], plugins: &[(String, PathBuf)]) -> Vec<AgentDef> {
     let mut out = BTreeMap::new();
+    builtin(&mut out);
     for (name, path) in plugins {
-        load_dir(&path.join("agents"), name, 0, &mut out);
+        load_dir(&path.join("agents"), name, 1, &mut out);
     }
     for u in user_dirs {
-        load_dir(u, "", 1, &mut out);
+        load_dir(u, "", 2, &mut out);
     }
     if let Some(w) = workspace {
         for d in [".claude/agents", ".github/agents", ".task-x/agents"] {
-            load_dir(&w.join(d), "", 2, &mut out);
+            load_dir(&w.join(d), "", 3, &mut out);
         }
     }
     let mut all: Vec<(u8, AgentDef)> = out.into_values().collect();
@@ -295,6 +327,23 @@ mod tests {
         assert!(explicit(&all, "@src/main.rs explain").is_none(), "a path is a mention, not an agent");
         assert!(explicit(&all, "@nobody do it").is_none());
         assert!(index(&all).unwrap().contains("- review (edits)"));
+        assert_eq!(all.last().unwrap().name, "designer", "built-in agents come last");
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn the_built_in_designer_draws_and_checks_with_the_callers_model() {
+        let all = load(None, &[], &[]);
+        let d = find(&all, "@designer").expect("built in");
+        assert!(d.writes && d.model.is_none(), "it edits and keeps the selected model");
+        assert!(d.tools.iter().any(|t| t == "render_svg") && d.tools.iter().any(|t| t == "export_png"));
+        assert!(!d.tools.iter().any(|t| t == "run_command"), "no shell for a designer");
+        assert!(d.body.contains("vector-design"));
+        let base = std::env::temp_dir().join(format!("task-x-agents-designer-{}", std::process::id()));
+        std::fs::create_dir_all(base.join(".claude/agents")).unwrap();
+        std::fs::write(base.join(".claude/agents/designer.md"), "---\ndescription: ours\n---\nOur brand rules.").unwrap();
+        let all = load(Some(&base), &[], &[]);
+        assert_eq!(find(&all, "designer").unwrap().body, "Our brand rules.", "a project file replaces the built-in agent");
         std::fs::remove_dir_all(base).ok();
     }
 

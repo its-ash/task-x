@@ -546,6 +546,15 @@ fn preview(name: &str, input: &Value) -> Option<String> {
             Some(format!("{} {} → {}", if name == "move_file" { "move" } else { "copy" }, input["from"].as_str()?, input["to"].as_str()?))
         }
         "rename_file" => Some(format!("rename {} → {}", input["from"].as_str()?, input["to"].as_str()?)),
+        "export_png" => {
+            let sizes: Vec<String> = input["sizes"].as_array().into_iter().flatten().map(|s| s.to_string()).collect();
+            Some(format!(
+                "export {} as PNG ({} px){}",
+                input["path"].as_str()?,
+                if sizes.is_empty() { "512".into() } else { sizes.join(", ") },
+                input["out"].as_str().map(|o| format!(" into {o}")).unwrap_or_default()
+            ))
+        }
         _ => None,
     }
 }

@@ -248,7 +248,7 @@ const BUILTIN_SKILLS: &[(&str, &str, &str)] = &[(
    - Keep it small: under 30 elements and 10 KB for a logo; reuse with <use> and <symbol>.\n\
 4. Check it with render_svg { path }. Look at the picture: balance, centring, spacing, stroke weight, legibility, and anything clipped. Read every warning and fix it. Render again with background black when the logo must work on dark backgrounds, and with size 32 to see it as a favicon. Repeat until there are no warnings and it looks right; at most 4 rounds.\n\
 5. If you cannot see images (render_svg gives no picture, or you are a text-only model), call render_svg with image false and work from contentBox, colors, and warnings.\n\
-6. On request, add variants next to it: <name>-mark.svg (symbol only, square), <name>-mono.svg (one colour, currentColor), <name>-dark.svg (for dark backgrounds).\n\
+6. On request, add variants next to it: <name>-mark.svg (symbol only, square), <name>-mono.svg (one colour, currentColor), <name>-dark.svg (for dark backgrounds). For PNGs, favicons, or app icons, call export_png { path, sizes } when the SVG is final.\n\
 7. Report the files, the concept, and the colours used. Do not paste the whole SVG into the reply.",
 )];
 
