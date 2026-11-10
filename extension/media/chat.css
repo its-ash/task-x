@@ -473,6 +473,8 @@ button:disabled { opacity: .38; cursor: default; }
 .request-ctx .ctx-chip.sent:hover { color: var(--on-surface); background: color-mix(in srgb, var(--fg) var(--md-state-hover), transparent); }
 .row.browser .browser-icon { flex: none; color: var(--accent); }
 .row.browser .label { color: var(--accent); font-weight: 600; }
+.row.browser .browser-where { flex: none; display: inline-flex; align-items: center; gap: 3px; padding: 0 6px; border-radius: 8px; font-size: 11px; line-height: 16px; color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.row.browser .browser-where .codicon { font-size: 12px; }
 .request-images { display: flex; align-items: center; gap: 4px; margin-top: 4px; font-size: 11px; color: var(--muted); }
 textarea { width: 100%; resize: none; min-height: 100px; max-height: 40vh; padding: 2px 4px; border: none; outline: none; font: inherit; line-height: 1.45; color: var(--on-surface); background: transparent; }
 textarea:focus-visible { outline: none; }

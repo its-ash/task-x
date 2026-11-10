@@ -177,7 +177,7 @@ const MAX_LANE_STEPS = 30;
 type Item =
   | { kind: 'user'; text: string; mode: ChatMode; images?: number; context?: SentContext[]; id?: string; operations?: number[] }
   | { kind: 'assistant'; text: string }
-  | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string }; tokens?: number }
+  | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string }; tokens?: number; browser?: string }
   | { kind: 'file'; path: string; operation: number | null; diffKey: string; added: number; removed: number; diff: string; diffCut: boolean; undone?: boolean; kept?: boolean }
   | { kind: 'context'; text: string }
   | { kind: 'steer'; text: string }
@@ -560,6 +560,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private nightSince: number | undefined;
   private readonly diffs = new Map<string, string>();
   private readonly outputs = new Map<string, string>();
+  /** The browser the last `browser` call ran in ("VS Code", "Chrome", ...). */
+  private lastBrowser: string | undefined;
   private readonly wired = new WeakSet<JsonRpcClient>();
   private changesTimer: NodeJS.Timeout | undefined;
   /** Approvals for runtime tasks that are not this chat's (background tasks, best-of-N). */
@@ -1790,12 +1792,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /** Records a finished call's output and returns what the transcript shows. */
-  private captureOutput(id: string, tool: string, ok: boolean, raw: string): { output?: string; outputCut?: boolean } {
+  private captureOutput(id: string, tool: string, ok: boolean, raw: string): { output?: string; outputCut?: boolean; browser?: string } {
     const base = tool.split(' › ').pop() ?? tool;
-    if (ok && !OUTPUT_TOOLS.has(base)) return {};
+    const browser = base.replace(/^mcp__task-x__/, '') === 'browser' ? this.browserUsed(raw, ok) : undefined;
+    const where = browser ? { browser } : {};
+    if (ok && !OUTPUT_TOOLS.has(base)) return where;
     const text = formatOutput(raw);
     this.outputs.set(id, text);
-    return { output: text.slice(0, MAX_SAVED_OUTPUT), outputCut: text.length > MAX_SAVED_OUTPUT };
+    return { ...where, output: text.slice(0, MAX_SAVED_OUTPUT), outputCut: text.length > MAX_SAVED_OUTPUT };
+  }
+
+  /** The browser a `browser` call ran in: the runtime names it in `browserName` (also when the result came over MCP). */
+  private browserUsed(raw: string, ok: boolean): string | undefined {
+    const named = /\\?"browserName\\?"\s*:\s*\\?"([^"\\]{1,40})\\?"/.exec(raw)?.[1];
+    if (named) this.lastBrowser = named;
+    // A screenshot's image can push the name past the event's cut-off; it ran where the calls before it did.
+    return named ?? (ok ? this.lastBrowser : undefined);
   }
 
   private async openFile(rel: string): Promise<void> {

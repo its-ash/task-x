@@ -100,14 +100,19 @@ export function activate(ctx: vscode.ExtensionContext): void {
       vscode.window.showErrorMessage(`task-x MCP: ${describeError(e)}`);
     }
   };
-  const openWorkspace = (rt: RuntimeProcess) =>
-    sync
-      .open(rt.client)
-      .catch((e) => {
-        out.error(`workspace indexing failed: ${describeError(e)}`);
-        return undefined;
-      })
-      .finally(() => configureExtensions(rt));
+  // Settles once the current runtime has the workspace open (or opening it failed). Requests wait
+  // for it, so the first prompt after a (re)start never reaches a runtime with no workspace.
+  let workspaceReady: Promise<unknown> = Promise.resolve();
+  const openWorkspace = (rt: RuntimeProcess) => {
+    const opened = sync.open(rt.client).catch((e) => {
+      out.error(`workspace indexing failed: ${describeError(e)}`);
+      return undefined;
+    });
+    workspaceReady = opened;
+    // Hooks and MCP load after the workspace but do not hold up requests.
+    void opened.finally(() => configureExtensions(rt));
+    return opened;
+  };
 
   // The last time anything used the runtime; an idle runtime is stopped (see below).
   let lastUse = Date.now();
@@ -147,7 +152,19 @@ export function activate(ctx: vscode.ExtensionContext): void {
     })().finally(() => (starting = undefined));
     return starting;
   };
-  const client = async (): Promise<JsonRpcClient> => (await ensureRuntime()).client;
+  const client = async (): Promise<JsonRpcClient> => {
+    const rt = await ensureRuntime();
+    const waited = workspaceReady;
+    await waited;
+    // The open failed (or the runtime restarted without it): try once more before the request.
+    // Only the first caller retries; the others wait on that same attempt.
+    if (workspaceReady !== waited) await workspaceReady;
+    else if (WorkspaceSync.root() && !sync.summary && rt.running) {
+      workspaceReady = sync.open(rt.client).catch((e) => out.error(`workspace indexing failed: ${describeError(e)}`));
+      await workspaceReady;
+    }
+    return rt.client;
+  };
 
   const originals = new OriginalContent();
   const chat = new ChatViewProvider(ctx, client, () => ProviderDialog.show(ctx, client), originals, (level, msg) => logs.add(level, 'agent', msg));

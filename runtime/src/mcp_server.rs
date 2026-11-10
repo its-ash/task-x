@@ -113,6 +113,9 @@ impl McpServer {
         let input = if args.is_null() { json!({}) } else { args };
         match tools::call(def, ctx, input).await {
             Ok(mut v) => {
+                if let Some((media, data)) = tools::fs::take_image(&mut v) {
+                    return json!({ "content": [{ "type": "text", "text": v.to_string() }, { "type": "image", "data": data, "mimeType": media }], "isError": false });
+                }
                 // Long command output reaches Claude as its errors and last lines; read_log has the rest.
                 let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
                 tools::logs::shorten(&mut v, &format!("mcp-{name}-{stamp}"));
@@ -217,7 +220,7 @@ mod tests {
         let secret = rpc(&s, 5, "tools/call", json!({ "name": "read_file", "arguments": { "path": ".env" } })).await;
         assert_eq!(secret["result"]["isError"], false, "secret files are readable");
         let outside = rpc(&s, 6, "tools/call", json!({ "name": "read_file", "arguments": { "path": "../x" } })).await;
-        assert_eq!(outside["result"]["isError"], true);
+        assert_eq!(outside["result"]["isError"], true, "this file does not exist");
         assert_eq!(rpc(&s, 7, "nope", json!({})).await["error"]["code"], rpc::METHOD_NOT_FOUND);
         assert!(!names.contains(&APPROVE_TOOL), "no approval address, no approve tool");
         let only = McpServer::open(root.clone(), false, Some(("127.0.0.1:1".into(), "t".into()))).unwrap();

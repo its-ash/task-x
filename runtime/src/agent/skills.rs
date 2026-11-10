@@ -204,6 +204,31 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
         "[path or focus]",
         "Do a security review of the uncommitted changes (git_diff, then the code the changes call into). Check injection (SQL, shell, path), XSS, authentication and authorization gaps, secrets in code or logs, unsafe deserialization, SSRF, and missing input validation. Report only real, reachable issues, each with file:line, severity, the attack, and the fix. Do not edit files.\n\nFocus: $ARGUMENTS",
     ),
+    (
+        "create-skill",
+        "Create a skill for Claude Code and GitHub Copilot from a prompt",
+        "<what the skill does>",
+        "Create a new skill for both Claude Code and GitHub Copilot from the request at the end.\n\n\
+1. If the request is empty, ask what the skill must do, and stop.\n\
+2. Pick a name: lowercase letters, digits, and hyphens, up to 64 characters. If .claude/skills/<name> or .github/skills/<name> exists, ask before you change it.\n\
+3. Read the code the skill is about, so that its commands, paths, and conventions come from this project and are not guesses.\n\
+4. Write .claude/skills/<name>/SKILL.md. Front matter: name (the same as the folder) and description, one line of up to 600 characters that says what the skill does and when to use it, with the words a request would contain. Put the description in double quotes if it contains a colon. Body: short imperative instructions, one fact per line, under 100 lines. Move long examples and catalogs to references/<topic>.md in the skill folder, and link them from SKILL.md.\n\
+5. Copy every file of the skill, unchanged, to .github/skills/<name>/, so that Copilot reads the same skill.\n\
+6. Report the files you wrote.\n\nRequest: $ARGUMENTS",
+    ),
+    (
+        "create-agent",
+        "Create a custom agent for Claude Code and GitHub Copilot from a prompt",
+        "<what the agent does>",
+        "Create a new custom agent for both Claude Code and GitHub Copilot from the request at the end.\n\n\
+1. If the request is empty, ask what the agent must do, and stop.\n\
+2. Pick a name: lowercase letters, digits, and hyphens, up to 64 characters. If .claude/agents/<name>.md or .github/agents/<name>.agent.md exists, ask before you change it.\n\
+3. Read the code the agent will work on, so that its instructions use the commands, paths, and conventions of this project and are not guesses.\n\
+4. Write the instructions: its role, its steps, its limits, and what it reports back. Keep them short and imperative. Give it only the tools it needs; an agent that only investigates gets no edit or shell tools.\n\
+5. Write .claude/agents/<name>.md. Front matter: name; description, one line that says what the agent does and when to delegate to it, in double quotes if it contains a colon; tools, a comma-separated list from Read, Grep, Glob, Edit, Write, Bash, WebFetch, WebSearch; model: inherit. The instructions follow the front matter.\n\
+6. Write .github/agents/<name>.agent.md for Copilot. Front matter: the same name and description; tools, a YAML list such as [\"read\", \"search\"] from read, search, edit, execute, web; no model. The instructions are the same.\n\
+7. Report the files you wrote.\n\nRequest: $ARGUMENTS",
+    ),
 ];
 
 fn builtin(out: &mut BTreeMap<String, Skill>) {

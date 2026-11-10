@@ -57,7 +57,7 @@ git diff | task-x-runtime exec --read-only --json -    # read the prompt from st
 
 - The model comes from `--provider` and `--model`, or from `TASK_X_PROVIDER` and `TASK_X_MODEL`. With neither, task-x uses Anthropic when `ANTHROPIC_API_KEY` is set, OpenAI when `OPENAI_API_KEY` is set, and a local Ollama otherwise.
 - `--edit safe` (default), `auto`, or `ask` sets what runs without asking; `--read-only` only reads. A call that needs approval asks on the terminal. Without a terminal it is refused, unless you give `--yes`.
-- In `chat`, `/cost`, `/compact`, `/checkpoints`, `/rewind <n>`, `/fork [n]`, and `/new` act on the conversation. Every skill and command works too, such as `/init` and `/review`.
+- In `chat`, `/cost`, `/compact`, `/checkpoints`, `/rewind <n>`, `/fork [n]`, and `/new` act on the conversation. Every skill and command works too, such as `/init`, `/review`, `/create-skill`, and `/create-agent`.
 - Tasks, the edit log, the project graph, and the memory are kept in `~/.task-x/cli`. `--continue` picks up the newest task, and `--resume <id>` picks up a given one.
 - The folder's `.task-x/hooks.json` and `.task-x/mcp.json` apply, as do its skills, commands, agents, and plugins. MCP sign-in (OAuth) is only in VS Code; in the terminal, put a token in the server's `headers`.
 

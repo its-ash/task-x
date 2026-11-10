@@ -19,6 +19,9 @@ const MAX_OUTLINE: usize = 80;
 const MAX_SYMBOLS: usize = 10;
 const MAX_LINE_CHARS: usize = 2_000;
 const MAX_MULTI_FILES: usize = 20;
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
+/// As base64 this fits the limit for images in a prompt (`provider::types`).
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 pub fn tools() -> Vec<ToolDef> {
     use Permission::Read;
@@ -72,7 +75,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool(
             "read_file",
-            "Read a text file with line numbers. Without offset/limit it returns the first 300 lines, and a longer file also lists its symbols with line numbers: then read only the range you need.",
+            "Read a text file with line numbers, or see a PNG, JPEG, GIF, or WebP image. Any path on the machine works: in the workspace, absolute, or ~/. list_files also lists folders outside the workspace. Without offset/limit it returns the first 300 lines, and a longer file also lists its symbols with line numbers: then read only the range you need.",
             Read,
             || {
                 object(
@@ -146,11 +149,34 @@ fn dir_prefix(c: &ToolCtx, p: Option<&str>) -> Result<String, ToolError> {
     Ok(if rel == "." { String::new() } else { format!("{rel}/") })
 }
 
+fn list_outside(c: &ToolCtx, dir: &Path, recursive: bool, limit: usize) -> ToolResult {
+    if !dir.is_dir() {
+        return Err(ToolError::new(ToolErrorKind::NotFound, format!("{} is not a folder", dir.display())));
+    }
+    let walk = ignore::WalkBuilder::new(dir).standard_filters(false).max_depth(if recursive { None } else { Some(1) }).build();
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    for e in walk.flatten().filter(|e| e.depth() > 0) {
+        c.check_cancel()?;
+        if entries.len() == limit {
+            truncated = true;
+            break;
+        }
+        let dir = e.file_type().is_some_and(|t| t.is_dir());
+        entries.push(format!("{}{}", e.path().display(), if dir { "/" } else { "" }));
+    }
+    Ok(json!({ "total": entries.len(), "entries": entries, "truncated": truncated }))
+}
+
 fn list_files(c: &ToolCtx, input: Value) -> ToolResult {
     let i: ListIn = parse(input)?;
-    let prefix = dir_prefix(c, i.path.as_deref())?;
     let limit = i.limit.unwrap_or(DEFAULT_LIST_LIMIT).min(5_000);
     let recursive = i.recursive.unwrap_or(false);
+    // The index covers only the workspace, so a folder outside it (or `.git`) is read from disk.
+    if let Some(p) = i.path.as_deref().filter(|p| c.resolve(p).is_err()) {
+        return list_outside(c, &c.resolve_read(p)?.0, recursive, limit);
+    }
+    let prefix = dir_prefix(c, i.path.as_deref())?;
     c.with_workspace(|w| {
         let mut dirs = BTreeSet::new();
         let mut files = Vec::new();
@@ -229,37 +255,63 @@ struct PathIn {
     path: String,
 }
 
-/// A file inside a user skill folder (`~/.claude/skills`, `~/.copilot/skills`, …) or a Claude Code
-/// plugin's `skills` folder, given as an absolute or `~/` path. Skills point the agent at their own
-/// reference files, which live outside the workspace; they can be read, never written.
-fn skill_file(raw: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)?;
-    let p = match raw.strip_prefix("~/") {
-        Some(rest) => home.join(rest),
-        None if Path::new(raw).is_absolute() => PathBuf::from(raw),
-        None => return None,
-    };
-    let p = super::lexical(&p);
-    let real = p.canonicalize().ok().filter(|r| r.is_file())?;
-    // A skill linked into the folder (`~/.claude/skills/x -> ~/src/x`) counts by the path it was given.
-    let in_dir = |d: &Path| p.starts_with(d) || d.canonicalize().is_ok_and(|d| real.starts_with(&d) || p.starts_with(&d));
-    let plugins = home.join(".claude").join("plugins");
-    let in_plugin_skills = in_dir(&plugins) && p.components().chain(real.components()).any(|c| c.as_os_str() == "skills");
-    (crate::agent::skills::user_dirs().iter().any(|d| in_dir(d)) || in_plugin_skills).then_some(real)
+/// The image type of file bytes, from their first bytes. A file's name can be wrong, and a model
+/// provider refuses the whole request when an image is not valid.
+fn image_type(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if b.len() > 12 && b.starts_with(b"RIFF") && &b[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn base64(b: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
+    for c in b.chunks(3) {
+        let n = u32::from(c[0]) << 16 | u32::from(*c.get(1).unwrap_or(&0)) << 8 | u32::from(*c.get(2).unwrap_or(&0));
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// An image file as a tool result. `take_image` moves its data out, so the model gets a real image
+/// and the chat and logs do not get megabytes of base64.
+fn read_image(abs: &Path, rel: &str) -> Result<Option<Value>, ToolError> {
+    let named = abs.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+    if !named {
+        return Ok(None);
+    }
+    let meta = std::fs::metadata(abs).map_err(|e| ToolError::io(e, rel))?;
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(ToolError::invalid(format!("{rel} is {} bytes; images can be up to {MAX_IMAGE_BYTES} bytes", meta.len())));
+    }
+    let bytes = std::fs::read(abs).map_err(|e| ToolError::io(e, rel))?;
+    let media = image_type(&bytes).ok_or_else(|| ToolError::invalid(format!("{rel} has an image name, but it is not a PNG, JPEG, GIF, or WebP image")))?;
+    Ok(Some(json!({ "path": rel, "image": true, "mediaType": media, "bytes": bytes.len(), "base64": base64(&bytes) })))
+}
+
+/// Takes the image out of a `read_file` result: (media type, base64 data).
+pub fn take_image(v: &mut Value) -> Option<(String, String)> {
+    if v["image"] != true {
+        return None;
+    }
+    let data = v.as_object_mut()?.remove("base64")?;
+    Some((v["mediaType"].as_str()?.to_owned(), data.as_str()?.to_owned()))
 }
 
 /// Reads a UTF-8 text file within limits and records its fingerprint for stale-edit detection.
-/// Files of the user's skills are readable too (read-only), so a skill's reference files load.
 pub fn read_text(c: &ToolCtx, raw: &str) -> Result<(String, String), ToolError> {
-    if let Some(abs) = skill_file(raw.trim()) {
-        let bytes = std::fs::read(&abs).map_err(|e| ToolError::io(e, raw))?;
-        if bytes.len() as u64 > MAX_FILE_BYTES * 4 || bytes[..bytes.len().min(8192)].contains(&0) {
-            return Err(ToolError::invalid(format!("{raw} is too large or binary")));
-        }
-        let text = String::from_utf8(bytes).map_err(|_| ToolError::invalid(format!("{raw} is not valid UTF-8")))?;
-        return Ok((abs.display().to_string(), text));
-    }
-    let (abs, rel) = c.resolve_existing(raw)?;
+    let (abs, rel) = c.resolve_read(raw)?;
     let meta = std::fs::metadata(&abs).map_err(|e| ToolError::io(e, &rel))?;
     if !meta.is_file() {
         return Err(ToolError::invalid(format!("{rel} is not a file")));
@@ -282,10 +334,7 @@ pub fn read_text(c: &ToolCtx, raw: &str) -> Result<(String, String), ToolError> 
 /// A workspace text file above the whole-load limit, as (absolute, relative) path: reads and
 /// searches stream it line by line. `None` for every other file.
 pub fn large_file(c: &ToolCtx, raw: &str) -> Result<Option<(PathBuf, String)>, ToolError> {
-    if skill_file(raw.trim()).is_some() {
-        return Ok(None);
-    }
-    let (abs, rel) = c.resolve_existing(raw)?;
+    let (abs, rel) = c.resolve_read(raw)?;
     let meta = std::fs::metadata(&abs).map_err(|e| ToolError::io(e, &rel))?;
     if !meta.is_file() || meta.len() <= MAX_FILE_BYTES * 4 {
         return Ok(None);
@@ -373,6 +422,10 @@ fn read_file(c: &ToolCtx, input: Value) -> ToolResult {
         Some(end) => end,
         None => start + i.limit.unwrap_or(DEFAULT_READ_LINES).clamp(1, MAX_READ_LINES) - 1,
     };
+    let (abs, rel) = c.resolve_read(&i.path)?;
+    if let Some(image) = read_image(&abs, &rel)? {
+        return Ok(image);
+    }
     if let Some((abs, rel)) = large_file(c, &i.path)? {
         let mut r = stream_range(c, &abs, &rel, start, end)?;
         if whole && r["more"] == true {
@@ -399,7 +452,7 @@ fn read_file(c: &ToolCtx, input: Value) -> ToolResult {
 
 /// The symbols of a file in one line each (`L12-40 fn name`), for parser-supported languages.
 fn outline(c: &ToolCtx, rel: &str, text: &str) -> Option<Vec<String>> {
-    let (abs, _) = c.resolve_existing(rel).ok()?;
+    let (abs, _) = c.resolve_read(rel).ok()?;
     let lang = symbols::parser_lang(&abs)?;
     let defs = symbols::extract(lang, text).definitions;
     let lines: Vec<String> =
@@ -534,7 +587,7 @@ fn read_symbol(c: &ToolCtx, input: Value) -> ToolResult {
 
 fn get_file_outline(c: &ToolCtx, input: Value) -> ToolResult {
     let i: PathIn = parse(input)?;
-    let (abs, rel) = c.resolve_existing(&i.path)?;
+    let (abs, rel) = c.resolve_read(&i.path)?;
     let lang = symbols::parser_lang(&abs).ok_or_else(|| ToolError::invalid(format!("no outline support for {rel}")))?;
     let (_, text) = read_text(c, &rel)?;
     let syms = symbols::extract(lang, &text);
@@ -543,7 +596,7 @@ fn get_file_outline(c: &ToolCtx, input: Value) -> ToolResult {
 
 fn get_file_metadata(c: &ToolCtx, input: Value) -> ToolResult {
     let i: PathIn = parse(input)?;
-    let (abs, rel) = c.resolve_existing(&i.path)?;
+    let (abs, rel) = c.resolve_read(&i.path)?;
     let m = std::fs::metadata(&abs).map_err(|e| ToolError::io(e, &rel))?;
     let modified = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
     let lines = (m.is_file() && m.len() <= MAX_FILE_BYTES).then(|| std::fs::read_to_string(&abs).ok().map(|t| t.lines().count())).flatten();
@@ -560,7 +613,7 @@ fn get_file_metadata(c: &ToolCtx, input: Value) -> ToolResult {
 
 fn detect_language(c: &ToolCtx, input: Value) -> ToolResult {
     let i: PathIn = parse(input)?;
-    let (abs, rel) = c.resolve_existing(&i.path)?;
+    let (abs, rel) = c.resolve_read(&i.path)?;
     Ok(json!({ "path": rel, "language": symbols::language_name(&abs), "symbolSupport": symbols::parser_lang(&abs).is_some() }))
 }
 
@@ -583,6 +636,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reads_work_anywhere_and_writes_do_not() {
+        let c = ctx(&[("a.txt", "in\n")]);
+        let dir = std::env::temp_dir().join(format!("task-x-read-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("note.txt");
+        std::fs::write(&file, "outside text\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        assert!(run(&c, "read_file", json!({ "path": path })).unwrap()["content"].as_str().unwrap().contains("outside text"));
+        assert_eq!(run(&c, "read_range", json!({ "path": path, "start": 1, "end": 1 })).unwrap()["totalLines"], 1);
+        assert_eq!(run(&c, "read_multiple_files", json!({ "paths": [path] })).unwrap()["files"][0]["totalLines"], 1);
+        assert_eq!(run(&c, "get_file_metadata", json!({ "path": path })).unwrap()["size"], 13);
+        let climbed = pathdiff_up(&c.root, &file);
+        assert!(run(&c, "read_file", json!({ "path": climbed })).unwrap()["content"].as_str().unwrap().contains("outside text"), "a path that climbs out");
+        let listed = run(&c, "list_files", json!({ "path": dir.to_string_lossy() })).unwrap();
+        assert!(listed["entries"].to_string().contains("note.txt") && listed["entries"].to_string().contains("sub/"), "{listed}");
+        std::fs::create_dir_all(c.root.join(".git")).unwrap();
+        std::fs::write(c.root.join(".git/HEAD"), "ref: x\n").unwrap();
+        assert!(run(&c, "read_file", json!({ "path": ".git/HEAD" })).unwrap()["content"].as_str().unwrap().contains("ref: x"));
+        assert_eq!(run(&c, "read_file", json!({ "path": "a.txt" })).unwrap()["path"], "a.txt", "workspace paths stay relative");
+        assert_eq!(run(&c, "read_file", json!({ "path": dir.join("missing").to_string_lossy() })).unwrap_err().kind, ToolErrorKind::NotFound);
+
+        let edit = run(&c, "replace_text", json!({ "path": path, "oldText": "outside", "newText": "changed" })).unwrap_err();
+        assert_eq!(edit.kind, ToolErrorKind::Forbidden, "a read does not open the file for edits");
+        assert_eq!(run(&c, "create_file", json!({ "path": dir.join("new.txt").to_string_lossy(), "content": "x" })).unwrap_err().kind, ToolErrorKind::Forbidden);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "outside text\n");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn pathdiff_up(root: &Path, file: &Path) -> String {
+        format!("{}{}", "../".repeat(root.components().count()), file.to_string_lossy().trim_start_matches('/'))
+    }
+
+    #[test]
+    fn an_image_comes_back_as_an_image() {
+        let c = ctx(&[("a.txt", "x\n")]);
+        let dir = std::env::temp_dir().join(format!("task-x-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("panel.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let mut r = run(&c, "read_file", json!({ "path": png.to_string_lossy() })).unwrap();
+        assert_eq!((r["mediaType"].as_str(), r["bytes"].as_u64()), (Some("image/png"), Some(12)));
+        assert_eq!(take_image(&mut r), Some(("image/png".to_owned(), "iVBORw0KGgpyZXN0".to_owned())));
+        assert!(r.get("base64").is_none(), "the data leaves the text result");
+        let fake = dir.join("fake.png");
+        std::fs::write(&fake, "not an image").unwrap();
+        assert!(run(&c, "read_file", json!({ "path": fake.to_string_lossy() })).unwrap_err().message.contains("not a PNG"));
+        assert_eq!(take_image(&mut json!({ "content": "text" })), None);
+        assert_eq!((base64(b"M"), base64(b"Ma"), base64(b"Man")), ("TQ==".into(), "TWE=".into(), "TWFu".into()));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn lists_finds_and_trees() {
         let c = ctx(&[("src/a.rs", "fn a() {}\n"), ("src/sub/b.rs", "fn b() {}\n"), ("README.md", "hi\n")]);
         let l = run(&c, "list_files", json!({})).unwrap();
@@ -593,7 +698,8 @@ mod tests {
         assert_eq!(run(&c, "find_files", json!({ "pattern": "**/*.rs" })).unwrap()["total"], 2);
         let t = run(&c, "get_file_tree", json!({ "depth": 2 })).unwrap();
         assert!(t["tree"].as_str().unwrap().contains("  sub/"));
-        assert!(run(&c, "list_files", json!({ "path": "../" })).is_err());
+        assert!(run(&c, "list_files", json!({ "path": "../" })).is_ok(), "a folder outside the workspace can be listed");
+        assert_eq!(run(&c, "list_files", json!({ "path": "../no-such-folder-here" })).unwrap_err().kind, ToolErrorKind::NotFound);
     }
 
     #[test]

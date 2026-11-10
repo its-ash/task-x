@@ -474,6 +474,23 @@ impl ToolCtx {
         }
     }
 
+    /// The path of something to read. Reads have no limits: besides workspace paths, it takes absolute
+    /// paths, `~/` paths, and paths that climb out with `..`. Writes always go through `resolve`.
+    /// Returns the real path and a label: relative in the workspace, absolute elsewhere.
+    pub fn resolve_read(&self, raw: &str) -> Result<(PathBuf, String), ToolError> {
+        let raw = raw.trim();
+        let home = raw.strip_prefix("~/").and_then(|rest| std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(|h| PathBuf::from(h).join(rest)));
+        if home.is_none() {
+            match self.resolve_existing(raw) {
+                Err(e) if e.kind == ToolErrorKind::Forbidden => {}
+                other => return other,
+            }
+        }
+        let abs = lexical(&home.unwrap_or_else(|| self.root.join(raw)));
+        let label = abs.display().to_string();
+        Ok((abs, label))
+    }
+
     /// Like `resolve`, but for the source of a copy or a move: the file may also live outside the
     /// workspace (an absolute path, or one that climbs out with `..`). Returns the real path, a
     /// label for messages, and whether it is outside. Writes always go through `resolve`, so the

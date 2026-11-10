@@ -48,7 +48,7 @@ const ACTIONS: &[&str] =
 pub fn tools() -> Vec<ToolDef> {
     vec![tool(
         "browser",
-        "Drive the browser the user has open, over the Chrome DevTools Protocol: list tabs (tabs), open a page (open), navigate (goto), click a CSS selector (click), type into a selector (type), press a key (press), read the visible text (text) or the HTML (html), take a screenshot (screenshot), run JavaScript in the page (eval), wait for a selector (wait), go back or forward (back, forward), and close the tab (close). Inside VS Code it drives VS Code's integrated browser (open puts the page in an editor tab; the target is the page id open returns; text returns an accessibility snapshot; close is not available). Outside VS Code it needs a Chrome or Edge started with --remote-debugging-port.",
+        "Drive the browser the user has open, over the Chrome DevTools Protocol: list tabs (tabs), open a page (open), navigate (goto), click a CSS selector (click), type into a selector (type), press a key (press), read the visible text (text) or the HTML (html), take a screenshot (screenshot), run JavaScript in the page (eval), wait for a selector (wait), go back or forward (back, forward), and close the tab (close). Inside VS Code it drives VS Code's integrated browser (open puts the page in an editor tab; the target is the page id open returns; text returns an accessibility snapshot; close is not available). Outside VS Code it needs a Chrome or Edge started with --remote-debugging-port. Every result names the browser that ran it in browserName; tell the user which browser you used.",
         Permission::Network,
         || {
             object(
@@ -363,19 +363,68 @@ fn browser(ctx: &ToolCtx, input: Value) -> ToolResult {
 }
 
 async fn run(p: &BrowserInput) -> ToolResult {
-    let action = p.action.as_str();
     let timeout = Duration::from_millis(p.timeout_ms.unwrap_or(DEFAULT_WAIT_MS).min(MAX_WAIT_MS));
     // An explicit DevTools endpoint wins; otherwise VS Code's own browser, when the extension serves it.
     if std::env::var(ENV_ENDPOINT).map_or(true, |s| s.trim().is_empty()) {
         if let Some(bridge) = Bridge::from_env() {
-            return run_vscode(p, &bridge, timeout).await;
+            return run_vscode(p, &bridge, timeout).await.map(|v| stamp(v, VSCODE_NAME));
         }
     }
     let base = endpoint()?;
+    let v = run_cdp(p, &base, timeout).await?;
+    Ok(stamp(v, &browser_name(&base).await))
+}
+
+/// The name results give for VS Code's integrated browser.
+const VSCODE_NAME: &str = "VS Code";
+
+/// Names the browser that ran the call, so the model and the chat can say where it happened.
+fn stamp(mut v: Value, name: &str) -> Value {
+    if let Some(o) = v.as_object_mut() {
+        o.insert("browserName".into(), json!(name));
+    }
+    v
+}
+
+/// The browser behind a DevTools endpoint, from its `json/version`. Asked on every call: the
+/// user may close Chrome and start Edge on the same port.
+async fn browser_name(base: &url::Url) -> String {
+    let Ok(url) = base.join("json/version") else { return "DevTools browser".into() };
+    let Ok(client) = http() else { return "DevTools browser".into() };
+    match client.get(url).send().await {
+        Ok(res) => res.json::<Value>().await.map(|v| name_from_version(&v)).unwrap_or_else(|_| "DevTools browser".into()),
+        Err(_) => "DevTools browser".into(),
+    }
+}
+
+/// "Chrome", "Edge", "VS Code", ... from the `Browser` and `User-Agent` of `json/version`.
+fn name_from_version(v: &Value) -> String {
+    let browser = v["Browser"].as_str().unwrap_or_default();
+    let ua = v["User-Agent"].as_str().unwrap_or_default();
+    let has = |s: &str| browser.contains(s) || ua.contains(s);
+    let name = if has("Electron/") {
+        if ua.contains(" Code/") || ua.contains("Code - Insiders/") { VSCODE_NAME } else { "Electron app" }
+    } else if has("Edg/") {
+        "Edge"
+    } else if has("OPR/") {
+        "Opera"
+    } else if has("HeadlessChrome/") {
+        "Chrome (headless)"
+    } else if has("Chrome/") {
+        "Chrome"
+    } else {
+        browser.split('/').next().filter(|s| !s.trim().is_empty()).unwrap_or("DevTools browser")
+    };
+    name.to_owned()
+}
+
+/// One action on a browser reached over its DevTools endpoint.
+async fn run_cdp(p: &BrowserInput, base: &url::Url, timeout: Duration) -> ToolResult {
+    let action = p.action.as_str();
 
     // `tabs` needs no page session: it is how the model finds a target id.
     if action == "tabs" {
-        let tabs: Vec<Value> = pages(&base)
+        let tabs: Vec<Value> = pages(base)
             .await?
             .into_iter()
             .map(|t| json!({ "id": t.id, "url": t.url, "title": t.title, "embedded": is_embedded(&t) }))
@@ -386,10 +435,10 @@ async fn run(p: &BrowserInput) -> ToolResult {
     if action == "open" {
         let url = required(&p.url, "url", action)?;
         check_page_url(url)?;
-        return open_tab(&base, url).await;
+        return open_tab(base, url).await;
     }
 
-    let target = pick_target(&base, p.target.as_deref()).await?;
+    let target = pick_target(base, p.target.as_deref()).await?;
     if action == "close" {
         if is_embedded(&target) {
             return Err(ToolError::invalid("this page is inside a view (a VS Code Simple Browser); close the view in VS Code"));
@@ -756,6 +805,20 @@ mod tests {
             assert!(!is_page(&target(kind, url)), "{kind} {url} must not be driven");
         }
         assert!(is_embedded(&target("iframe", "https://a.test/")) && !is_embedded(&target("page", "https://a.test/")));
+    }
+
+    #[test]
+    fn the_browser_behind_an_endpoint_is_named() {
+        let name = |browser: &str, ua: &str| name_from_version(&json!({ "Browser": browser, "User-Agent": ua }));
+        assert_eq!(name("Chrome/131.0.6778.86", "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"), "Chrome");
+        assert_eq!(name("Edg/131.0.2903.70", "Mozilla/5.0 Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"), "Edge");
+        assert_eq!(name("Chrome/128.0.6613.186", "Mozilla/5.0 Code/1.95.3 Chrome/128.0.6613.186 Electron/32.2.1 Safari/537.36"), "VS Code");
+        assert_eq!(name("HeadlessChrome/131.0.0.0", ""), "Chrome (headless)");
+        assert_eq!(name("Firefox/133", ""), "Firefox");
+        assert_eq!(name_from_version(&json!({})), "DevTools browser");
+        let v = stamp(json!({ "url": "https://a.test/" }), VSCODE_NAME);
+        assert_eq!(v["browserName"], "VS Code");
+        assert_eq!(stamp(json!("text"), "Chrome"), json!("text"), "only objects are stamped");
     }
 
     fn input(v: Value) -> BrowserInput {

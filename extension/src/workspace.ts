@@ -73,6 +73,8 @@ export class WorkspaceSync implements vscode.Disposable {
     const c = vscode.workspace.getConfiguration(SECTION);
     const exclude = c.get<string[]>('index.exclude', []).filter((g) => typeof g === 'string' && g.trim());
     this.pending.clear();
+    // Cleared first: a summary from an earlier runtime does not mean this one has the workspace.
+    this.summary = undefined;
     const started = Date.now();
     this.summary = await client.request<WorkspaceSummary>('workspace/open', { root, exclude });
     const s = this.summary.stats;

@@ -1135,7 +1135,9 @@
         const lab = el('span', 'label', label);
         lab.dataset.tool = it.tool;
         if (tool === 'browser') row.append(icon('globe', 'browser-icon'));
-        row.append(lab, el('span', EXPANDED.has(tool) ? 'detail cmd' : 'detail', it.detail || ''));
+        row.append(lab);
+        if (it.browser) row.append(browserChip(it.browser));
+        row.append(el('span', EXPANDED.has(tool) ? 'detail cmd' : 'detail', it.detail || ''));
         step(row);
         // The dot itself is the stop control while the call runs; `toolDone` clears it.
         if (it.stop && it.ok === undefined && state.busy) stopDot(row);
@@ -1329,6 +1331,14 @@
     box.append(head, body);
     if (cut) box.append(el('div', 'term-note', 'Showing the start of the output. Open in editor to see all of it.'));
     return box;
+  }
+  // Where a browser call ran: VS Code's integrated browser, or Chrome, Edge, ... over a DevTools port.
+  function browserChip(name) {
+    const vs = name === 'VS Code';
+    const chip = el('span', 'browser-where');
+    chip.append(icon(vs ? 'vscode' : 'browser'), el('span', null, vs ? 'VS Code browser' : name));
+    chip.title = vs ? "Ran in VS Code's integrated browser" : `Ran in ${name}, through its DevTools port`;
+    return chip;
   }
   // About how many tokens a tool result adds to the conversation (it is sent again on every later turn).
   function tokenChip(row, tokens) {
@@ -2493,6 +2503,7 @@
           row.querySelector('.tool-stop')?.remove();
           row.classList.toggle('quiet', Boolean(row.dataset.edit) && m.ok);
           if (row.dataset.edit && !m.ok) row.querySelector('.label').textContent = 'Edit failed';
+          if (m.browser && !row.querySelector('.browser-where')) row.querySelector('.label')?.after(browserChip(m.browser));
           attachOutput(row, m.id, row.querySelector('.label')?.dataset.tool || '', m.ok, m.output, m.outputCut);
           tokenChip(row, m.tokens);
           scroll();

@@ -2145,6 +2145,8 @@ impl Run {
             Ok(_) => any_ok = true,
             Err(e) => any_fixable |= errors::Error::from_tool(&call.name, e).severity != errors::Severity::Blocked,
         };
+        // Images that read_file loaded: the model sees them after the results of this round.
+        let mut images: Vec<ContentPart> = Vec::new();
         let mut i = 0;
         let mut carry: Option<(usize, Target)> = None;
         while i < calls.len() || carry.is_some() {
@@ -2174,7 +2176,10 @@ impl Run {
             let started = Instant::now();
             let outs = join_all(batch.iter().map(|(n, t)| self.execute(t, &calls[*n]))).await;
             self.rec.metrics.tool_ms += started.elapsed().as_millis() as u64;
-            for ((n, _), res) in batch.iter().zip(outs) {
+            for ((n, _), mut res) in batch.iter().zip(outs) {
+                if let Some((media_type, data)) = res.as_mut().ok().and_then(tools::fs::take_image) {
+                    images.push(ContentPart::Image { media_type, data });
+                }
                 note(&calls[*n], &res);
                 results[*n] = Some(self.record(&calls[*n], &res));
             }
@@ -2182,7 +2187,7 @@ impl Run {
                 break;
             }
         }
-        let parts = results
+        let mut parts: Vec<ContentPart> = results
             .into_iter()
             .zip(calls)
             .map(|(r, c)| {
@@ -2194,6 +2199,7 @@ impl Run {
                 })
             })
             .collect();
+        parts.extend(images);
         Round { parts, any_ok, any_fixable }
     }
 
@@ -3238,6 +3244,28 @@ mod tests {
         assert!(reqs[0]["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "apply_patch"));
         assert_eq!(reqs[2]["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").count(), 2);
         assert!(Store::new(Some(&root.join(".anvil-data"))).load(&r.id).is_some());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_read_image_reaches_the_model_as_an_image() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        let dir = std::env::temp_dir().join(format!("task-x-agent-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("panel.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let (base, seen) = mock(vec![sse_tool("c1", "read_file", json!({ "path": png.to_string_lossy() })), sse_text("I see the panel.")]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        // A read-only mode: reading outside the workspace asks nothing and is not refused.
+        let r = run(host(&root, ApprovalDecision::Deny, events.clone()), params(&base, ChatMode::Ask, Mode::ReadOnly), CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        let sent = seen.lock().unwrap()[1]["messages"].to_string();
+        assert!(sent.contains("data:image/png;base64,iVBORw0KGgpyZXN0"), "{sent}");
+        assert!(!sent.contains(r#"\"base64\""#), "the data is not also in the text result: {sent}");
+        let ev = events.lock().unwrap();
+        assert!(!ev.iter().any(|e| e["type"] == "approvalRequested"), "a read does not ask");
+        assert!(!serde_json::to_string(&*ev).unwrap().contains("iVBORw0KGgpyZXN0"), "the chat events stay small");
+        std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(root).ok();
     }
 

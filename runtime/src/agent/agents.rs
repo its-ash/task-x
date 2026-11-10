@@ -75,11 +75,12 @@ pub fn map_tool(t: &str) -> Vec<String> {
         "grep" | "search" => &["search_text", "search_regex", "multi_search", "find_symbol", "find_references"],
         "glob" | "ls" => &["find_files", "list_files", "get_file_tree"],
         "edit" | "multiedit" | "write" | "notebookedit" => &["replace_text", "edit_files", "create_file", "apply_patch", "insert_at_line", "delete_range"],
-        "bash" | "shell" | "terminal" | "runcommands" => &["run_command", "run_tests", "check_build", "run_linter", "format_code"],
+        "bash" | "shell" | "terminal" | "runcommands" | "execute" => &["run_command", "run_tests", "check_build", "run_linter", "format_code"],
         "webfetch" => &["web_fetch"],
         "websearch" => &["web_search"],
+        "web" => &["web_fetch", "web_search"],
         "task" | "agent" => &["run_subagent"],
-        "todowrite" => &["todo_write"],
+        "todowrite" | "todo" => &["todo_write"],
         _ => return vec![t.trim().to_owned()],
     };
     mapped.iter().map(|s| (*s).to_owned()).collect()
@@ -141,7 +142,7 @@ fn load_dir(dir: &Path, prefix: &str, rank: u8, out: &mut BTreeMap<String, (u8, 
         let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_owned();
         let (file, fallback) = if p.is_dir() {
             (p.join("AGENT.md"), fname)
-        } else if let Some(stem) = fname.strip_suffix(".md") {
+        } else if let Some(stem) = fname.strip_suffix(".agent.md").or_else(|| fname.strip_suffix(".md")) {
             (p.clone(), stem.to_owned())
         } else {
             continue;

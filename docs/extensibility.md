@@ -38,6 +38,8 @@ There are three ways a skill applies:
 
 Run **task-x: List Skills** to see what task-x found.
 
+To write a skill from a prompt, run `/create-skill <what the skill does>`. The agent reads the project, writes `.claude/skills/<name>/SKILL.md`, and copies the skill folder to `.github/skills/<name>/`, so Claude Code and Copilot both read it.
+
 ## Commands
 
 A command is a Claude Code slash command: a Markdown file that you run by typing `/name`. It never applies by itself, and the model does not see it in the skill index.
@@ -78,6 +80,7 @@ You are a code reviewer. Report each defect with file:line and severity.
 - **Delegation:** in Agent and Team mode, the lead sees the agents by name and description and calls `run_subagent { agent, objective }`. Several run at the same time, and each writing agent works in its own git worktree. In Team mode, each `run_plan` step can name an agent.
 - **Direct use:** start the message with `@name` to run the whole task as that agent. The `@` menu lists agents at the start of the message, and the `/` menu lists them too.
 - Each subagent has a lane in the chat with the agent's name, model, live steps, and Stop, Apply, or Discard.
+- **From a prompt:** `/create-agent <what the agent does>` makes the agent read the project and write `.claude/agents/<name>.md` for Claude Code and `.github/agents/<name>.agent.md` for Copilot. Copilot's tool names (`read`, `search`, `edit`, `execute`, `web`) also work in task-x.
 
 ## Plugins
 
