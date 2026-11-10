@@ -231,6 +231,27 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+/// Skills that come with task-x. They are listed for the model, which loads one when it fits; a
+/// file with the same name replaces one.
+const BUILTIN_SKILLS: &[(&str, &str, &str)] = &[(
+    "vector-design",
+    "Design vector graphics as SVG: logos, icons, marks, badges, favicons, simple illustrations. Use it when asked to create, draw, or redesign a logo, icon, or any .svg.",
+    "Make the graphic as hand-written SVG, then check it with render_svg until it is right.\n\n\
+1. Brief. Take the name, what the brand does, the style words, and the colours from the request. Ask only when the name is missing; otherwise choose and say what you chose.\n\
+2. Concept. Pick one simple idea: a monogram, a geometric mark built from the initial, an abstract symbol of what the brand does, or a wordmark. Say it in one line before you draw.\n\
+3. Write the file with create_file, at assets/logo/<name>.svg unless the project has a better place:\n\
+   - Root: <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 512 512\" role=\"img\" aria-labelledby=\"title\"> with a <title id=\"title\">. No width or height, so it scales. Use a wide viewBox (such as 0 0 1200 400) for a horizontal lockup.\n\
+   - Build on a grid: whole or half numbers, shapes centred, about 8% margin on every side, nothing outside the viewBox.\n\
+   - Shapes only: <path>, <circle>, <rect>, <polygon>, <g>, <linearGradient> when asked. No <image>, <script>, <foreignObject>, external links, or embedded fonts.\n\
+   - Colours: 1 to 3 flat colours plus one neutral, written as #rrggbb. Put each colour in a fill attribute, not CSS classes, so tools can recolour it.\n\
+   - Letters: prefer drawing the letters as paths. If you use <text>, name a common family with a fallback (font-family=\"Inter, Arial, sans-serif\") and say that the user should outline it in a design tool.\n\
+   - Keep it small: under 30 elements and 10 KB for a logo; reuse with <use> and <symbol>.\n\
+4. Check it with render_svg { path }. Look at the picture: balance, centring, spacing, stroke weight, legibility, and anything clipped. Read every warning and fix it. Render again with background black when the logo must work on dark backgrounds, and with size 32 to see it as a favicon. Repeat until there are no warnings and it looks right; at most 4 rounds.\n\
+5. If you cannot see images (render_svg gives no picture, or you are a text-only model), call render_svg with image false and work from contentBox, colors, and warnings.\n\
+6. On request, add variants next to it: <name>-mark.svg (symbol only, square), <name>-mono.svg (one colour, currentColor), <name>-dark.svg (for dark backgrounds).\n\
+7. Report the files, the concept, and the colours used. Do not paste the whole SVG into the reply.",
+)];
+
 fn builtin(out: &mut BTreeMap<String, Skill>) {
     for (name, description, hint, body) in BUILTIN {
         out.insert(
@@ -246,6 +267,24 @@ fn builtin(out: &mut BTreeMap<String, Skill>) {
                 argument_hint: Some((*hint).to_owned()),
                 source: "built-in".into(),
                 on_demand: false,
+                body: (*body).to_owned(),
+            },
+        );
+    }
+    for (name, description, body) in BUILTIN_SKILLS {
+        out.insert(
+            (*name).to_owned(),
+            Skill {
+                name: (*name).to_owned(),
+                description: (*description).to_owned(),
+                kind: Kind::Skill,
+                triggers: Vec::new(),
+                patterns: Vec::new(),
+                tools: Vec::new(),
+                params: Vec::new(),
+                argument_hint: None,
+                source: "built-in".into(),
+                on_demand: true,
                 body: (*body).to_owned(),
             },
         );
@@ -474,7 +513,11 @@ mod tests {
         assert_eq!(init[0].name, "init");
         assert!(init[0].text.contains("CLAUDE.md") && init[0].text.ends_with("Focus, if given: the runtime folder"));
         assert!(s.iter().any(|x| x.name == "security-review" && x.kind == Kind::Command));
-        assert!(index(&s, &[]).is_none(), "built-in commands are not listed for the model");
+        let idx = index(&s, &[]).unwrap();
+        assert!(!idx.contains("- init:") && !idx.contains("- review:"), "built-in commands are not listed for the model: {idx}");
+        assert!(idx.contains("- vector-design: Design vector graphics"), "the built-in skill is listed: {idx}");
+        let v = select(&s, "/vector-design a fox logo", &[]);
+        assert!(v[0].text.contains("render_svg"), "it names the tool that checks the drawing");
     }
 
     #[test]

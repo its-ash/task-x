@@ -18,7 +18,7 @@
     delete_file: 'Deleted', git_status: 'Git status', git_diff: 'Git diff', git_log: 'Git log', git_show: 'Git show', get_changed_files: 'Changed files',
     get_file_history: 'File history', format_code: 'Formatted', run_linter: 'Linted', run_tests: 'Ran tests', check_build: 'Built',
     get_diagnostics: 'Checked problems', run_command: 'Ran', read_skill: 'Loaded skill', web_fetch: 'Fetched',
-    multi_search: 'Searched', read_log: 'Read log', remember: 'Remembered', find_tool: 'Loaded tools', summarize_file: 'Summarized',
+    multi_search: 'Searched', read_log: 'Read log', remember: 'Remembered', find_tool: 'Loaded tools', summarize_file: 'Summarized', render_svg: 'Rendered SVG',
     Read: 'Read', Write: 'Wrote', Edit: 'Edited', MultiEdit: 'Edited', NotebookEdit: 'Edited notebook', Bash: 'Ran', BashOutput: 'Read output',
     KillShell: 'Stopped shell', Grep: 'Searched', Glob: 'Found files', LS: 'Listed', TodoWrite: 'Updated todos', WebFetch: 'Fetched',
     WebSearch: 'Searched web', browser: 'VS Code browser', Skill: 'Used skill', Task: 'Subagent', ExitPlanMode: 'Finished plan', run_subagent: 'Subagent', worktree_apply: 'Applied worktree', worktree_discard: 'Discarded worktree',

@@ -3248,6 +3248,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rendered_svg_reaches_the_model_as_an_image() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><circle cx="32" cy="32" r="24" fill="#0ea5e9"/></svg>"##;
+        let root = temp_repo(&[("logo.svg", svg)]);
+        let (base, seen) = mock(vec![sse_tool("c1", "render_svg", json!({ "path": "logo.svg", "size": 64 })), sse_text("The mark is centred.")]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let r = run(host(&root, ApprovalDecision::Deny, events.clone()), params(&base, ChatMode::Agent, Mode::AskBeforeEdit), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        let reqs = seen.lock().unwrap();
+        let tools = reqs[0]["tools"].to_string();
+        assert!(tools.contains("render_svg") || tools.contains("find_tool"), "the tool is offered: {tools}");
+        let sent = reqs[1]["messages"].to_string();
+        assert!(sent.contains("data:image/png;base64,iVBORw0KGgo"), "the PNG goes to the model as an image");
+        assert!(sent.contains("#0ea5e9") && sent.contains("contentBox"), "with the report as the tool result");
+        let ev = events.lock().unwrap();
+        assert!(!ev.iter().any(|e| e["type"] == "approvalRequested"), "rendering is a read and asks nothing");
+        assert!(!serde_json::to_string(&*ev).unwrap().contains("iVBORw0KGgo"), "the chat events stay small");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
     async fn a_read_image_reaches_the_model_as_an_image() {
         let root = temp_repo(&[("a.txt", "x\n")]);
         let dir = std::env::temp_dir().join(format!("task-x-agent-image-{}", std::process::id()));

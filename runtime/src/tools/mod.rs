@@ -15,6 +15,7 @@ pub mod search;
 pub mod shell_search;
 pub mod stream;
 pub mod validate;
+pub mod vector;
 pub mod web;
 
 use crate::context::Workspace;
@@ -871,6 +872,7 @@ pub fn registry() -> &'static [ToolDef] {
             todos::tools(),
             web::tools(),
             browser::tools(),
+            vector::tools(),
         ]
         .into_iter()
         .flatten()
@@ -1107,6 +1109,7 @@ pub(crate) mod tests {
             "check_build",
             "get_diagnostics",
             "run_command",
+            "render_svg",
         ] {
             assert!(find(required).is_some(), "missing tool {required}");
         }

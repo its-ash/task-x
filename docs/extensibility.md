@@ -38,6 +38,8 @@ There are three ways a skill applies:
 
 Run **task-x: List Skills** to see what task-x found.
 
+task-x comes with one on-demand skill, `vector-design`. It covers logos, icons, and other SVG graphics: the model writes the SVG, then checks it with the `render_svg` tool, which returns a PNG and a list of problems. A skill file named `vector-design` replaces it.
+
 To write a skill from a prompt, run `/create-skill <what the skill does>`. The agent reads the project, writes `.claude/skills/<name>/SKILL.md`, and copies the skill folder to `.github/skills/<name>/`, so Claude Code and Copilot both read it.
 
 ## Commands
