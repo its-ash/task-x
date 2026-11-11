@@ -18,9 +18,14 @@ export class RpcError extends Error {
   }
 }
 
+/** How long an aborted request waits for the runtime to confirm the cancel before it is rejected locally. */
+const ABORT_GRACE_MS = 5_000;
+
 export interface RequestOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** After an abort, how long to wait for the runtime's reply before rejecting locally (default 5 s). */
+  abortGraceMs?: number;
 }
 
 type Handler = (params: unknown) => void;
@@ -66,13 +71,21 @@ export class JsonRpcClient {
             this.settle(id, undefined, new RpcError(ErrorCode.RequestCancelled, `request timed out after ${opts.timeoutMs}ms`));
           }, opts.timeoutMs)
         : undefined;
-      opts.signal?.addEventListener('abort', cancel, { once: true });
+      // The runtime normally answers a cancel at once. If it does not (a tool or provider call that
+      // hangs), the request is rejected here anyway, so the caller never waits forever.
+      let grace: ReturnType<typeof setTimeout> | undefined;
+      const onAbort = () => {
+        cancel();
+        grace = setTimeout(() => this.settle(id, undefined, new RpcError(ErrorCode.RequestCancelled, 'request cancelled (the runtime did not confirm)')), opts.abortGraceMs ?? ABORT_GRACE_MS);
+      };
+      opts.signal?.addEventListener('abort', onAbort, { once: true });
       this.pending.set(id, {
         resolve: resolve as (v: unknown) => void,
         reject,
         cleanup: () => {
           clearTimeout(timer);
-          opts.signal?.removeEventListener('abort', cancel);
+          clearTimeout(grace);
+          opts.signal?.removeEventListener('abort', onAbort);
         },
       });
       this.write({ jsonrpc: '2.0', id, method, params });

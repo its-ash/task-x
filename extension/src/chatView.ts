@@ -2511,7 +2511,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // MCP resources (`#mcp:`) are read through the runtime, so it is connected first.
     await this.getClient().then((c) => this.wire(c), () => undefined);
     const claudeRun = engine() === 'claudeCode' && !worker;
-    const full = await withHashContext(withDocs(withChatMode(withAgent(text, claudeRun))));
+    // The run is registered, so nothing may throw before the `try` below: a throw here would leave
+    // the tab marked as running and every later message waiting behind it.
+    let full = text;
+    try {
+      full = await withHashContext(withDocs(withChatMode(withAgent(text, claudeRun))));
+    } catch (e) {
+      this.log('warn', `context for the request failed, sending it without: ${describeError(e)}`);
+    }
     if (claudeRun) {
       try {
         const task = this.night ? await this.nightTask(full, retry, abort.signal) : full;
@@ -2524,7 +2531,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.runs.delete(tab);
         this.markUsed(tab);
         this.runsChanged();
-        await this.persist();
+        await this.persistAfterRun();
         this.drain();
         this.afterRun(before, abort.signal, run.stalled);
       }
@@ -2578,9 +2585,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.runs.delete(tab);
       this.markUsed(tab);
       this.runsChanged();
-      await this.persist();
+      await this.persistAfterRun();
       this.drain();
       this.afterRun(before, abort.signal, run.stalled);
+    }
+  }
+
+  /** Saves after a run. A failed save is logged, not thrown: the waiting messages must still start. */
+  private async persistAfterRun(): Promise<void> {
+    try {
+      await this.persist();
+    } catch (e) {
+      this.log('warn', `saving the chat failed: ${describeError(e)}`);
     }
   }
 

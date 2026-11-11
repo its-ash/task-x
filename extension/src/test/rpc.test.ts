@@ -74,6 +74,20 @@ test('abort sends $/cancelRequest and the runtime reply rejects as cancelled', a
   await assert.rejects(p, (e: unknown) => e instanceof RpcError && e.cancelled);
 });
 
+test('an abort the runtime never answers still rejects after the grace period', async () => {
+  const h = harness();
+  const ac = new AbortController();
+  const p = h.client.request('agent/run', {}, { signal: ac.signal, abortGraceMs: 20 });
+  const req = await h.next();
+  ac.abort();
+  assert.equal((await h.next()).method, '$/cancelRequest');
+  await assert.rejects(p, (e: unknown) => e instanceof RpcError && e.cancelled);
+  // A late reply for the settled request is ignored.
+  h.reply({ id: req.id, result: 'late' });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(h.errors, []);
+});
+
 test('timeouts reject locally and notify the runtime', async () => {
   const h = harness();
   const p = h.client.request('slow', undefined, { timeoutMs: 20 });
