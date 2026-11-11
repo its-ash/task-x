@@ -3090,10 +3090,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     <button type="button" id="settingsBtn" class="pick settings-pick"></button>
     <button type="button" id="effortBtn" class="pick effort-pick"></button>
     <button type="button" id="mcpBtn" class="pick mcp-pick"></button>
-    <span class="spacer"></span>
+    <span class="toolbar-end">
     <span id="ctxMeter" class="meter" role="meter" aria-valuemin="0" aria-valuemax="100" hidden></span>
     <button type="button" id="refineBtn" class="action" title="Refine: rewrite the prompt with the routed model (task-x.routing), else the active model. Ctrl+Z restores your text." aria-label="Refine prompt"><span class="codicon codicon-sparkle" aria-hidden="true"></span></button>
     <button type="button" id="send" class="action primary"></button>
+    </span>
   </div>
 </form>
 <script nonce="${nonce}" src="${hljs}"></script>
