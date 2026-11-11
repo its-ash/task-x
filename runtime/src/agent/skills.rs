@@ -252,6 +252,11 @@ const BUILTIN_SKILLS: &[(&str, &str, &str)] = &[(
 7. Report the files, the concept, and the colours used. Do not paste the whole SVG into the reply.",
 )];
 
+/// The skills that come with task-x: (name, instructions).
+pub fn builtin_skills() -> impl Iterator<Item = (&'static str, &'static str)> {
+    BUILTIN_SKILLS.iter().map(|(name, _, body)| (*name, *body))
+}
+
 fn builtin(out: &mut BTreeMap<String, Skill>) {
     for (name, description, hint, body) in BUILTIN {
         out.insert(

@@ -1278,8 +1278,13 @@
     const role = el('span', 'lane-role');
     role.append(icon(it.agent ? 'hubot' : ROLE_ICONS[it.role] || 'person'), el('span', null, [it.step, it.agent || it.role].filter(Boolean).join(' · ')));
     head.append(role, el('span', 'lane-model', it.model), el('span', 'spacer'), el('span', 'lane-status', LANE_STATUS[it.status] || it.status));
+    const open = () => vscode.postMessage({ type: 'openSubagent', taskId: it.taskId });
+    head.append(button('action', icon('open-preview'), open, 'Open this subagent’s activity in a tab'));
     if (it.status === 'running' && it.stoppable !== false) head.append(button('action stop-btn', icon('debug-stop'), () => vscode.postMessage({ type: 'stopLane', taskId: it.taskId }), 'Stop this subagent'));
-    card.append(head, el('div', 'lane-goal', it.objective));
+    const goal = el('div', 'lane-goal', it.objective);
+    goal.title = 'Open this subagent’s activity in a tab';
+    goal.addEventListener('click', open);
+    card.append(head, goal);
     const body = el('details', 'lane-body');
     body.open = it.status === 'running';
     const steps = el('summary', null, `${(it.hidden || 0) + it.steps.length} step${(it.hidden || 0) + it.steps.length === 1 ? '' : 's'}`);
@@ -1918,7 +1923,7 @@
     document.body.dataset.tabKind = cur?.kind || 'chat';
     strip.replaceChildren(...tabs.map((t) => {
       const on = onChat && t.id === activeTab;
-      const tab = el('div', `chat-tab ${t.kind}`);
+      const tab = el('div', `chat-tab ${t.kind}${t.preview ? ' preview' : ''}`);
       tab.dataset.id = t.id;
       if (t.role) tab.dataset.role = t.role;
       if (t.status) tab.dataset.status = t.status;
@@ -1932,7 +1937,6 @@
       const close = button('tab-close', icon('close'), (e) => { e.stopPropagation(); closeTab(t.id); }, `Close ${t.title}`);
       close.tabIndex = -1;
       tab.append(mark, el('span', 'tab-title', t.title));
-      if (t.kind === 'subagent' && t.status && t.status !== 'running') tab.append(el('span', 'tab-state'));
       // The running chat: its elapsed time, and Stop in place of Close.
       if (t.started) {
         const time = el('span', 'tab-time');
@@ -1941,6 +1945,11 @@
         const stop = button('tab-stop', icon('debug-stop'), (e) => { e.stopPropagation(); vscode.postMessage({ type: 'cancel', tab: t.id }); }, 'Stop the running task of this tab');
         stop.tabIndex = -1;
         tab.append(time, stop);
+      } else if (t.preview) {
+        // The shared preview tab: Pin keeps it on the strip after the run ends.
+        const pin = button('tab-close', icon('pin'), (e) => { e.stopPropagation(); vscode.postMessage({ type: 'pinTab', id: t.id }); }, `Keep ${t.title} open`);
+        pin.tabIndex = -1;
+        tab.append(pin, close);
       } else tab.append(close);
       tab.addEventListener('click', () => selectTab(t.id));
       tab.addEventListener('auxclick', (e) => { if (e.button === 1) { e.preventDefault(); closeTab(t.id); } });

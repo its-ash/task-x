@@ -225,6 +225,8 @@ type Inbound =
   | { type: 'newTab' }
   | { type: 'selectTab'; id: string }
   | { type: 'closeTab'; id: string }
+  | { type: 'openSubagent'; taskId: string }
+  | { type: 'pinTab'; id: string }
   | { type: 'selectModel'; kind: string; model: string }
   | { type: 'loadModels'; force?: boolean }
   | { type: 'addProvider' }
@@ -331,6 +333,9 @@ interface ChatTab {
   laneTaskId?: string;
   dir?: string | null;
   status?: 'running' | 'completed' | 'failed' | 'cancelled';
+  /** Subagent tabs: on the tab strip (opened from its lane card), and kept there after the run ends. */
+  shown?: boolean;
+  pinned?: boolean;
   usage?: { used: number; window: number };
   assistant?: Extract<Item, { kind: 'assistant' }>;
   /** The plan checklist of this chat's newest task. */
@@ -362,6 +367,9 @@ interface Run {
 const MAX_PARALLEL_RUNS = 4;
 
 const blankTab = (items: Item[] = [], taskId?: string): ChatTab => ({ id: `t${Date.now().toString(36)}${randomBytes(3).toString('hex')}`, kind: 'chat', items, taskId });
+
+/** Chat tabs are always on the strip; a subagent's tab only after its lane card opened it. */
+const onStrip = (t: ChatTab): boolean => t.kind === 'chat' || !!t.shown;
 
 function tabTitle(t: ChatTab): string {
   if (t.kind === 'subagent') return t.title || t.role || 'Subagent';
@@ -783,17 +791,54 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /** Closes a tab. The running task's tab stays open; closing the last chat opens an empty one. */
   private async closeTab(id: string): Promise<void> {
-    const i = this.tabs.findIndex((t) => t.id === id);
-    const tab = this.tabs[i];
+    const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return;
+    // A subagent's tab only leaves the strip: its lane card can open it again.
+    if (tab.kind === 'subagent') {
+      tab.shown = tab.pinned = false;
+      if (this.activeTab === id) return this.showTab(this.tabs.some((t) => t.id === tab.parent) ? tab.parent! : this.chatTabId);
+      return this.postTabs();
+    }
     if (this.runs.has(tab.id)) return void vscode.window.showWarningMessage('task-x: stop the running task before you close its tab.');
-    if (tab.kind === 'chat') await this.archive(tab);
-    this.tabs.splice(i, 1);
+    await this.archive(tab);
+    const strip = this.tabs.filter(onStrip);
+    const i = strip.indexOf(tab);
+    // A closed chat takes its subagents with it.
+    this.tabs = this.tabs.filter((t) => t !== tab && t.parent !== id);
     if (!this.tabs.some((t) => t.kind === 'chat')) this.addTab(blankTab());
-    if (this.chatTabId === id) this.chatTabId = (this.tabs.slice(0, i).findLast((t) => t.kind === 'chat') ?? this.tabs.find((t) => t.kind === 'chat'))!.id;
-    if (this.activeTab === id) return this.showTab(this.tabs[Math.min(i, this.tabs.length - 1)].id);
+    if (this.chatTabId === id) this.chatTabId = (strip.slice(0, i).findLast((t) => t.kind === 'chat') ?? this.tabs.find((t) => t.kind === 'chat'))!.id;
+    if (this.activeTab === id) {
+      const left = this.tabs.filter(onStrip);
+      return this.showTab(left[Math.min(i, left.length - 1)].id);
+    }
     this.postTabs();
     await this.saveTabs();
+  }
+
+  /**
+   * Opens a subagent's tab from its lane card. Unpinned subagent tabs share one preview slot, so
+   * opening another one replaces it; pinning keeps a tab on the strip.
+   */
+  private openSubagent(taskId: string): void {
+    const sub = this.tabs.find((t) => t.kind === 'subagent' && t.laneTaskId === taskId);
+    if (!sub) return void vscode.window.showInformationMessage('task-x: this subagent’s activity is no longer available.');
+    if (!sub.shown) for (const t of this.tabs) if (t.kind === 'subagent' && t.shown && !t.pinned) t.shown = false;
+    sub.shown = true;
+    this.showTab(sub.id);
+  }
+
+  private pinTab(id: string): void {
+    const sub = this.tabs.find((t) => t.id === id && t.kind === 'subagent' && t.shown);
+    if (!sub) return;
+    sub.pinned = true;
+    this.postTabs();
+  }
+
+  /** When a chat's run ends, the preview tabs of its subagents close; pinned ones stay. */
+  private closePreviews(parent: string): void {
+    const previews = this.tabs.filter((t) => t.parent === parent && t.shown && !t.pinned);
+    for (const t of previews) t.shown = false;
+    if (previews.some((t) => t.id === this.activeTab)) this.showTab(this.tabs.some((t) => t.id === parent) ? parent : this.chatTabId);
   }
 
   /** Empties a chat tab after its task was deleted. */
@@ -807,11 +852,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   private postTabs(): void {
-    const tabs = this.tabs.map((t) => ({
+    const tabs = this.tabs.filter(onStrip).map((t) => ({
       id: t.id,
       kind: t.kind,
       title: tabTitle(t),
       role: t.role ?? null,
+      preview: t.kind === 'subagent' && !t.pinned,
       status: t.kind === 'subagent' ? t.status : this.runs.has(t.id) ? 'running' : null,
       started: t.kind === 'chat' ? (this.runs.get(t.id)?.started ?? null) : null,
     }));
@@ -1310,6 +1356,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'closeTab':
         if (typeof m.id === 'string') await this.closeTab(m.id);
         break;
+      case 'openSubagent':
+        if (typeof m.taskId === 'string') this.openSubagent(m.taskId);
+        break;
+      case 'pinTab':
+        if (typeof m.id === 'string') this.pinTab(m.id);
+        break;
       case 'openTask':
         if (typeof m.id === 'string' && m.id.length <= 100) {
           await this.openTask(m.id).catch((e) => vscode.window.showErrorMessage(`task-x: ${describeError(e)}`));
@@ -1611,17 +1663,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.postChat({ type: 'laneUpdate', item: lane });
   }
 
-  /** Opens a tab for a subagent next to its chat, without leaving the tab on screen. */
+  /**
+   * Records a subagent's activity next to its chat. Its tab stays off the strip until the lane card
+   * opens it, so many subagents do not crowd the tabs.
+   */
   private openSubagentTab(e: Extract<AgentEvent, { type: 'subagentStarted' }>): void {
     const parent = this.chat;
     const tab: ChatTab = { id: blankTab().id, kind: 'subagent', title: e.agent || e.name, role: e.role, parent: parent.id, laneTaskId: e.taskId, dir: e.dir, status: 'running', items: [{ kind: 'user', text: e.objective, mode: 'agent' }] };
     let at = this.tabs.indexOf(parent);
     while (this.tabs[at + 1]?.parent === parent.id) at++;
     this.tabs.splice(at + 1, 0, tab);
-    const done = this.tabs.filter((t) => t.kind === 'subagent' && t.status !== 'running' && t.id !== this.activeTab);
+    const done = this.tabs.filter((t) => t.kind === 'subagent' && t.status !== 'running' && !t.shown);
     const extra = this.tabs.filter((t) => t.kind === 'subagent').length - MAX_SUBAGENT_TABS;
     for (const old of done.slice(0, Math.max(0, extra))) this.tabs.splice(this.tabs.indexOf(old), 1);
-    this.postTabs();
   }
 
   /** Adds one event of a subagent to its tab. Edits outside a worktree also go to the changed-files list. */
@@ -2516,6 +2570,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         t.status = 'cancelled';
         t.assistant = undefined;
       }
+      this.closePreviews(tab);
       run.approvals.clear();
       run.cards.clear();
       // Steers the task never read are sent again as the next message, so nothing is lost.

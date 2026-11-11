@@ -103,9 +103,9 @@ body {
 .chat-tab.subagent[data-role=documentation] { --tab: var(--role-documentation); --tab-container: var(--role-documentation-container); --on-tab-container: var(--on-role-documentation-container); }
 .chat-tab .tab-icon { flex: none; font-size: 13px; color: var(--tab); }
 .chat-tab .tab-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chat-tab .tab-state { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
-.chat-tab[data-status=failed] .tab-state { background: var(--warn); }
-.chat-tab[data-status=cancelled] .tab-state { background: var(--muted); }
+/* A subagent's preview tab: one shared slot, closed when its chat's run ends unless pinned. */
+.chat-tab.preview .tab-title { font-style: italic; }
+.lane-goal { cursor: pointer; }
 .tab-close { display: inline-grid; place-items: center; flex: none; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; color: inherit; background: none; cursor: pointer; opacity: 0; transition: opacity var(--md-duration-short4) ease, background-color var(--md-duration-short4) ease; }
 .tab-close .codicon { font-size: 12px; }
 /* The running chat tab: elapsed time and a Stop button, always visible. */

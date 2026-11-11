@@ -412,6 +412,33 @@ pub fn args(p: &Params, task_tools: Option<(&Path, &Path)>, instructions: &str, 
     a
 }
 
+/// Tools every built-in agent gets in Claude Code besides its own list, so it can look around.
+const AGENT_READ_TOOLS: &[&str] = &["read_file", "read_range", "find_files", "list_files"];
+
+/// `--agents` with the task-x built-in agents (such as `designer`), so Claude Code's Agent tool can
+/// start them. They work through the task-x tools, so they are added only with `use_task_tools`.
+/// An agent file of the same name replaces a built-in one, in task-x and here.
+fn agent_args(p: &Params, agents: &[crate::agent::agents::AgentDef]) -> Vec<String> {
+    use crate::agent::agents::inline_skills;
+    if !p.use_task_tools {
+        return Vec::new();
+    }
+    let defs: serde_json::Map<String, Value> = agents
+        .iter()
+        .filter(|a| a.source == "built-in")
+        .map(|a| {
+            let tools: Vec<String> = AGENT_READ_TOOLS
+                .iter()
+                .map(|t| (*t).to_owned())
+                .chain(a.tools.iter().filter(|t| !AGENT_READ_TOOLS.contains(&t.as_str())).cloned())
+                .map(|t| format!("{TASK_TOOL_PREFIX}{t}"))
+                .collect();
+            (a.name.clone(), json!({ "description": a.description, "prompt": inline_skills(&a.body), "tools": tools }))
+        })
+        .collect();
+    if defs.is_empty() { Vec::new() } else { vec!["--agents".into(), Value::Object(defs).to_string()] }
+}
+
 fn text_of(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
@@ -1071,8 +1098,10 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
     if let Some(m) = &p.subagent_model {
         cmd.env(SUBAGENT_MODEL_ENV, m);
     }
+    let agents = crate::agent::agents::load(Some(&root), &crate::agent::agents::user_dirs(), &[]);
     let mut child = cmd
         .args(args(&p, exe.as_deref().map(|e| (e, root.as_path())), &instruction_note(&host), approval.as_deref()))
+        .args(agent_args(&p, &agents))
         .current_dir(&root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1412,6 +1441,19 @@ mod tests {
         assert!(only_imported.iter().any(|x| x.contains("3845")), "imported servers are passed without task-x tools too");
         with.mcp_servers.insert("task-x".into(), json!({}));
         assert!(validate(&with).is_err(), "the task-x server name is reserved");
+        let builtins = crate::agent::agents::load(None, &[], &[]);
+        let ag = agent_args(&p, &builtins);
+        assert_eq!(ag[0], "--agents");
+        let defs: Value = serde_json::from_str(&ag[1]).unwrap();
+        let d = &defs["designer"];
+        assert!(d["description"].as_str().unwrap().contains("SVG"), "the built-in designer is offered to Claude Code");
+        assert!(!d["prompt"].as_str().unwrap().contains("read_skill"), "Claude Code has no read_skill: the skill is written in");
+        let tools: Vec<&str> = d["tools"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(tools.contains(&"mcp__task-x__render_svg") && tools.contains(&"mcp__task-x__read_file") && !tools.iter().any(|t| t.contains("run_command")));
+        assert!(agent_args(&Params { use_task_tools: false, ..p.clone() }, &builtins).is_empty(), "no task-x tools, no designer");
+        let mut replaced = builtins.clone();
+        replaced[0].source = ".claude/agents/designer.md".into();
+        assert!(agent_args(&p, &replaced).is_empty(), "Claude Code reads the user's file itself");
         let plain = args(&p, None, "", None);
         let only = &plain[plain.iter().position(|x| x == "--append-system-prompt").unwrap() + 1];
         assert!(

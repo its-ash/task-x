@@ -195,6 +195,25 @@ fn builtin(out: &mut BTreeMap<String, (u8, AgentDef)>) {
     }
 }
 
+/// Instructions that need no `read_skill`: each built-in skill the body loads is written in at the
+/// end. For an engine without the task-x skill tools (Claude Code).
+pub fn inline_skills(body: &str) -> String {
+    let mut out = body.to_owned();
+    let mut added = Vec::new();
+    for (name, text) in super::skills::builtin_skills() {
+        let call = format!("read_skill {{ name: \"{name}\" }}");
+        if out.contains(&call) {
+            out = out.replace(&call, &format!("the {name} skill below"));
+            added.push(format!("## Skill: {name}\n\n{text}"));
+        }
+    }
+    for s in added {
+        out.push_str("\n\n");
+        out.push_str(&s);
+    }
+    out
+}
+
 /// Every agent found; `plugins` are `(name, path)` of the enabled plugins. Workspace agents come
 /// first, then the user's, then plugin agents, then the built-in ones (each group by name), so the
 /// index the lead sees keeps the project's own agents when it has to cut the list.
@@ -339,6 +358,9 @@ mod tests {
         assert!(d.tools.iter().any(|t| t == "render_svg") && d.tools.iter().any(|t| t == "export_png"));
         assert!(!d.tools.iter().any(|t| t == "run_command"), "no shell for a designer");
         assert!(d.body.contains("vector-design"));
+        let inline = inline_skills(&d.body);
+        assert!(!inline.contains("read_skill"), "no read_skill call left: {inline}");
+        assert!(inline.contains("## Skill: vector-design") && inline.contains("render_svg { path }"), "the skill text is written in");
         let base = std::env::temp_dir().join(format!("task-x-agents-designer-{}", std::process::id()));
         std::fs::create_dir_all(base.join(".claude/agents")).unwrap();
         std::fs::write(base.join(".claude/agents/designer.md"), "---\ndescription: ours\n---\nOur brand rules.").unwrap();

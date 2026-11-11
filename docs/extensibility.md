@@ -76,7 +76,7 @@ maxIterations: 20
 You are a code reviewer. Report each defect with file:line and severity.
 ```
 
-- Built in: `designer` designs logos, icons, and other SVG graphics with the `vector-design` skill. It checks each version with `render_svg` and exports PNG sizes with `export_png`. It uses the selected model and has no shell. Run `@designer a logo for Acme`, or let the lead delegate to it. A file named `designer` in any agents folder replaces it.
+- Built in: `designer` designs logos, icons, and other SVG graphics with the `vector-design` skill. It checks each version with `render_svg` and exports PNG sizes with `export_png`. It uses the selected model and has no shell. Run `@designer a logo for Acme`, or let the lead delegate to it. A file named `designer` in any agents folder replaces it. With Claude Code as the engine and `task-x.claudeCode.useTaskXTools` on, task-x passes the designer to Claude Code with `--agents`, so Claude can start it too.
 - Locations, lowest precedence first: the built-in agents, plugin `agents/` folders (named `<plugin>:<name>`), `~/.claude/agents/`, `~/.copilot/agents/`, `~/.task-x/agents/`, then `.claude/agents/`, `.github/agents/`, and `.task-x/agents/` in the workspace.
 - `tools` uses Claude Code names (`Read`, `Grep`, `Glob`, `Edit`, `Write`, `Bash`, `WebFetch`, `WebSearch`) or task-x tool names. An agent whose tools only read is read-only. `mode: read` or `mode: write` sets it directly.
 - `model` is a model id for the current provider, or `sonnet`, `opus`, or `haiku` on Anthropic. Other providers ignore those aliases.
