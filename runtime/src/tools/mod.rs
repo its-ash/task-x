@@ -555,7 +555,8 @@ fn take_ignored() -> Vec<String> {
 
 /// Reads a tool's input into `T`, repairing the shapes models really send instead of failing:
 /// another name for a field (`file` for `path`, `pattern` for `query`, `case` for `caseSensitive`),
-/// a field the tool does not take (dropped and reported), JSON sent as a string, a single value for
+/// a field the tool does not take (dropped and reported), one field sent under two of its names
+/// (one kept, the other dropped and reported), JSON sent as a string, a single value for
 /// a list, numbers and booleans as strings (and the reverse), `null` for an optional field, and a
 /// bare value for a tool with one required field.
 pub fn parse<T: DeserializeOwned>(input: Value) -> Result<T, ToolError> {
@@ -709,9 +710,14 @@ fn repair<T: DeserializeOwned>(v: &mut Value, err: &str) -> bool {
         } else if same_field(&key, "path") && expected.iter().any(|w| w == "glob") && !obj.contains_key("glob") && val.is_string() {
             obj.insert("glob".into(), json!(path_glob(val.as_str().unwrap_or_default())));
         } else {
-            IGNORED.with(|i| i.borrow_mut().push(key));
+            IGNORED.with(|i| i.borrow_mut().push(format!("`{key}` (not an input of this tool)")));
         }
         return true;
+    }
+    // One field under two names (`glob` and its alias `pattern`): one is dropped.
+    if err.starts_with("duplicate field") {
+        let Some(field) = ticked(err, "duplicate field").into_iter().next() else { return false };
+        return drop_duplicate::<T>(v, &field);
     }
     if err.starts_with("missing field") {
         let Some(want) = ticked(err, "missing field").into_iter().next() else { return false };
@@ -744,6 +750,50 @@ fn repair<T: DeserializeOwned>(v: &mut Value, err: &str) -> bool {
     // One object where a list goes: `{...}` for `[{...}]`.
     if err.starts_with("invalid type: map, expected a sequence") {
         return wrap_first_map(v);
+    }
+    false
+}
+
+/// Every key of every object in `v`, with the JSON pointer of the object that holds it.
+fn object_keys(v: &Value, at: &str, out: &mut Vec<(String, String)>) {
+    let esc = |k: &str| k.replace('~', "~0").replace('/', "~1");
+    match v {
+        Value::Object(o) => {
+            for (k, x) in o {
+                out.push((at.to_owned(), k.clone()));
+                object_keys(x, &format!("{at}/{}", esc(k)), out);
+            }
+        }
+        Value::Array(a) => a.iter().enumerate().for_each(|(i, x)| object_keys(x, &format!("{at}/{i}"), out)),
+        _ => {}
+    }
+}
+
+/// Serde names only the field, not the alias that repeated it, so each key is tried: the one whose
+/// removal ends the duplicate (without making a required field missing) is dropped and reported.
+/// The field's own name is tried last, so it is the one kept.
+fn drop_duplicate<T: DeserializeOwned>(v: &mut Value, field: &str) -> bool {
+    let dup = format!("duplicate field `{field}`");
+    let mut keys = Vec::new();
+    object_keys(v, "", &mut keys);
+    keys.sort_by_key(|(_, k)| k == field);
+    for (at, key) in keys {
+        let mut trial = v.clone();
+        let Some(obj) = trial.pointer_mut(&at).and_then(Value::as_object_mut) else { continue };
+        obj.remove(&key);
+        let ended = match T::deserialize(&trial) {
+            Ok(_) => true,
+            Err(e) => {
+                let e = e.to_string();
+                !e.starts_with(&dup) && !e.starts_with("missing field")
+            }
+        };
+        if ended {
+            *v = trial;
+            let note = if key == field { format!("`{key}` (given twice)") } else { format!("`{key}` (another name for `{field}`, which was also given)") };
+            IGNORED.with(|i| i.borrow_mut().push(note));
+            return true;
+        }
     }
     false
 }
@@ -940,7 +990,7 @@ pub async fn call(def: &'static ToolDef, ctx: Arc<ToolCtx>, input: Value) -> Too
         if ignored.is_empty() {
             return r;
         }
-        let note = format!("{} does not take {}; ignored", def.name, ignored.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", "));
+        let note = format!("{} ignored {}", def.name, ignored.join(", "));
         match r {
             Ok(Value::Object(mut o)) => {
                 o.insert("ignoredInput".into(), json!(note));
@@ -1028,12 +1078,38 @@ pub(crate) mod tests {
         assert_eq!(p.glob.as_deref(), Some("src/**"), "a folder covers what is under it");
         let p: Probe = parse(json!(r#"{"search": "a \"b\"", "tags": "one.rs", "stepNumber": 3, "limit": null}"#)).unwrap();
         assert_eq!((p.query.as_str(), p.tags.as_slice(), p.limit), ("a \"b\"", ["one.rs".to_string()].as_slice(), None));
-        assert_eq!(take_ignored(), ["stepNumber"], "a field nothing reads is dropped and reported");
+        assert_eq!(take_ignored(), ["`stepNumber` (not an input of this tool)"], "a field nothing reads is dropped and reported");
         let p: Probe = parse(json!({ "arguments": { "query": "x", "tags": "[\"a\", \"b\"]", "label": 7 } })).unwrap();
         assert_eq!((p.tags.len(), p.label.as_deref()), (2, Some("7")));
         let p: Probe = parse(json!("needle")).unwrap();
         assert_eq!(p.query, "needle", "a bare value is the required field");
         assert!(parse::<Probe>(json!({ "limit": 3 })).unwrap_err().message.contains("missing field `query`"));
+    }
+
+    #[test]
+    fn a_field_under_two_names_keeps_its_own_name() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Find {
+            #[serde(alias = "pattern")]
+            glob: String,
+            #[serde(default)]
+            limit: Option<usize>,
+        }
+        take_ignored();
+        let f: Find = parse(json!({ "pattern": "**/*.ts", "glob": "src/**", "max_depth": 3, "limit": 5 })).unwrap();
+        assert_eq!((f.glob.as_str(), f.limit), ("src/**", Some(5)), "the field's own name wins");
+        let ignored = take_ignored();
+        assert_eq!(ignored.len(), 2, "{ignored:?}");
+        assert!(ignored.iter().any(|n| n.starts_with("`max_depth`")) && ignored.iter().any(|n| n.starts_with("`pattern` (another name for `glob`")), "{ignored:?}");
+        // In a nested list item too.
+        #[derive(Deserialize)]
+        struct Batch {
+            items: Vec<Find>,
+        }
+        let b: Batch = parse(json!({ "items": [{ "glob": "a" }, { "glob": "b", "pattern": "c" }] })).unwrap();
+        assert_eq!(b.items[1].glob, "b");
+        take_ignored();
     }
 
     #[test]
