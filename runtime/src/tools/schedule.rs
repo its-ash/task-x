@@ -3,7 +3,7 @@
 //! `agent::wakeup`), so the result arrives later as a message; a caller without a way to deliver
 //! it later (the MCP server on its own) waits for the result.
 
-use super::{Permission, ToolCtx, ToolDef, ToolError, ToolErrorKind, ToolResult, parse};
+use super::{Permission, ToolCtx, ToolDef, ToolError, ToolResult, parse};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -163,7 +163,6 @@ pub fn check_wait(input: Value) -> Result<WaitSpec, ToolError> {
 
 fn wait_until(c: &ToolCtx, input: Value) -> ToolResult {
     let spec = check_wait(input)?;
-    let run = super::find("run_command").ok_or_else(|| ToolError::new(ToolErrorKind::Failed, "run_command is missing"))?;
     let started = Instant::now();
     let attempt_secs = spec.interval.as_secs().clamp(10, MAX_ATTEMPT_SECS).min(spec.timeout.as_secs());
     let mut attempts = 0u32;
@@ -175,7 +174,7 @@ fn wait_until(c: &ToolCtx, input: Value) -> ToolResult {
             cmd["cwd"] = json!(cwd);
         }
         // A command that cannot start (bad cwd, empty program) fails the same way every time.
-        let out = (run.handler)(c, cmd)?;
+        let out = super::validate::run_check(c, cmd)?;
         let r = &out["result"];
         let text = format!("{}\n{}", r["stdout"].as_str().unwrap_or_default(), r["stderr"].as_str().unwrap_or_default());
         let met = match &spec.pattern {
@@ -214,6 +213,7 @@ fn tail(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ToolErrorKind;
     use super::super::tests::{ctx, run};
     use super::*;
 

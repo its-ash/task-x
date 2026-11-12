@@ -48,7 +48,8 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     // `--hook-shell-edit [--no-block] [--ask]`: Claude Code PreToolUse hook for Bash. It blocks file
-    // writes from the shell (unless `--no-block`) and starts long commands in the background.
+    // writes, searches, and `sleep` from the shell (unless `--no-block`) and starts long commands
+    // in the background.
     if std::env::args().nth(1).as_deref() == Some("--hook-shell-edit") {
         let flags: Vec<String> = std::env::args().skip(2).collect();
         let mut input = String::new();

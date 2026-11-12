@@ -270,6 +270,17 @@ struct RunIn {
 }
 
 fn run_command(c: &ToolCtx, input: Value) -> ToolResult {
+    run(c, input, true)
+}
+
+/// `run_command` for a `wait_until` check: the check itself may wait (`sleep 1; curl …`), since
+/// it already runs on the waiting tool's schedule.
+pub(super) fn run_check(c: &ToolCtx, input: Value) -> ToolResult {
+    run(c, input, false)
+}
+
+/// `no_sleep`: refuse `sleep` used to wait; the waiting tools do that for every provider.
+fn run(c: &ToolCtx, input: Value, no_sleep: bool) -> ToolResult {
     let i: RunIn = parse(input)?;
     if i.background {
         // The agent loop runs background commands itself; other callers (MCP) cannot be told later.
@@ -288,6 +299,9 @@ fn run_command(c: &ToolCtx, input: Value) -> ToolResult {
     }
     if command[0].trim().is_empty() {
         return Err(ToolError::invalid("the program name is empty"));
+    }
+    if no_sleep && exec::is_sleep_command(&line.clone().unwrap_or_else(|| command.join(" "))) {
+        return Err(ToolError::new(ToolErrorKind::Forbidden, exec::SLEEP_BLOCKED));
     }
     let (abs, label) = c.resolve(i.cwd.as_deref().unwrap_or("."))?;
     if !abs.is_dir() {
@@ -445,6 +459,14 @@ mod tests {
         assert_eq!(r["result"]["stdout"], "a | b && c\n", "no shell interpretation");
         assert!(super::super::tests::run(&c, "run_command", json!({ "command": ["ls"], "cwd": "../" })).is_err());
         assert!(super::super::tests::run(&c, "run_command", json!({ "command": [] })).is_err());
+        // Waiting goes to the waiting tools, whatever the provider or MCP client.
+        for nap in [json!(["sleep", "5"]), json!("sleep 5 && ls"), json!(["sh", "-c", "sleep 1; ls"])] {
+            let e = super::super::tests::run(&c, "run_command", json!({ "command": nap })).unwrap_err();
+            assert!(e.kind == ToolErrorKind::Forbidden && e.message.contains("wait_until"), "{nap}: {}", e.message);
+        }
+        // A wait_until check may pause between its own steps.
+        let r = run_check(&c, json!({ "command": ["sh", "-c", "sleep 0.1; echo up"] })).unwrap();
+        assert_eq!(r["result"]["stdout"], "up\n");
     }
 
     #[test]

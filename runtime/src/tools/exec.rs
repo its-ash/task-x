@@ -54,6 +54,22 @@ pub fn is_long_command(cmd: &str) -> bool {
     LONG_COMMAND.is_match(cmd)
 }
 
+/// `sleep` run as a command: at the start, after `;`, `&&`, `|`, or `&`, in `$(…)`, in a
+/// `do`/`then`/`else` body, or as `sh -c 'sleep …'`. A word `sleep` in arguments does not count.
+static SLEEP_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:^|[;&|({\n]|\$\(|\b(?:do|then|else)\b)\s*(?:(?:ba|z)?sh\s+-[a-z]*c\s+['"]?)?(?:sudo\s+)?sleep(?:\s|$)"#)
+        .expect("sleep command regex")
+});
+
+/// Why a `sleep` command is refused, for every engine and provider: the waiting tools do it
+/// without holding a shell (the Claude Code hook names them with their `mcp__task-x__` prefix).
+pub const SLEEP_BLOCKED: &str = "Blocked: do not run sleep as a command to wait. Use the waiting tools instead: sleep for a pause of up to 120 seconds; wait_until to wait until a command succeeds (a server is up, a job is done) instead of a sleep-and-poll loop; schedule_wakeup to come back later (then end your turn). For a slow command, start it in the background and keep working.";
+
+/// Whether a command line (a shell string, or argv joined with spaces) runs `sleep` to wait.
+pub fn is_sleep_command(cmd: &str) -> bool {
+    SLEEP_COMMAND.is_match(cmd)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Output {
@@ -385,6 +401,26 @@ mod tests {
         }
         for quick in ["git status", "ls -la", "echo cargo build", "cat Cargo.toml", "npm -v && echo test", "rustc --version"] {
             assert!(!is_long_command(quick), "{quick}");
+        }
+    }
+
+    #[test]
+    fn sleep_counts_only_as_a_command() {
+        for nap in [
+            "sleep 30",
+            "sleep",
+            "sh -c sleep 2; echo x",
+            "bash -lc 'sleep 5 && curl localhost'",
+            "npm run dev & sleep 3; curl -s localhost:3000",
+            "until curl -sf localhost:3000; do sleep 2; done",
+            "while true; do\n  sleep 1\ndone",
+            "x=$(sleep 1; echo hi)",
+            "cd app && sudo sleep 10",
+        ] {
+            assert!(is_sleep_command(nap), "{nap}");
+        }
+        for ok in ["echo sleep 5", "cargo test sleep_pauses", "git log --grep sleep", "npm run sleepy", "ls sleep/", "sleeper 3"] {
+            assert!(!is_sleep_command(ok), "{ok}");
         }
     }
 

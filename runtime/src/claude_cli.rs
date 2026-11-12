@@ -127,11 +127,13 @@ static WRITE_API: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("write api regex")
 });
+const SHELL_SLEEP_BLOCKED: &str = "Blocked: do not sleep in Bash. Use the task-x MCP tools to wait: mcp__task-x__sleep for a pause under 2 minutes; mcp__task-x__wait_until to wait until a command succeeds (a server is up, a job is done) instead of a sleep-and-poll loop; mcp__task-x__schedule_wakeup to come back later (then end your turn). For a slow command, run it with run_in_background: true and keep working.";
 const SHELL_EDIT_BLOCKED: &str = "Blocked: this command writes files from the shell. Use the mcp__task-x__ tools instead: replace_text for one change, edit_files for many changes across files, apply_patch for a diff, create_file for a new file.";
 
 /// `--hook-shell-edit`: a Claude Code PreToolUse hook. Reads the hook JSON from stdin; exit code 2
-/// blocks the Bash call and sends the reason to Claude. It blocks file writes from the shell, and
-/// code searches (`grep`, `rg`, `find`) with the task-x search call that does the same.
+/// blocks the Bash call and sends the reason to Claude. It blocks file writes from the shell,
+/// `sleep` (the task-x waiting tools do that), and code searches (`grep`, `rg`, `find`) with the
+/// task-x search call that does the same.
 pub fn shell_edit_hook(input: &str) -> Result<(), String> {
     let v = serde_json::from_str::<Value>(input).unwrap_or_default();
     let cmd = v["tool_input"]["command"].as_str().unwrap_or_default();
@@ -139,6 +141,9 @@ pub fn shell_edit_hook(input: &str) -> Result<(), String> {
     let script = cmd.replace("stdout.write(", "").replace("stderr.write(", "");
     if SHELL_EDIT.is_match(cmd) || (INLINE_SCRIPT.is_match(cmd) && WRITE_API.is_match(&script)) {
         return Err(SHELL_EDIT_BLOCKED.into());
+    }
+    if crate::tools::exec::is_sleep_command(cmd) {
+        return Err(SHELL_SLEEP_BLOCKED.into());
     }
     let cwd = std::path::PathBuf::from(v["cwd"].as_str().unwrap_or("."));
     crate::tools::shell_search::suggestion(cmd, &cwd).map_or(Ok(()), Err)
@@ -1848,6 +1853,22 @@ mod tests {
         for search in ["grep -rn tee src", "rg python3", "find . -name '*.rs'", r#"grep -rn "ROAD_END\|createRoad" scripts/*.js | sort"#] {
             let msg = hook(search).unwrap_err();
             assert!(msg.contains("mcp__task-x__") && !msg.contains("writes files"), "{search}: {msg}");
+        }
+        // Waiting goes to the task-x sleep, wait_until, and schedule_wakeup tools.
+        for sleep in [
+            "sleep 30",
+            "sleep 5 && curl localhost:3000",
+            "npm run dev & sleep 3; curl -s localhost:3000",
+            "until curl -sf localhost:3000; do sleep 2; done",
+            "while true; do\n  sleep 1\ndone",
+            "x=$(sleep 1; echo hi)",
+            "cd app && sudo sleep 10",
+        ] {
+            let msg = hook(sleep).unwrap_err();
+            assert!(msg.contains("mcp__task-x__sleep") && msg.contains("mcp__task-x__wait_until"), "{sleep}: {msg}");
+        }
+        for ok in ["echo sleep 5", "cargo test sleep_pauses", "git log --grep sleep", "npm run sleepy", "ls sleep/"] {
+            assert!(hook(ok).is_ok(), "{ok}");
         }
     }
 }

@@ -2282,6 +2282,10 @@ impl Run {
         def: &'static tools::ToolDef,
         call: &ToolCall,
     ) -> Result<(Value, tokio::sync::oneshot::Receiver<Result<Value, tools::ToolError>>), tools::ToolError> {
+        // Refused before it starts, so a background `sleep` is not reported later as a failure.
+        if tools::exec::is_sleep_command(&command_text(&call.input["command"])) {
+            return Err(tools::ToolError::new(ToolErrorKind::Forbidden, tools::exec::SLEEP_BLOCKED));
+        }
         let mut input = call.input.clone();
         if let Some(o) = input.as_object_mut() {
             o.remove("background");
@@ -3493,7 +3497,7 @@ mod tests {
         let call = ToolCall {
             id: "slow".into(),
             name: "run_command".into(),
-            input: json!({ "command": ["sh", "-c", "sleep 2; echo typecheck-done"] }),
+            input: json!({ "command": ["sh", "-c", "perl -e 'select(undef, undef, undef, 2)'; echo typecheck-done"] }),
         };
         let started = Instant::now();
         // A 100 ms hand-off stands in for the real 30 s window.
@@ -3534,13 +3538,21 @@ mod tests {
         assert_eq!(out["result"]["stdout"], "hi\n", "{out}");
         assert!(out.get("background").is_none());
         assert!(run.background.done.lock().unwrap().is_empty(), "no report for a command that finished");
+        // `sleep` is refused at once, in the foreground and in the background, for every provider.
+        for input in [json!({ "command": ["sleep", "30"] }), json!({ "command": "sleep 30 && echo hi", "background": true })] {
+            let call = ToolCall { id: "nap".into(), name: "run_command".into(), input };
+            let e = run.command_with(def, &call, COMMAND_HANDOFF).await.unwrap_err();
+            assert!(e.kind == ToolErrorKind::Forbidden && e.message.contains("wait_until"), "{}", e.message);
+            assert!(run.start_background(def, &call).is_err());
+        }
+        assert_eq!(run.background.running.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing started");
         std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
     async fn background_commands_report_back_before_the_task_ends() {
         let root = temp_repo(&[("a.txt", "x\n")]);
-        let cmd = json!({ "command": ["sh", "-c", "sleep 1; echo bg-done"], "background": true });
+        let cmd = json!({ "command": ["sh", "-c", "perl -e 'select(undef, undef, undef, 1)'; echo bg-done"], "background": true });
         let (base, seen) =
             mock(vec![sse_tool("c1", "run_command", cmd), sse_text("Started it; nothing else to do."), sse_text("The install finished.")]);
         let h = host(&root, ApprovalDecision::Allow, Arc::default());
@@ -3661,7 +3673,7 @@ mod tests {
     async fn stopping_a_command_keeps_the_task_running() {
         let root = temp_repo(&[("a.txt", "x\n")]);
         let (base, seen) =
-            mock(vec![sse_tool("c1", "run_command", json!({ "command": ["sleep", "30"] })), sse_text("Skipped the slow command.")]);
+            mock(vec![sse_tool("c1", "run_command", json!({ "command": ["tail", "-f", "/dev/null"] })), sse_text("Skipped the slow command.")]);
         let h = host(&root, ApprovalDecision::Allow, Arc::default());
         let cancels = h.tool_cancels.clone();
         let stopper = tokio::spawn(async move {
