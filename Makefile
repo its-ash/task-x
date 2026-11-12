@@ -12,7 +12,7 @@ ASSET := $(BIN)-$(OS)-$(ARCH)
 # Where `make install` and `make add` put the runtime: $(PREFIX)/bin/task-x-runtime.
 PREFIX ?= $(HOME)/.local
 
-.PHONY: run build deploy install add bump
+.PHONY: run build deploy install add bump link-vscode
 
 # Debug build, then an interactive session in this folder.
 run:
@@ -31,6 +31,19 @@ install: build
 	cp $(RUNTIME)/target/release/$(BIN) $(PREFIX)/bin/$(BIN)
 	@echo "Installed $(PREFIX)/bin/$(BIN)."
 	@case ":$$PATH:" in *":$(PREFIX)/bin:"*) ;; *) echo "$(PREFIX)/bin is not on your PATH; add it to run $(BIN) by name." ;; esac
+	@$(MAKE) --no-print-directory link-vscode
+
+# Installed task-x VS Code extensions run the runtime in their own bin/ folder, which no update
+# reaches. Each one's copy becomes a link to $(PREFIX)/bin/$(BIN), so every install (and its MCP
+# tools) is what VS Code runs after a window reload. Running processes keep their old binary.
+link-vscode:
+	@for d in $(HOME)/.vscode/extensions/its-ash.task-x-* $(HOME)/.vscode-insiders/extensions/its-ash.task-x-* $(HOME)/.cursor/extensions/its-ash.task-x-*; do \
+		[ -d "$$d" ] || continue; \
+		mkdir -p "$$d/bin"; \
+		rm -f "$$d/bin/$(BIN)"; \
+		ln -s "$(PREFIX)/bin/$(BIN)" "$$d/bin/$(BIN)"; \
+		echo "Linked $$d/bin/$(BIN) to $(PREFIX)/bin/$(BIN); reload VS Code to use it."; \
+	done
 
 # Raises the patch version in runtime/Cargo.toml until no release v<version> exists, so each
 # deploy is a new release. A deploy that failed before its release keeps its version.
@@ -69,3 +82,4 @@ add:
 	cp "$$tmp/$(ASSET)" $(PREFIX)/bin/$(BIN); \
 	chmod +x $(PREFIX)/bin/$(BIN); \
 	echo "Installed $(PREFIX)/bin/$(BIN)."
+	@$(MAKE) --no-print-directory link-vscode
