@@ -38,7 +38,7 @@ pub fn cut(r: &mut TaskRecord, at: usize) -> Result<Vec<usize>, String> {
     r.checkpoints.truncate(at);
     r.final_text = last_answer(r);
     r.error = None;
-    if r.status == Status::Running {
+    if matches!(r.status, Status::Running | Status::Sleeping) {
         r.status = Status::Cancelled;
     }
     r.updated_ms = now_ms();
@@ -59,7 +59,7 @@ pub fn fork(store: &Store, id: &str, at: Option<usize>) -> Result<TaskRecord, St
     for c in &mut r.checkpoints {
         c.operations = 0;
     }
-    if r.status == Status::Running {
+    if matches!(r.status, Status::Running | Status::Sleeping) {
         r.status = Status::Cancelled;
     }
     (r.created_ms, r.updated_ms) = (now_ms(), now_ms());

@@ -11,6 +11,7 @@ pub mod memory;
 pub mod todos;
 pub mod patch;
 pub mod repomap;
+pub mod schedule;
 pub mod search;
 pub mod shell_search;
 pub mod stream;
@@ -923,6 +924,7 @@ pub fn registry() -> &'static [ToolDef] {
             web::tools(),
             browser::tools(),
             vector::tools(),
+            schedule::tools(),
         ]
         .into_iter()
         .flatten()

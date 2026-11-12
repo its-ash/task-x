@@ -5,6 +5,7 @@ pub mod agents;
 pub mod session;
 pub mod compact;
 pub mod cost;
+pub mod export;
 pub mod hooks;
 pub mod marketplace;
 pub mod plugins;
@@ -14,6 +15,8 @@ pub mod recall;
 pub mod skills;
 pub mod store;
 pub mod team;
+pub mod timeline;
+pub mod wakeup;
 
 use crate::context::Workspace;
 use crate::errors;
@@ -648,6 +651,25 @@ struct Run {
     agents: Vec<agents::AgentDef>,
     /// `additionalContext` from hooks, given to the model before its next step.
     hook_notes: Mutex<Vec<String>>,
+    /// Wake-ups (`schedule_wakeup`) and background checks (`wait_until`) of this task.
+    wakeups: Arc<wakeup::Scheduler>,
+    /// Time spent sleeping until a wake-up; it does not count towards the deadline.
+    slept: Duration,
+    /// The workspace whose timeline gets this task's snapshots (top-level tasks only).
+    timeline_root: Option<std::path::PathBuf>,
+    /// A failed snapshot was reported; later failures stay quiet.
+    timeline_warned: bool,
+}
+
+/// Whether a call may change files, so the timeline takes a snapshot after its step. Unknown and
+/// MCP tools count as changing; the agent's own read-only tools do not.
+fn changes_files(name: &str) -> bool {
+    match tools::find(name) {
+        Some(d) => d.permission != Permission::Read,
+        None => {
+            !([READ_SKILL, ASK_USER, FIND_TOOL, SUMMARIZE, SEMANTIC, DOCS_SEARCH, "recall"].contains(&name) || wakeup::name(name).is_some())
+        }
+    }
 }
 
 /// Tools offered from the start when the tool list is lazy: what nearly every coding task uses.
@@ -802,6 +824,8 @@ enum Target {
     Docs,
     /// `recall`: the memory of earlier tasks in this workspace.
     Recall,
+    /// `schedule_wakeup`, `list_wakeups`, `cancel_wakeup`.
+    Wakeup(&'static str),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1025,7 +1049,9 @@ impl Target {
         match self {
             Self::Builtin(d) => d.permission,
             Self::Mcp(..) => Permission::Network,
-            Self::Skill | Self::Ask(_) | Self::FindTool | Self::Summarize | Self::Semantic | Self::Docs | Self::Recall => Permission::Read,
+            Self::Skill | Self::Ask(_) | Self::FindTool | Self::Summarize | Self::Semantic | Self::Docs | Self::Recall | Self::Wakeup(_) => {
+                Permission::Read
+            }
             Self::Subagent(r, _) => {
                 if r.writes() {
                     Permission::Write
@@ -1353,6 +1379,7 @@ impl Run {
             None if call.name == SEMANTIC => Target::Semantic,
             None if call.name == DOCS_SEARCH => Target::Docs,
             None if call.name == "recall" => Target::Recall,
+            None if wakeup::name(&call.name).is_some() => Target::Wakeup(wakeup::name(&call.name).unwrap_or(wakeup::LIST)),
             None if call.name == "worktree_apply" => Target::Worktree("worktree_apply"),
             None if call.name == "worktree_discard" => Target::Worktree("worktree_discard"),
             None => self
@@ -1819,6 +1846,13 @@ impl Run {
             }
             // A command that keeps running is handed to the background instead of blocking the turn.
             Target::Builtin(def) if def.name == "run_command" => self.command_with(def, call, COMMAND_HANDOFF).await,
+            // Checks run in the background; the result comes as a wake-up.
+            Target::Builtin(def) if def.name == tools::schedule::WAIT_UNTIL => {
+                self.wakeups.call(def.name, &call.input, |stop| self.ctx_with(stop).map_err(|e| tools::ToolError::new(ToolErrorKind::Failed, e)))
+            }
+            Target::Wakeup(name) => {
+                self.wakeups.call(name, &call.input, |_| Err(tools::ToolError::new(ToolErrorKind::Failed, "no tool context needed")))
+            }
             Target::Builtin(def) => {
                 // The user can stop this call alone; the task goes on.
                 let stop = self.cancel.child_token();
@@ -2331,6 +2365,49 @@ impl Run {
         }
     }
 
+    /// Saves the workspace as the next snapshot of this task's timeline (`timelineSnapshot`). A
+    /// failure never stops the task: the first one is reported as a warning.
+    async fn snap(&mut self, label: String) {
+        let Some(root) = self.timeline_root.clone() else { return };
+        let id = self.rec.id.clone();
+        let res = tokio::task::spawn_blocking(move || timeline::Timeline::open(&root)?.snapshot(&id, &label))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        match res {
+            Ok(Some(s)) => self.emit(json!({ "type": "timelineSnapshot", "snapshot": s })),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "timeline snapshot failed");
+                if !std::mem::replace(&mut self.timeline_warned, true) {
+                    self.emit(json!({ "type": "warning", "message": format!("The timeline could not save a snapshot: {e}") }));
+                }
+            }
+        }
+    }
+
+    /// Sleeps (status `sleeping`) until a wake-up fires or the user sends a message: then true, and
+    /// they join the conversation. False when nothing is pending any more or the task is cancelled.
+    async fn sleep_until_wakeup(&mut self) -> bool {
+        let since = Instant::now();
+        self.rec.status = Status::Sleeping;
+        self.save();
+        self.emit(self.wakeups.sleeping_event());
+        let (steers, id) = (self.host.steers.clone(), self.rec.id.clone());
+        let woke = self.wakeups.wait(|| steers.lock().expect("steers lock").get(&id).is_some_and(|q| !q.is_empty())).await;
+        self.slept += since.elapsed();
+        let by = if !woke {
+            if self.cancel.is_cancelled() { "cancelled" } else { "nothingPending" }
+        } else if self.wakeups.has_fired() {
+            "wakeup"
+        } else {
+            "message"
+        };
+        self.rec.status = Status::Running;
+        self.emit(json!({ "type": "awake", "by": by, "sleptMs": since.elapsed().as_millis() as u64, "pending": self.wakeups.pending() }));
+        self.save();
+        woke && self.take_steers()
+    }
+
     /// Moves the steering messages and finished background reports into the conversation. Returns whether there were any.
     fn take_steers(&mut self) -> bool {
         let texts = self.host.steers.lock().expect("steers lock").get_mut(&self.rec.id).map(std::mem::take).unwrap_or_default();
@@ -2338,6 +2415,8 @@ impl Run {
         let mut reports = std::mem::take(&mut *self.background.done.lock().expect("background lock"));
         // Context from hooks (`additionalContext`) joins the same way, marked as coming from a hook.
         reports.extend(std::mem::take(&mut *self.hook_notes.lock().expect("hook notes lock")).into_iter().map(|c| format!("<hook_context>\n{c}\n</hook_context>")));
+        // Fired wake-ups: the model's own note, or a finished `wait_until` check (their rows show them).
+        reports.extend(self.wakeups.take_fired());
         for (text, steered) in texts.iter().map(|t| (t, true)).chain(reports.iter().map(|t| (t, false))) {
             let part = ContentPart::Text { text: text.clone() };
             match self.rec.messages.last_mut() {
@@ -2360,6 +2439,8 @@ impl Run {
         let mut stop_blocks = 0;
         self.rec.status = Status::Running;
         self.save();
+        let prompt = self.rec.checkpoints.last().map(|c| c.prompt.clone()).unwrap_or_default();
+        self.snap(format!("Before: {prompt}")).await;
         let status = loop {
             if self.cancel.is_cancelled() {
                 break Status::Cancelled;
@@ -2367,7 +2448,7 @@ impl Run {
             if self.rec.iterations >= self.limits.max_iterations {
                 break Status::MaxIterations;
             }
-            if self.started.elapsed() > deadline {
+            if self.started.elapsed().saturating_sub(self.slept) > deadline {
                 break Status::DeadlineExceeded;
             }
             if self.limits.max_total_tokens.is_some_and(|m| self.total_tokens() >= m) {
@@ -2434,6 +2515,15 @@ impl Run {
                         break Status::Cancelled;
                     }
                 }
+                // Pending wake-ups: the task sleeps until one fires (or a message arrives), then goes on.
+                if self.wakeups.pending() > 0 {
+                    if self.sleep_until_wakeup().await {
+                        continue;
+                    }
+                    if self.cancel.is_cancelled() {
+                        break Status::Cancelled;
+                    }
+                }
                 // A stop hook can send the agent back to work (for example "run the tests first").
                 if stop_blocks < MAX_STOP_BLOCKS {
                     if let Some(reason) = self.stop_reason(stop_blocks > 0).await {
@@ -2451,6 +2541,11 @@ impl Run {
             let round = self.run_calls(&out.tool_calls).await;
             self.rec.messages.push(Message { role: Role::User, content: round.parts });
             self.save();
+            if out.tool_calls.iter().any(|c| changes_files(&c.name)) {
+                let mut names: Vec<&str> = out.tool_calls.iter().map(|c| c.name.as_str()).collect();
+                names.dedup();
+                self.snap(format!("After: {}", names.join(", "))).await;
+            }
             failed_rounds = if round.any_ok || !round.any_fixable { 0 } else { failed_rounds + 1 };
             if failed_rounds >= STUCK_ROUNDS {
                 self.rec.error = Some(format!("every tool call failed in {STUCK_ROUNDS} consecutive rounds"));
@@ -2475,6 +2570,10 @@ impl Run {
             m.cost_usd += t.cost_usd;
             m.unpriced_tokens += t.unpriced;
         }
+        // Wake-ups end with the task.
+        self.wakeups.cancel_all();
+        let end = serde_json::to_value(status).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
+        self.snap(format!("End: {end}")).await;
         self.rec.skipped_checks = self.skipped_checks();
         self.save();
         // What this task did joins the workspace memory that `recall` searches in later tasks.
@@ -2705,6 +2804,8 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     }
     if p.depth == 0 {
         tool_specs.push(ask_spec());
+        // Subagents work to a deadline set by the lead: only top-level tasks sleep and wake.
+        tool_specs.extend(wakeup::specs());
     }
     if has_ws {
         tool_specs.push(summarize_spec());
@@ -2869,6 +2970,7 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
             "skills": active_skills, "agent": agent.as_ref().map(|a| &a.name),
         }),
     );
+    let wakeups = wakeup::Scheduler::new(&rec.id, host.emit.clone(), cancel.clone());
     Ok(Run {
         host,
         rec,
@@ -2899,6 +3001,10 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         embeddings,
         agents: all_agents,
         hook_notes: Mutex::default(),
+        wakeups,
+        slept: Duration::ZERO,
+        timeline_root: root.clone().filter(|_| p.depth == 0),
+        timeline_warned: false,
     })
 }
 
@@ -3448,6 +3554,106 @@ mod tests {
         assert!(first.contains("continues in the background"), "the call returned at once");
         assert!(!first.contains("exitCode"), "the command had not finished, so no output is in the step");
         assert!(seen[2]["messages"].to_string().contains("bg-done"), "the output came as a message");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `wait_until` returns at once; with nothing else to do the task sleeps, and the passed check
+    /// wakes it with the result.
+    #[tokio::test]
+    async fn a_wait_until_check_puts_the_task_to_sleep_and_wakes_it() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        let check = json!({ "command": ["sh", "-c", "sleep 1; echo server ready"], "match": "ready", "intervalSecs": 2, "reason": "server up" });
+        let (base, seen) = mock(vec![sse_tool("c1", "wait_until", check), sse_text("Waiting for the server."), sse_text("The server is up.")]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let h = host(&root, ApprovalDecision::Allow, events.clone());
+        let r = run(h, params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        assert_eq!(r.final_text, "The server is up.");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "one more step after the wake-up");
+        assert!(seen[1]["messages"].to_string().contains("runs in the background"), "the call returned at once");
+        assert!(seen[2]["messages"].to_string().contains("w1 (server up) passed"), "the result came as a message");
+        let events = events.lock().unwrap();
+        let types: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).filter(|t| ["wakeupScheduled", "sleeping", "wakeupFired", "awake"].contains(t)).collect();
+        assert_eq!(types, ["wakeupScheduled", "sleeping", "wakeupFired", "awake"]);
+        assert!(events.iter().any(|e| e["type"] == "awake" && e["by"] == "wakeup"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A message from the user wakes a sleeping task; once nothing is pending the task completes.
+    #[tokio::test]
+    async fn a_message_wakes_a_sleeping_task() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        let (base, seen) = mock(vec![
+            sse_tool("c1", "schedule_wakeup", json!({ "delaySeconds": 1800, "prompt": "Check the deploy of v2", "reason": "deploy check" })),
+            sse_text("I will check the deploy in 30 minutes."),
+            sse_tool("c2", "cancel_wakeup", json!({ "id": "all" })),
+            sse_text("Cancelled the check as asked."),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut h = host(&root, ApprovalDecision::Allow, Arc::default());
+        let (log, steers) = (events.clone(), h.steers.clone());
+        h.emit = Arc::new(move |id, e| {
+            if e["type"] == "sleeping" {
+                assert!(steer(&steers, id, "never mind, cancel the check").unwrap());
+            }
+            log.lock().unwrap().push(e);
+        });
+        let mut p = params(&base, ChatMode::Ask, Mode::AskBeforeEdit);
+        p.task_id = Some("sleepy".into());
+        let store = h.store.clone();
+        let r = run(h, p, CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        assert_eq!(store.load("sleepy").unwrap().status, Status::Completed);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert!(seen[2]["messages"].to_string().contains("never mind, cancel the check"));
+        let events = events.lock().unwrap();
+        let sleeping = events.iter().find(|e| e["type"] == "sleeping").unwrap();
+        assert_eq!((sleeping["pending"][0]["id"].as_str(), sleeping["pending"][0]["reason"].as_str()), (Some("w1"), Some("deploy check")));
+        assert!(events.iter().any(|e| e["type"] == "awake" && e["by"] == "message"));
+        assert!(events.iter().any(|e| e["type"] == "wakeupCancelled" && e["by"] == "model"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Each task leaves a timeline in the project: before it, after each step that changed files,
+    /// and at the end. It can go back to any step, and it exports as one HTML page.
+    #[tokio::test]
+    async fn a_task_leaves_a_timeline_and_exports_as_html() {
+        // The test store lives in the workspace; a real one does not (`initialize.dataDir`, ~/.task-x).
+        let root = temp_repo(&[("greet.txt", "hi\n"), (".gitignore", ".anvil-data/\n")]);
+        let (base, _) = mock(vec![
+            sse_tool("c1", "read_file", json!({ "path": "greet.txt" })),
+            sse_tool("c2", "replace_text", json!({ "path": "greet.txt", "oldText": "hi", "newText": "hello" })),
+            sse_text("Changed the greeting to **hello**."),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let h = host(&root, ApprovalDecision::Allow, events.clone());
+        let mut p = params(&base, ChatMode::Agent, Mode::Autonomous);
+        p.task_id = Some("timeline-task".into());
+        let r = run(h.clone(), p, CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        assert_eq!(std::fs::read_to_string(root.join("greet.txt")).unwrap(), "hello\n");
+
+        let t = timeline::Timeline::open(&root).unwrap();
+        let snaps = t.list("timeline-task").unwrap();
+        let labels: Vec<&str> = snaps.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["Before: Change the greeting to hello", "After: replace_text"], "a read-only step and an unchanged end add nothing");
+        assert_eq!(snaps[1].files, [timeline::FileStatus { path: "greet.txt".into(), status: "modified".into() }]);
+        let reported = events.lock().unwrap().iter().filter(|e| e["type"] == "timelineSnapshot").count();
+        assert_eq!(reported, 2);
+        let r2 = t.restore("timeline-task", &snaps[0].id).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("greet.txt")).unwrap(), "hi\n", "back to before the task");
+        assert_eq!(r2["backup"], snaps[1].id.as_str(), "nothing changed since the last snapshot: it is the way back");
+
+        let log = h.edits.lock().unwrap();
+        let (path, bytes) = export::export_task(&r, &log, Some(&root), None).unwrap();
+        assert!(path.starts_with(root.join(export::EXPORT_DIR)) && bytes > 0, "{}", path.display());
+        let html = std::fs::read_to_string(&path).unwrap();
+        assert!(html.contains("Changed the greeting to <strong>hello</strong>."));
+        assert!(html.contains("<b>replace_text</b> greet.txt") && html.contains("Changed files (1)"));
+        let tail = &html[html.find("<h2>Timeline").unwrap_or(0)..];
+        assert!(html.contains("<b>Step 1</b> · After: replace_text") && html.contains("greet.txt (modified)"), "the timeline is in the page: {tail}");
         std::fs::remove_dir_all(root).ok();
     }
 

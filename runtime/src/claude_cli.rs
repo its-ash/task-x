@@ -105,6 +105,8 @@ const SHELL_EDITS: &[&str] = &["Bash(sed -i:*)", "Bash(perl -i:*)", "Bash(perl -
 const TOOL_NOTE: &str = "Work on files only through the mcp__task-x__ tools: read_file, read_range, read_symbol, search_text, search_regex, multi_search, find_files, find_symbol, find_references, get_dependencies, replace_text, edit_files, insert_at_line, apply_patch, create_file, rename_file, delete_file. Read a file before you edit it. For several replacements in one or more files, call edit_files once with all of them. Search with search_regex (a pattern, with an optional glob such as scripts/*.{js,mjs}), search_text, find_files, find_symbol, and find_references, not with grep, rg, or find in Bash; a hook blocks those. Never write or rewrite files with shell commands (python, node, sed, perl, cat, tee, heredocs) and never script edits; a hook blocks them. Use Bash only to build, test, lint, and run git. When a command result says its output was shortened, call read_log for the part you need. Save lasting project facts (build and test commands, layout, conventions) with remember.";
 /// Long commands run in parallel with the rest of the work.
 const BACKGROUND_NOTE: &str = "For slow commands (package installs, builds, long test runs, dev servers) call Bash with run_in_background: true and keep working on other parts of the task; do not sleep or wait for them. Builds, tests, and installs are moved to the background automatically. Read their output with BashOutput when you need it, and check it before you finish.";
+/// Waiting without holding the turn (only with the task-x tools and a runtime to wake Claude Code).
+const WAKEUP_NOTE: &str = "To wait, do not run sleep in Bash. For a pause under 2 minutes call mcp__task-x__sleep. To come back to something later (check a deploy in 30 minutes, look at a long job again), call mcp__task-x__schedule_wakeup with a delay and a note to yourself, then end your turn: the task sleeps and task-x wakes you with the note when it is due. To wait until a command succeeds (a server is up, a CI run is green), call mcp__task-x__wait_until: it checks in the background and its result comes as a message. list_wakeups and cancel_wakeup manage what is pending.";
 /// Catches shell file rewrites anywhere in a command (after `cd x &&`, in a pipe, in `$(...)`),
 /// which the prefix rules in `SHELL_EDITS` miss.
 static SHELL_EDIT: LazyLock<Regex> = LazyLock::new(|| {
@@ -375,6 +377,10 @@ pub fn args(p: &Params, task_tools: Option<(&Path, &Path)>, instructions: &str, 
             a.push("--disallowedTools".into());
             a.extend(BUILTIN_FILE_TOOLS.iter().chain(SHELL_EDITS).map(|t| t.to_string()));
             allowed.extend(task_tools_allowed(p));
+            // Scheduling, listing, and cancelling wake-ups only touch this run's own timers.
+            if approval.is_some() {
+                allowed.extend(crate::agent::wakeup::NAMES.iter().map(|n| format!("mcp__{}__{n}", crate::mcp_server::SERVER_NAME)));
+            }
         }
     }
     if !servers.is_empty() {
@@ -396,6 +402,7 @@ pub fn args(p: &Params, task_tools: Option<(&Path, &Path)>, instructions: &str, 
     let system: Vec<&str> = [
         task_tools.filter(|_| p.use_task_tools).map(|_| TOOL_NOTE),
         Some(BACKGROUND_NOTE),
+        task_tools.filter(|_| p.use_task_tools && approval.is_some()).map(|_| WAKEUP_NOTE),
         Some(crate::agent::prompt::REPLY_FORMAT),
         Some(instructions).filter(|s| !s.is_empty()),
     ]
@@ -895,36 +902,81 @@ struct ApprovalHost {
     approve_all: bool,
 }
 
-/// Answers approval requests from this run's MCP server: one JSON line in, one JSON line out.
-async fn serve_approvals(listener: TcpListener, token: String, task_id: String, host: ApprovalHost) {
-    let (token, task_id, host) = (Arc::new(token), Arc::new(task_id), Arc::new(host));
+/// The runtime side of this run's scheduler tools (`agent::wakeup`): the MCP server forwards
+/// `schedule_wakeup`, `list_wakeups`, `cancel_wakeup`, and `wait_until` here, so a wake-up can
+/// send Claude Code a message later.
+#[derive(Clone)]
+struct RuntimeTools {
+    wakeups: Arc<crate::agent::wakeup::Scheduler>,
+    /// The tool context for a `wait_until` check, from the token that stops it.
+    ctx: Arc<dyn Fn(CancellationToken) -> Arc<crate::tools::ToolCtx> + Send + Sync>,
+}
+
+/// Runs one forwarded tool call: `{ "ok": result }` or `{ "error": { kind, message } }`.
+fn run_tool(v: &Value, token: &str, tools: Option<&RuntimeTools>) -> Value {
+    let fail = |kind: &str, message: &str| json!({ "error": { "kind": kind, "message": message } });
+    if v["token"].as_str() != Some(token) {
+        return fail("forbidden", "invalid token");
+    }
+    let Some(t) = tools else { return fail("failed", "wake-ups are not available in this run") };
+    let name = v["name"].as_str().unwrap_or_default();
+    if !crate::agent::wakeup::handles(name) {
+        return fail("notFound", &format!("unknown tool '{name}'"));
+    }
+    let input = if v["input"].is_object() { v["input"].clone() } else { json!({}) };
+    match t.wakeups.call(name, &input, |stop| Ok((t.ctx)(stop))) {
+        Ok(r) => json!({ "ok": r }),
+        Err(e) => json!({ "error": e }),
+    }
+}
+
+/// Answers this run's MCP server: approval requests, and forwarded scheduler tool calls
+/// (`"op": "tool"`). One JSON line in, one JSON line out.
+async fn serve_approvals(listener: TcpListener, token: String, task_id: String, host: ApprovalHost, tools: Option<RuntimeTools>) {
+    let (token, task_id, host, tools) = (Arc::new(token), Arc::new(task_id), Arc::new(host), Arc::new(tools));
     let granted = Arc::new(Mutex::new(HashSet::new()));
     for n in 1.. {
         let Ok((sock, _)) = listener.accept().await else { break };
-        let (token, task_id, host, granted) = (token.clone(), task_id.clone(), host.clone(), granted.clone());
+        let (token, task_id, host, granted, tools) = (token.clone(), task_id.clone(), host.clone(), granted.clone(), tools.clone());
         tokio::spawn(async move {
             let (r, mut w) = sock.into_split();
             let mut line = String::new();
             if BufReader::new(r.take(MAX_APPROVAL_BYTES)).read_line(&mut line).await.is_err() {
                 return;
             }
-            let reply = decide(&line, &token, format!("claude-approval-{n}"), &task_id, &host, &granted).await;
+            let reply = match serde_json::from_str::<Value>(&line) {
+                Ok(v) if v["op"] == "tool" => run_tool(&v, &token, tools.as_ref().as_ref()),
+                _ => decide(&line, &token, format!("claude-approval-{n}"), &task_id, &host, &granted).await,
+            };
             let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
         });
     }
 }
 
+/// One request line to the runtime at `addr`, and its reply line.
+async fn exchange(addr: &str, req: &Value) -> Option<Value> {
+    let mut s = TcpStream::connect(addr).await.ok()?;
+    s.write_all(format!("{req}\n").as_bytes()).await.ok()?;
+    let mut line = String::new();
+    BufReader::new(s.take(MAX_APPROVAL_BYTES)).read_line(&mut line).await.ok()?;
+    serde_json::from_str::<Value>(&line).ok()
+}
+
 /// Sent by the MCP server's `approve` tool: asks the runtime at `addr` and returns its answer.
 pub async fn request_approval(addr: &str, token: &str, args: &Value) -> Value {
     let req = json!({ "token": token, "tool_name": args["tool_name"], "input": args["input"] });
-    let reply = async {
-        let mut s = TcpStream::connect(addr).await.ok()?;
-        s.write_all(format!("{req}\n").as_bytes()).await.ok()?;
-        let mut line = String::new();
-        BufReader::new(s.take(MAX_APPROVAL_BYTES)).read_line(&mut line).await.ok()?;
-        serde_json::from_str::<Value>(&line).ok()
-    };
-    reply.await.unwrap_or_else(|| json!({ "behavior": "deny", "message": "task-x could not ask the user for approval." }))
+    exchange(addr, &req).await.unwrap_or_else(|| json!({ "behavior": "deny", "message": "task-x could not ask the user for approval." }))
+}
+
+/// Sent by the MCP server for a scheduler tool (`agent::wakeup::handles`): the runtime runs it for
+/// this run. Err holds the tool error (`kind`, `message`).
+pub async fn request_tool(addr: &str, token: &str, name: &str, input: &Value) -> Result<Value, Value> {
+    let req = json!({ "token": token, "op": "tool", "name": name, "input": input });
+    match exchange(addr, &req).await {
+        Some(r) if r.get("ok").is_some() => Ok(r["ok"].clone()),
+        Some(r) => Err(r["error"].clone()),
+        None => Err(json!({ "kind": "failed", "message": "task-x could not be reached; wake-ups need the task-x runtime" })),
+    }
 }
 
 /// The `agent/steer` queue of one Claude Code run. It is removed when the run stops taking messages.
@@ -989,6 +1041,19 @@ async fn send_steers(stdin: &mut Option<ChildStdin>, texts: &[String], host: &Ho
         (host.emit)(task_id, json!({ "type": "steered", "text": t }));
     }
     1
+}
+
+/// A timeline snapshot of the workspace for this run (`timelineSnapshot`); a failure is a warning.
+async fn snap(root: &Path, task_id: &str, label: String, host: &Host) {
+    let (root, id) = (root.to_path_buf(), task_id.to_owned());
+    let res = tokio::task::spawn_blocking(move || crate::agent::timeline::Timeline::open(&root)?.snapshot(&id, &label))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    match res {
+        Ok(Some(s)) => (host.emit)(task_id, json!({ "type": "timelineSnapshot", "snapshot": s })),
+        Ok(None) => {}
+        Err(e) => (host.emit)(task_id, json!({ "type": "warning", "message": format!("The timeline could not save a snapshot: {e}") })),
+    }
 }
 
 /// The workspace instruction file for Claude Code. Claude Code reads `CLAUDE.md` itself, so only the
@@ -1075,8 +1140,28 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
         .map(|w| w.index.root().to_path_buf())
         .ok_or("open a workspace folder first")?;
     let before = snapshot(&host.workspace);
+    snap(&root, &p.task_id, format!("Before: {}", p.prompt.trim()), &host).await;
     let started = Instant::now();
     let exe = std::env::current_exe().ok();
+    // Wake-ups of this run: while some are pending, stdin stays open, and each one that fires is
+    // sent to Claude Code as a message.
+    let wakeups = crate::agent::wakeup::Scheduler::new(&p.task_id, host.emit.clone(), cancel.child_token());
+    let runtime_tools = {
+        let (root, workspace, seen, edits, task_id) = (root.clone(), host.workspace.clone(), host.seen.clone(), host.edits.clone(), p.task_id.clone());
+        RuntimeTools {
+            wakeups: wakeups.clone(),
+            ctx: Arc::new(move |stop| {
+                Arc::new(crate::tools::ToolCtx {
+                    root: root.clone(),
+                    workspace: workspace.clone(),
+                    cancel: stop,
+                    seen: seen.clone(),
+                    edits: edits.clone(),
+                    task_id: Some(task_id.clone()),
+                })
+            }),
+        }
+    };
     // Tool calls that need permission come back through the MCP server and are shown to the user.
     let mut approvals = None;
     let mut approval = None;
@@ -1092,7 +1177,7 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
             cancel: cancel.clone(),
             approve_all: p.approve_all,
         };
-        approvals = Some(tokio::spawn(serve_approvals(listener, token, p.task_id.clone(), ah)));
+        approvals = Some(tokio::spawn(serve_approvals(listener, token, p.task_id.clone(), ah, Some(runtime_tools))));
     }
     let mut cmd = Command::new(&p.cli_path);
     if let Some(m) = &p.subagent_model {
@@ -1136,6 +1221,8 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
     // User messages sent without a result yet, and when the last result came while some still wait.
     let mut pending = 1u32;
     let mut idle_since: Option<Instant> = None;
+    // Idle with wake-ups pending (a `sleeping` event was sent).
+    let mut sleeping = false;
     let mut tick = tokio::time::interval(STEER_POLL);
     // Running `Bash` calls: their stop token and the shells that ran before each one started.
     let pid = child.id();
@@ -1163,10 +1250,24 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
                 if stdin.is_none() {
                     continue;
                 }
+                // A wake-up that fired goes to Claude Code as the next user message.
+                let fired = wakeups.take_fired();
+                if !fired.is_empty() && write_user(&mut stdin, json!(fired.join("\n\n"))).await {
+                    pending += 1;
+                    idle_since = None;
+                    if std::mem::take(&mut sleeping) {
+                        (host.emit)(&p.task_id, json!({ "type": "awake", "by": "wakeup", "pending": wakeups.pending() }));
+                    }
+                }
                 let texts = inbox.take();
                 if !texts.is_empty() {
                     pending += send_steers(&mut stdin, &texts, &host, &p.task_id).await;
                     idle_since = None;
+                    if std::mem::take(&mut sleeping) {
+                        (host.emit)(&p.task_id, json!({ "type": "awake", "by": "message", "pending": wakeups.pending() }));
+                    }
+                } else if wakeups.pending() > 0 || wakeups.has_fired() {
+                    // Not idle for good: a wake-up will send the next message.
                 } else if idle_since.is_some_and(|t| t.elapsed() > IDLE_CLOSE) {
                     let texts = inbox.close_or_take();
                     pending += send_steers(&mut stdin, &texts, &host, &p.task_id).await;
@@ -1198,7 +1299,13 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
                     }
                     pending = pending.saturating_sub(1);
                     idle_since = Some(Instant::now());
-                    if pending == 0 && stdin.is_some() {
+                    if pending == 0 && stdin.is_some() && (wakeups.pending() > 0 || wakeups.has_fired()) {
+                        // Claude Code answered everything; it sleeps until a wake-up is due.
+                        if !sleeping && !wakeups.has_fired() {
+                            sleeping = true;
+                            (host.emit)(&p.task_id, wakeups.sleeping_event());
+                        }
+                    } else if pending == 0 && stdin.is_some() {
                         // Closing stdin ends the run once Claude Code has answered every message.
                         let texts = inbox.close_or_take();
                         pending += send_steers(&mut stdin, &texts, &host, &p.task_id).await;
@@ -1211,6 +1318,8 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
             },
         }
     }
+    // Wake-ups end with the run.
+    wakeups.cancel_all();
     {
         let mut cancels = host.tool_cancels.lock().expect("tool cancels lock");
         for id in running.keys() {
@@ -1279,6 +1388,7 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
     } else {
         "completed"
     };
+    snap(&root, &p.task_id, format!("End: {status_name}"), &host).await;
     let error = (status_name == "failed").then(|| {
         let msg = r["result"]
             .as_str()
@@ -1501,6 +1611,13 @@ mod tests {
                 && !allowed.iter().any(|x| x == "mcp__task-x__delete_file"),
             "edits need approval"
         );
+        assert!(
+            ["mcp__task-x__schedule_wakeup", "mcp__task-x__list_wakeups", "mcp__task-x__cancel_wakeup"].iter().all(|t| allowed.iter().any(|x| x == t)),
+            "wake-ups only touch the run's own timers"
+        );
+        let note = &ask[ask.iter().position(|x| x == "--append-system-prompt").unwrap() + 1];
+        assert!(note.contains("mcp__task-x__schedule_wakeup") && note.contains("do not run sleep in Bash"), "Claude learns how to wait");
+        assert!(!a.iter().any(|x| x.contains("schedule_wakeup")), "no runtime to wake Claude Code, no wake-ups");
         let off = args(&Params { use_task_tools: false, ..p.clone() }, Some((Path::new("/x"), Path::new("/r"))), "", None);
         assert!(!off.iter().any(|x| x == "--disallowedTools") && !off.iter().any(|x| x == "--mcp-config"));
         let only = args(&Params { use_task_tools: false, ..p.clone() }, Some((Path::new("/x"), Path::new("/r"))), "", Some("a t"));
@@ -1553,7 +1670,7 @@ mod tests {
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let server = tokio::spawn(serve_approvals(listener, "tok".into(), "t".into(), host));
+        let server = tokio::spawn(serve_approvals(listener, "tok".into(), "t".into(), host, None));
         let bash = json!({ "tool_name": "Bash", "input": { "command": "cargo test" } });
         let r = request_approval(&addr, "tok", &bash).await;
         assert_eq!((r["behavior"].as_str(), &r["updatedInput"]["command"]), (Some("allow"), &json!("cargo test")));
@@ -1565,6 +1682,34 @@ mod tests {
         server.abort();
         assert_eq!(request_approval("127.0.0.1:1", "tok", &bash).await["behavior"], "deny", "no listener counts as deny");
         assert_eq!(permission_of("mcp__task-x__read_file"), crate::tools::Permission::Read);
+    }
+
+    #[tokio::test]
+    async fn scheduler_tools_reach_the_runtime() {
+        let host = ApprovalHost {
+            emit: Arc::new(|_, _| {}),
+            approve: Arc::new(|_, _| Box::pin(async { crate::agent::ApprovalDecision::Deny })),
+            ask: Arc::new(|_, _| Box::pin(async { None })),
+            cancel: CancellationToken::new(),
+            approve_all: false,
+        };
+        let wakeups = crate::agent::wakeup::Scheduler::new("t", Arc::new(|_, _| {}), CancellationToken::new());
+        let tools = RuntimeTools { wakeups: wakeups.clone(), ctx: Arc::new(|_: CancellationToken| -> Arc<crate::tools::ToolCtx> { unreachable!("no check here") }) };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(serve_approvals(listener, "tok".into(), "t".into(), host, Some(tools)));
+        let r = request_tool(&addr, "tok", "schedule_wakeup", &json!({ "delaySeconds": 600, "prompt": "look again" })).await.unwrap();
+        assert_eq!((r["id"].as_str(), r["in"].as_str()), (Some("w1"), Some("10m")), "{r}");
+        assert_eq!(wakeups.pending(), 1, "the runtime holds the wake-up");
+        assert_eq!(request_tool(&addr, "tok", "list_wakeups", &json!({})).await.unwrap()["count"], 1);
+        let bad = request_tool(&addr, "tok", "schedule_wakeup", &json!({ "delaySeconds": 1, "prompt": "x" })).await.unwrap_err();
+        assert_eq!(bad["kind"], "invalidInput", "{bad}");
+        assert_eq!(request_tool(&addr, "bad", "list_wakeups", &json!({})).await.unwrap_err()["kind"], "forbidden");
+        assert_eq!(request_tool(&addr, "tok", "read_file", &json!({})).await.unwrap_err()["kind"], "notFound");
+        assert_eq!(request_tool(&addr, "tok", "cancel_wakeup", &json!({ "id": "all" })).await.unwrap()["cancelled"], json!(["w1"]));
+        assert_eq!(wakeups.pending(), 0);
+        server.abort();
+        assert!(request_tool("127.0.0.1:1", "tok", "list_wakeups", &json!({})).await.is_err(), "no runtime, no wake-ups");
     }
 
     #[tokio::test]

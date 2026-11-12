@@ -41,6 +41,27 @@ struct TaskIdParams {
     task_id: String,
 }
 
+/// `timeline/list`, `timeline/diff`, and `timeline/restore`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TimelineParams {
+    task_id: String,
+    #[serde(default)]
+    snapshot: Option<String>,
+    /// diff only: compare with this snapshot instead of the one before.
+    #[serde(default)]
+    against: Option<String>,
+}
+
+/// `agent/export`: the task, and where to write the page (default `.task-x/exports/…`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExportParams {
+    task_id: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
 /// `plugins/install`, `plugins/uninstall`, `plugins/update`, and the marketplace methods.
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -604,6 +625,11 @@ impl Server {
             | "plugins/marketplaceUpdate"
             | "plugins/marketplaceRemove"
             | "mcp/authorize"
+            | "timeline/tasks"
+            | "timeline/list"
+            | "timeline/diff"
+            | "timeline/restore"
+            | "agent/export"
             | "mcp/status" => self.spawn(id, key, method, msg.params),
             _ => self.reply(&id, Err(RpcError::new(rpc::METHOD_NOT_FOUND, format!("unknown method: {method}")))),
         }
@@ -712,6 +738,8 @@ impl Server {
                 "agent/bestOf" => this.best_of(p, &token).await,
                 "agent/rewind" => this.rewind(p).await,
                 "agent/compact" => this.compact_task(p).await,
+                m if m.starts_with("timeline/") => this.timeline(m, p).await,
+                "agent/export" => this.export(p).await,
                 m if m.starts_with("plugins/") => this.plugin_op(m, p, &token).await,
                 "worktrees/apply" | "worktrees/discard" => this.worktree(method == "worktrees/apply", p).await,
                 "edits/undo" => this.undo(p).await,
@@ -1035,6 +1063,62 @@ impl Server {
         }
         store.save(&r).map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e.to_string()))?;
         Ok(json!({ "taskId": r.id, "checkpoint": at, "messages": r.messages.len(), "undone": undone, "conflicts": conflicts, "text": r.final_text }))
+    }
+
+    /// `timeline/tasks`, `timeline/list`, `timeline/diff`, and `timeline/restore` on the workspace's
+    /// timeline (`agent::timeline`). A restore waits until no task runs, then reindexes.
+    async fn timeline(&self, method: &str, p: Value) -> Result<Value, RpcError> {
+        use agent::timeline::{KEEP_TASKS, Timeline};
+        let root = self.root().ok_or_else(|| RpcError::new(rpc::NO_WORKSPACE, "no workspace is open"))?;
+        let bad = |e: String| RpcError::new(rpc::INVALID_PARAMS, e);
+        let run = |f: Box<dyn FnOnce(Timeline) -> Result<Value, String> + Send>| async move {
+            tokio::task::spawn_blocking(move || f(Timeline::open(&root)?))
+                .await
+                .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e.to_string()))?
+                .map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))
+        };
+        if method == "timeline/tasks" {
+            return run(Box::new(|t| t.tasks().map(|l| json!({ "tasks": l, "keep": KEEP_TASKS })))).await;
+        }
+        let p: TimelineParams = params(p)?;
+        let snapshot = || p.snapshot.clone().ok_or_else(|| bad("snapshot is required".into()));
+        match method {
+            "timeline/list" => {
+                let id = p.task_id.clone();
+                run(Box::new(move |t| t.list(&id).map(|s| json!({ "taskId": id, "snapshots": s, "keep": KEEP_TASKS })))).await
+            }
+            "timeline/diff" => {
+                let (id, snap, against) = (p.task_id.clone(), snapshot()?, p.against.clone());
+                run(Box::new(move |t| t.diff(&id, &snap, against.as_deref()))).await
+            }
+            "timeline/restore" => {
+                let (id, snap) = (p.task_id.clone(), snapshot()?);
+                if !self.steers.lock().expect("steers lock").is_empty() {
+                    return Err(RpcError::new(rpc::INVALID_REQUEST, "a task is running; stop it before restoring a snapshot"));
+                }
+                let out = run(Box::new(move |t| t.restore(&id, &snap))).await?;
+                // Files changed under the tools: re-read them before any edit, and reindex.
+                self.seen.lock().expect("seen lock").clear();
+                self.refresh_workspace().await?;
+                Ok(out)
+            }
+            m => Err(RpcError::new(rpc::METHOD_NOT_FOUND, format!("unknown method: {m}"))),
+        }
+    }
+
+    /// `agent/export { taskId, path? }`: the task as one HTML file → `{ taskId, path, bytes }`.
+    async fn export(&self, p: Value) -> Result<Value, RpcError> {
+        let p: ExportParams = params(p)?;
+        let rec = self.store.read().expect("store lock").load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "unknown task"))?;
+        let (root, edits) = (self.root(), self.edits.clone());
+        let (path, bytes) = tokio::task::spawn_blocking(move || {
+            let log = edits.lock().expect("edit log lock");
+            agent::export::export_task(&rec, &log, root.as_deref(), p.path.as_deref())
+        })
+        .await
+        .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e.to_string()))?
+        .map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?;
+        Ok(json!({ "taskId": p.task_id, "path": path, "bytes": bytes }))
     }
 
     /// `memory/search { query, limit? }` and `memory/forget { id }` on the workspace memory.

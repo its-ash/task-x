@@ -48,7 +48,7 @@ Options:
   --quiet                   Print only the final answer
   --watch                   Index file changes while the session runs (chat)
 
-In chat: /exit, /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], and every skill and command (/init, /review, ...).";
+In chat: /exit, /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], /timeline, /restore <step>, /export [file.html], and every skill and command (/init, /review, ...).";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
@@ -178,6 +178,104 @@ pub fn provider(o: &Options, env: &dyn Fn(&str) -> Option<String>) -> Result<Pro
     Ok(cfg)
 }
 
+/// Colours of the wake-up lines: sleeping is magenta (☾), waking and firing yellow (⏰).
+const SLEEP_COLOR: &str = "35";
+const WAKE_COLOR: &str = "33";
+const DIM: &str = "2";
+
+/// Colour on a terminal, unless `NO_COLOR` is set.
+fn paint(code: &str, text: &str) -> String {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()));
+    if *ON { format!("\x1b[{code}m{text}\x1b[0m") } else { text.to_owned() }
+}
+
+/// The moon's phases, one per second while the task sleeps.
+const MOON: [&str; 8] = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"];
+
+/// A countdown to the second: `1h 05m 03s`, `29m 58s`, `7s`.
+fn countdown(ms: u64) -> String {
+    let s = ms.div_ceil(1000);
+    match (s / 3600, (s % 3600) / 60, s % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s:02}s"),
+        (h, m, s) => format!("{h}h {m:02}m {s:02}s"),
+    }
+}
+
+/// What follows "next wake-up in …" on the sleeping line: `: <reason> (<n> pending)`.
+fn sleeping_tail(event: &Value) -> String {
+    let n = event["pending"].as_array().map_or(0, Vec::len);
+    let reason = event["pending"][0]["reason"].as_str().map(|r| r.replace('\n', " ")).unwrap_or_default();
+    let reason = if reason.chars().count() > 60 { format!("{}…", reason.chars().take(59).collect::<String>()) } else { reason };
+    format!("{}{} ({n} pending)", if reason.is_empty() { "" } else { ": " }, reason)
+}
+
+/// One frame of the animated sleeping line: the moon of second `tick` and the time left.
+fn sleep_frame(tick: usize, until_ms: Option<u64>, now_ms: u64, tail: &str) -> String {
+    let when = match until_ms {
+        Some(u) if u > now_ms => format!("next wake-up in {}", countdown(u - now_ms)),
+        Some(_) => "waking up…".to_owned(),
+        None => "waiting".to_owned(),
+    };
+    format!("{} Sleeping · {when}{tail}", MOON[tick % MOON.len()])
+}
+
+/// The live sleeping line on a terminal: one magenta line redrawn in place every second. Any
+/// other output stops it and clears the line first, so nothing is printed into it.
+#[derive(Default)]
+struct SleepLine {
+    /// (generation, running): a new animation, or `stop`, ends the drawing thread of the last one.
+    state: Mutex<(u64, bool)>,
+}
+
+impl SleepLine {
+    fn start(self: &Arc<Self>, until_ms: Option<u64>, tail: String) {
+        let generation = {
+            let mut s = self.state.lock().expect("sleep line lock");
+            *s = (s.0 + 1, true);
+            s.0
+        };
+        eprintln!();
+        let me = self.clone();
+        std::thread::spawn(move || {
+            let live = |s: &(u64, bool)| s.0 == generation && s.1;
+            for tick in 0.. {
+                {
+                    // Drawn under the lock, so `stop` never clears the line halfway through a frame.
+                    let s = me.state.lock().expect("sleep line lock");
+                    if !live(&s) {
+                        return;
+                    }
+                    eprint!("\r\x1b[2K  {}", paint(SLEEP_COLOR, &sleep_frame(tick, until_ms, agent::store::now_ms(), &tail)));
+                    let _ = std::io::stderr().flush();
+                }
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if !live(&me.state.lock().expect("sleep line lock")) {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Stops the animation and clears its line. Nothing happens when none runs.
+    fn stop(&self) {
+        let mut s = self.state.lock().expect("sleep line lock");
+        if std::mem::replace(&mut s.1, false) {
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+        }
+    }
+}
+
+/// `30m` from now until `ms` (epoch milliseconds).
+fn until(ms: &Value) -> String {
+    let left = ms.as_u64().unwrap_or(0).saturating_sub(agent::store::now_ms());
+    agent::wakeup::human(std::time::Duration::from_millis(left.div_ceil(1000) * 1000))
+}
+
 /// One line for the terminal from an agent event: (to stderr, text). `None` for events not shown.
 pub fn render(event: &Value, quiet: bool) -> Option<(bool, String)> {
     let t = event["type"].as_str()?;
@@ -207,6 +305,32 @@ pub fn render(event: &Value, quiet: bool) -> Option<(bool, String)> {
         "error" => (true, format!("\n  ! {}\n", event["error"]["message"].as_str().unwrap_or("model error"))),
         "hook" if event["blocked"] == true => (true, format!("  ! a {} hook blocked: {}\n", event["event"].as_str().unwrap_or(""), short(&event["message"]))),
         "compacted" => (true, "  (history compressed)\n".into()),
+        // The static line, for logs and pipes; a terminal animates it instead (`SleepLine`).
+        "sleeping" => {
+            (true, format!("\n  {}\n", paint(SLEEP_COLOR, &format!("☾ Sleeping · next wake-up in {}{}", until(&event["untilMs"]), sleeping_tail(event)))))
+        }
+        "awake" => {
+            let by = match event["by"].as_str() {
+                Some("wakeup") => "a wake-up is due",
+                Some("message") => "a message arrived",
+                _ => "nothing is pending",
+            };
+            (true, format!("  {}\n", paint(WAKE_COLOR, &format!("⏰ Awake: {by}"))))
+        }
+        "wakeupScheduled" => {
+            let w = &event["wakeup"];
+            let what = if w["kind"] == "watch" { "check" } else { "wake-up" };
+            (true, format!("  {}\n", paint(DIM, &format!("⏰ {what} {} in {}: {}", w["id"].as_str()?, until(&w["dueMs"]), short(&w["reason"])))))
+        }
+        "wakeupFired" => {
+            let note = match event["met"].as_bool() {
+                Some(true) => " (passed)",
+                Some(false) => " (did not pass)",
+                None => "",
+            };
+            (true, format!("  {}\n", paint(WAKE_COLOR, &format!("⏰ {} fired{note}: {}", event["id"].as_str()?, short(&event["reason"])))))
+        }
+        "wakeupCancelled" if event["by"] == "model" => (true, format!("  {}\n", paint(DIM, &format!("⏰ {} cancelled", event["id"].as_str()?)))),
         _ => return None,
     })
 }
@@ -295,6 +419,9 @@ impl Session {
         }
         let emit_quiet = quiet;
         let yes = o.yes;
+        // The sleeping line animates on a real terminal only; logs and pipes get one static line.
+        let animate = !quiet && std::io::stderr().is_terminal() && std::env::var("TERM").map_or(true, |t| t != "dumb");
+        let sleep_line = Arc::new(SleepLine::default());
         let host = Host {
             providers: Providers::new().map_err(|e| e.message)?,
             workspace: Arc::new(RwLock::new(Some(ws))),
@@ -303,7 +430,15 @@ impl Session {
             grants: Arc::default(),
             store,
             emit: Arc::new(move |_, ev| {
+                if animate && ev["type"] == "sleeping" {
+                    sleep_line.start(ev["untilMs"].as_u64(), sleeping_tail(&ev));
+                    return;
+                }
+                if ev["type"] == "done" {
+                    sleep_line.stop();
+                }
                 if let Some((err, text)) = render(&ev, emit_quiet) {
+                    sleep_line.stop();
                     if err {
                         eprint!("{text}");
                     } else {
@@ -368,12 +503,54 @@ impl Session {
         Ok(rec)
     }
 
+    fn root(&self) -> Result<PathBuf, String> {
+        self.host.workspace.read().expect("workspace lock").as_ref().map(|w| w.index.root().to_path_buf()).ok_or_else(|| "no workspace is open".into())
+    }
+
     /// The session commands of `chat`; `None` when the line is a prompt for the agent.
     async fn command(&mut self, line: &str) -> Option<Result<String, String>> {
         let (cmd, arg) = line.split_once(' ').map_or((line, ""), |(c, a)| (c, a.trim()));
         let store = self.host.store.clone();
         let need = |id: &Option<String>| id.clone().ok_or_else(|| "no task yet in this session".to_owned());
         Some(match cmd {
+            "/timeline" => need(&self.task_id).and_then(|id| {
+                let list = agent::timeline::Timeline::open(&self.root()?)?.list(&id)?;
+                if list.is_empty() {
+                    return Ok("This task has no timeline yet.".into());
+                }
+                Ok(list
+                    .iter()
+                    .map(|s| {
+                        let files = if s.base { "before the task".to_owned() } else { format!("{} files", s.files.len()) };
+                        format!("{:>3}  {}  ({files})", s.step, s.label)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n/restore <step> puts the files back to that step.")
+            }),
+            "/restore" => {
+                let res = need(&self.task_id).and_then(|id| {
+                    let step: usize = arg.parse().map_err(|_| "give the step number (see /timeline)")?;
+                    let t = agent::timeline::Timeline::open(&self.root()?)?;
+                    let snap = t.list(&id)?.into_iter().find(|s| s.step == step).ok_or("no such step (see /timeline)")?;
+                    t.restore(&id, &snap.id)
+                });
+                res.map(|r| {
+                    self.host.seen.lock().expect("seen lock").clear();
+                    if let Some(w) = self.host.workspace.write().expect("workspace lock").as_mut() {
+                        w.refresh();
+                    }
+                    let n = r["files"].as_array().map_or(0, Vec::len);
+                    format!("Restored step {} ({n} files). The state before it is saved as the newest step, so /restore can undo this.", r["step"])
+                })
+            }
+            "/export" => need(&self.task_id).and_then(|id| {
+                let r = store.load(&id).ok_or("unknown task")?;
+                let root = self.root().ok();
+                let log = self.host.edits.lock().expect("edit log lock");
+                let (path, bytes) = agent::export::export_task(&r, &log, root.as_deref(), Some(arg).filter(|a| !a.is_empty()))?;
+                Ok(format!("Exported to {} ({} KB).", path.display(), bytes.div_ceil(1024)))
+            }),
             "/new" => {
                 self.task_id = None;
                 Ok("Started a new conversation.".into())
@@ -558,5 +735,24 @@ mod tests {
         assert!(render(&json!({ "type": "toolFinished", "tool": "x", "ok": true }), false).is_none(), "a success is quiet");
         assert!(render(&json!({ "type": "toolFinished", "tool": "x", "ok": false, "output": "boom" }), false).unwrap().1.contains("boom"));
         assert!(render(&json!({ "type": "textDelta", "text": "hi" }), true).is_none(), "quiet prints only the answer");
+    }
+
+    #[test]
+    fn renders_sleeping_and_wakeups() {
+        let due = agent::store::now_ms() + 1_800_000;
+        let sleeping = json!({ "type": "sleeping", "untilMs": due, "pending": [{ "id": "w1", "reason": "check the deploy" }] });
+        let line = render(&sleeping, false).unwrap().1;
+        assert!(line.contains("☾ Sleeping · next wake-up in 30m: check the deploy (1 pending)"), "{line}");
+        // The animated line: the moon moves one phase a second, and the countdown ticks down.
+        let tail = sleeping_tail(&sleeping);
+        assert_eq!(sleep_frame(0, Some(1_801_000), 1_000, &tail), "🌑 Sleeping · next wake-up in 30m 00s: check the deploy (1 pending)");
+        assert_eq!(sleep_frame(1, Some(1_801_000), 3_000, &tail), "🌒 Sleeping · next wake-up in 29m 58s: check the deploy (1 pending)");
+        assert!(sleep_frame(9, Some(10), 20, "").starts_with("🌒 Sleeping · waking up"), "the phases repeat; a due wake-up says so");
+        assert_eq!([7_000, 65_000, 3_903_000].map(countdown), ["7s", "1m 05s", "1h 05m 03s"]);
+        let scheduled = json!({ "type": "wakeupScheduled", "wakeup": { "id": "w2", "kind": "watch", "reason": "server up", "dueMs": due } });
+        assert!(render(&scheduled, false).unwrap().1.contains("⏰ check w2 in 30m: server up"));
+        assert!(render(&json!({ "type": "wakeupFired", "id": "w2", "reason": "server up", "met": true }), false).unwrap().1.contains("w2 fired (passed)"));
+        assert!(render(&json!({ "type": "awake", "by": "message" }), false).unwrap().1.contains("⏰ Awake: a message arrived"));
+        assert!(render(&json!({ "type": "wakeupCancelled", "id": "w1", "by": "taskEnded" }), false).is_none(), "the task's end is not news");
     }
 }

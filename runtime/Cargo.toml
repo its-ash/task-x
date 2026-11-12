@@ -1,9 +1,9 @@
 [package]
 name = "task-x-runtime"
-version = "0.1.0"
+version = "0.1.29"
 edition = "2024"
 rust-version = "1.85"
-description = "Model-agnostic coding agent runtime for the task-x VS Code extension"
+description = "Model-agnostic coding agent runtime: CLI, JSON-RPC server, and MCP server"
 license = "MIT"
 publish = false
 
@@ -38,7 +38,8 @@ url = "2"
 tokio-tungstenite = "0.30"
 
 [dev-dependencies]
-tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "net", "process"] }
+# test-util: a paused clock, so wake-up tests skip their 30-minute waits.
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time", "net", "process", "test-util"] }
 
 [profile.release]
 lto = "thin"

@@ -34,6 +34,9 @@ pub fn is_generated(text: &str) -> bool {
 
 pub const DEFAULT_EXCLUDES: &[&str] = &[
     "**/.git/**",
+    // task-x's own timeline repository and HTML exports (`.task-x` itself is indexed).
+    "**/.task-x/timeline.git/**",
+    "**/.task-x/exports/**",
     "**/node_modules/**",
     // Hidden directories are skipped wholesale (see `HIDDEN_DIRS_INDEXED`); the entries below make
     // the big caches explicit and also cover a same-named folder without the leading dot.

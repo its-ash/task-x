@@ -1,68 +1,61 @@
 RUNTIME := runtime
-EXT := extension
 BIN := task-x-runtime
-CODE ?= code
-VERSION = $(shell node -p "require('./$(EXT)/package.json').version")
-VSIX = $(EXT)/task-x-$(VERSION).vsix
-# GitHub repository for releases, and the stable asset name `make add` downloads.
+# The version is the runtime's: `version` in the [package] table of runtime/Cargo.toml.
+VERSION = $(shell grep -m1 '^version = ' $(RUNTIME)/Cargo.toml | cut -d'"' -f2)
+# GitHub repository for releases.
 REPO ?= its-ash/task-x
-ASSET := task-x.vsix
-# VS Code's own `code` CLI prints Node's DEP0169 warning (its `url.parse()` call, not our code).
-# Its wrapper moves NODE_OPTIONS to VSCODE_NODE_OPTIONS, which cli.js never reads, so the flag
-# cannot disable the warning. Each install step captures the CLI's output, drops exactly those two
-# lines, and passes the CLI's own exit code through (a pipe would report grep's status instead).
-CODE_FILTER = grep -vE '^\(node:[0-9]+\) \[DEP0169\]|^\(Use `Code --trace-deprecation'
+# The release asset for this machine, e.g. task-x-runtime-darwin-arm64. `make deploy` uploads the
+# one it builds; `make add` downloads the one for the machine it runs on.
+OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
+ARCH := $(shell uname -m)
+ASSET := $(BIN)-$(OS)-$(ARCH)
+# Where `make install` and `make add` put the runtime: $(PREFIX)/bin/task-x-runtime.
+PREFIX ?= $(HOME)/.local
 
 .PHONY: run build deploy install add bump
 
+# Debug build, then an interactive session in this folder.
 run:
-	cargo build --manifest-path $(RUNTIME)/Cargo.toml
-	npm --prefix $(EXT) install --no-audit --no-fund
-	npm --prefix $(EXT) run build
-	code --extensionDevelopmentPath="$(CURDIR)/$(EXT)"
+	cargo run --manifest-path $(RUNTIME)/Cargo.toml -- chat
 
+# Builds the release runtime: $(RUNTIME)/target/release/$(BIN).
 build:
 	cargo build --release --manifest-path $(RUNTIME)/Cargo.toml
-	mkdir -p $(EXT)/bin
-	@# Replace, not overwrite: macOS kills a signed binary that is rewritten in place.
-	rm -f $(EXT)/bin/$(BIN)
-	cp $(RUNTIME)/target/release/$(BIN) $(EXT)/bin/$(BIN)
-	npm --prefix $(EXT) ci --no-audit --no-fund
-	npm --prefix $(EXT) run build
 
-# Builds, packages, and installs the extension into VS Code (replacing an installed copy).
-# Use CODE=code-insiders for VS Code Insiders. The old "anvil-agent" build is removed first.
+# Builds the runtime and installs it as $(PREFIX)/bin/$(BIN) (default ~/.local/bin), replacing
+# an installed copy. Use PREFIX=/usr/local (with sudo) for a system-wide install.
 install: build
-	rm -f $(EXT)/*.vsix
-	npm --prefix $(EXT) run package
-	@$(CODE) --uninstall-extension its-ash.anvil-agent >/dev/null 2>&1 || true
-	@mk_cdp=$$(mktemp); $(CODE) --install-extension $(VSIX) --force > "$$mk_cdp" 2>&1; status=$$?; $(CODE_FILTER) "$$mk_cdp" >&2 || true; rm -f "$$mk_cdp"; [ $$status -eq 0 ] || exit $$status
-	@echo "Installed $(VSIX). Reload VS Code windows to use it."
+	mkdir -p $(PREFIX)/bin
+	@# Replace, not overwrite: macOS kills a signed binary that is rewritten in place.
+	rm -f $(PREFIX)/bin/$(BIN)
+	cp $(RUNTIME)/target/release/$(BIN) $(PREFIX)/bin/$(BIN)
+	@echo "Installed $(PREFIX)/bin/$(BIN)."
+	@case ":$$PATH:" in *":$(PREFIX)/bin:"*) ;; *) echo "$(PREFIX)/bin is not on your PATH; add it to run $(BIN) by name." ;; esac
 
-# Raises the patch version when v<version> is released already, so each deploy is a new release.
-# A deploy that failed before its release keeps its version, so no number is skipped.
+# Raises the patch version in runtime/Cargo.toml until no release v<version> exists, so each
+# deploy is a new release. A deploy that failed before its release keeps its version.
 bump:
-	@if gh release view v$(VERSION) --repo $(REPO) >/dev/null 2>&1; then \
-		npm --prefix $(EXT) version patch --no-git-tag-version >/dev/null; \
-		echo "Version $(VERSION) is released; now $$(node -p "require('./$(EXT)/package.json').version")"; \
+	@v="$(VERSION)"; \
+	while gh release view "v$$v" --repo $(REPO) >/dev/null 2>&1; do v="$${v%.*}.$$(( $${v##*.} + 1 ))"; done; \
+	if [ "$$v" != "$(VERSION)" ]; then \
+		perl -pi -e 'if (!$$done && s/^version = "[^"]*"/version = "'"$$v"'"/) { $$done = 1 }' $(RUNTIME)/Cargo.toml; \
+		echo "Version $(VERSION) is released; now $$v"; \
 	fi
 
-# Raises the version (bump), builds the .vsix, pushes main, and publishes the .vsix on a new
-# GitHub release v<version>. `bump` runs first, so the build and the release see the new version.
+# Raises the version (bump), builds the runtime, pushes main, and publishes the binary for this
+# machine on a new GitHub release v<version>. `bump` runs first, so the build sees the new version.
 deploy: bump build
-	rm -f $(EXT)/*.vsix
-	npm --prefix $(EXT) run package
-	cp $(VSIX) $(EXT)/$(ASSET)
+	cp $(RUNTIME)/target/release/$(BIN) $(RUNTIME)/target/release/$(ASSET)
 	git checkout main
 	git add -A
 	git diff --cached --quiet || { msg="$$(node scripts/commit-msg.mjs)" && git commit -m "$$msg"; }
 	git push origin main
-	gh release create v$(VERSION) $(VSIX) $(EXT)/$(ASSET) --repo $(REPO) --target main --title "task-x $(VERSION)" --latest \
-		--notes "Download $(ASSET), then run: code --install-extension $(ASSET)"
+	gh release create v$(VERSION) $(RUNTIME)/target/release/$(ASSET) --repo $(REPO) --target main --title "task-x $(VERSION)" --latest \
+		--notes "Download $(ASSET), make it executable (chmod +x), and put it on your PATH as $(BIN). Or, in a clone of the repository: make add"
 	@echo "Published https://github.com/$(REPO)/releases/tag/v$(VERSION)"
 
-# Downloads the .vsix from the latest GitHub release and installs it into VS Code.
-# Uses gh when it is installed (works for private repositories), else curl.
+# Downloads the runtime for this machine from the latest GitHub release and installs it as
+# $(PREFIX)/bin/$(BIN). Uses gh when it is installed (works for private repositories), else curl.
 add:
 	@set -e; tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
 	echo "Downloading $(ASSET) from the latest release of $(REPO)"; \
@@ -71,8 +64,8 @@ add:
 	else \
 		curl -fSL --progress-bar -o "$$tmp/$(ASSET)" "https://github.com/$(REPO)/releases/latest/download/$(ASSET)"; \
 	fi; \
-	$(CODE) --uninstall-extension its-ash.anvil-agent >/dev/null 2>&1 || true; \
-	mk_cdp=$$(mktemp); { $(CODE) --install-extension "$$tmp/$(ASSET)" --force > "$$mk_cdp" 2>&1; }; status=$$?; \
-	$(CODE_FILTER) "$$mk_cdp" >&2 || true; rm -f "$$mk_cdp" || true; \
-	[ $$status -eq 0 ] || exit $$status; \
-	echo "Installed task-x. Reload VS Code windows to use it."
+	mkdir -p $(PREFIX)/bin; \
+	rm -f $(PREFIX)/bin/$(BIN); \
+	cp "$$tmp/$(ASSET)" $(PREFIX)/bin/$(BIN); \
+	chmod +x $(PREFIX)/bin/$(BIN); \
+	echo "Installed $(PREFIX)/bin/$(BIN)."

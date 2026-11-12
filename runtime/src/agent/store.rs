@@ -15,6 +15,8 @@ const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 #[serde(rename_all = "camelCase")]
 pub enum Status {
     Running,
+    /// Idle until a wake-up (`schedule_wakeup`, `wait_until`) fires or the user sends a message.
+    Sleeping,
     Completed,
     Cancelled,
     MaxIterations,
@@ -164,7 +166,8 @@ impl Store {
             }
             let Ok(bytes) = std::fs::read(e.path()) else { continue };
             let Ok(mut r) = serde_json::from_slice::<TaskRecord>(&bytes) else { continue };
-            if r.status != Status::Running {
+            // A sleeping task's wake-ups lived in the runtime that stopped: they will never fire.
+            if !matches!(r.status, Status::Running | Status::Sleeping) {
                 continue;
             }
             r.status = Status::Failed;
@@ -221,9 +224,10 @@ pub mod tests {
         std::fs::remove_dir_all(&dir).ok();
         let store = Store::new(Some(&dir));
         store.save(&record("a", Status::Running)).unwrap();
-        store.save(&record("b", Status::Running)).unwrap();
+        store.save(&record("b", Status::Sleeping)).unwrap();
         store.save(&record("c", Status::Completed)).unwrap();
         assert_eq!(store.fail_interrupted(), 2);
+        assert_eq!(store.load("b").unwrap().status, Status::Failed, "a sleeping task's wake-ups died with the runtime");
         let a = store.load("a").unwrap();
         assert_eq!(a.status, Status::Failed);
         assert!(a.error.as_deref().unwrap().contains("stopped before this task finished"));
