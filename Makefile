@@ -12,7 +12,12 @@ ASSET := $(BIN)-$(OS)-$(ARCH)
 # Where `make install` and `make add` put the runtime: $(PREFIX)/bin/task-x-runtime.
 PREFIX ?= $(HOME)/.local
 
-.PHONY: run build deploy install add bump link-vscode
+EXT := extension
+CODE ?= code
+EXT_VERSION = $(shell node -p "require('./$(EXT)/package.json').version")
+VSIX = $(EXT)/task-x-$(EXT_VERSION).vsix
+
+.PHONY: run build deploy install add bump link-vscode ext ext-install install-vsix ext-run
 
 # Debug build, then an interactive session in this folder.
 run:
@@ -22,15 +27,22 @@ run:
 build:
 	cargo build --release --manifest-path $(RUNTIME)/Cargo.toml
 
-# Builds the runtime and installs it as $(PREFIX)/bin/$(BIN) (default ~/.local/bin), replacing
-# an installed copy. Use PREFIX=/usr/local (with sudo) for a system-wide install.
-install: build
+# Builds the runtime and the extension, installs the runtime as $(PREFIX)/bin/$(BIN) (default
+# ~/.local/bin) and the extension into VS Code, replacing installed copies. Without the $(CODE) CLI
+# only the runtime is installed. PREFIX=/usr/local (with sudo) installs the runtime system-wide;
+# CODE=code-insiders installs the extension into VS Code Insiders.
+install: ext
 	mkdir -p $(PREFIX)/bin
 	@# Replace, not overwrite: macOS kills a signed binary that is rewritten in place.
 	rm -f $(PREFIX)/bin/$(BIN)
 	cp $(RUNTIME)/target/release/$(BIN) $(PREFIX)/bin/$(BIN)
 	@echo "Installed $(PREFIX)/bin/$(BIN)."
 	@case ":$$PATH:" in *":$(PREFIX)/bin:"*) ;; *) echo "$(PREFIX)/bin is not on your PATH; add it to run $(BIN) by name." ;; esac
+	@if command -v $(CODE) >/dev/null 2>&1; then \
+		$(MAKE) --no-print-directory install-vsix; \
+	else \
+		echo "$(CODE) is not on your PATH, so the extension was not installed. Install $(VSIX) from VS Code (Extensions: Install from VSIX), or run make install CODE=<path to code>."; \
+	fi
 	@$(MAKE) --no-print-directory link-vscode
 
 # Installed task-x VS Code extensions run the runtime in their own bin/ folder, which no update
@@ -44,6 +56,35 @@ link-vscode:
 		ln -s "$(PREFIX)/bin/$(BIN)" "$$d/bin/$(BIN)"; \
 		echo "Linked $$d/bin/$(BIN) to $(PREFIX)/bin/$(BIN); reload VS Code to use it."; \
 	done
+
+# Builds the VS Code extension with the release runtime in $(EXT)/bin/, and packages $(VSIX).
+ext: build
+	mkdir -p $(EXT)/bin
+	@# Replace, not overwrite: macOS kills a signed binary that is rewritten in place.
+	rm -f $(EXT)/bin/$(BIN)
+	cp $(RUNTIME)/target/release/$(BIN) $(EXT)/bin/$(BIN)
+	npm --prefix $(EXT) ci --no-audit --no-fund
+	npm --prefix $(EXT) run build
+	rm -f $(EXT)/*.vsix
+	npm --prefix $(EXT) run package
+
+# Installs $(VSIX) into VS Code, replacing an installed copy (CODE=code-insiders for Insiders).
+ext-install: ext install-vsix
+
+# VS Code's `code` CLI prints Node's DEP0169 warning (its own `url.parse()` call, not ours); the
+# CLI's output is captured, exactly those two lines are dropped, and its exit code is kept.
+install-vsix:
+	@out=$$(mktemp); $(CODE) --install-extension $(VSIX) --force > "$$out" 2>&1; status=$$?; \
+	grep -vE '^\(node:[0-9]+\) \[DEP0169\]|^\(Use `Code --trace-deprecation' "$$out" >&2 || true; rm -f "$$out"; \
+	[ $$status -eq 0 ] || exit $$status; \
+	echo "Installed $(VSIX). Reload VS Code windows to use it."
+
+# Debug runtime plus an Extension Development Host with the extension from this folder.
+ext-run:
+	cargo build --manifest-path $(RUNTIME)/Cargo.toml
+	npm --prefix $(EXT) install --no-audit --no-fund
+	npm --prefix $(EXT) run build
+	$(CODE) --extensionDevelopmentPath="$(CURDIR)/$(EXT)"
 
 # Raises the patch version in runtime/Cargo.toml until no release v<version> exists, so each
 # deploy is a new release. A deploy that failed before its release keeps its version.

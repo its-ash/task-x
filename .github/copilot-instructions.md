@@ -13,8 +13,11 @@ task-x is a model-agnostic coding agent. `runtime/` is the Rust agent runtime (T
 
 ## Commands
 
-- `make run` — debug build plus Extension Development Host
-- `make build` — release runtime into `extension/bin/` plus extension build
+- `make run` — debug build plus a terminal chat session (`task-x-runtime chat`)
+- `make build` — release runtime
+- `make install` — release runtime and extension: runtime into `~/.local/bin`, `.vsix` into VS Code
+- `make ext-run` — debug runtime plus Extension Development Host
+- `make ext` / `make ext-install` — release runtime into `extension/bin/`, `.vsix` package / install into VS Code (extension only)
 - `cargo test --manifest-path runtime/Cargo.toml`
 - `cargo clippy --manifest-path runtime/Cargo.toml --all-targets`
 - `npm --prefix extension test`

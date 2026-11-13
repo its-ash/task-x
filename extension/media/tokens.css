@@ -1,0 +1,173 @@
+/*
+ * task-x design tokens: color roles and motion.
+ *
+ * Every color comes from the active VS Code theme (--vscode-*), so views follow light, dark, and
+ * high-contrast themes without a second palette. Material-style role names are kept as aliases so
+ * components read one vocabulary. Containers are tints of the editor background; "on-X" roles are
+ * the text color for an X fill. Components use only the semantic tokens in the second block.
+ */
+@font-face { font-family: "Fira Code"; src: url("fonts/FiraCode.woff2") format("woff2"); font-weight: 300 700; font-style: normal; font-display: swap; }
+
+body {
+  --bg: var(--vscode-editor-background);
+  --fg-theme: var(--vscode-foreground);
+
+  --md-sys-color-primary: #9fcaff;
+  --md-sys-color-on-primary: #003258;
+  --md-sys-color-primary-container: #00497d;
+  --md-sys-color-on-primary-container: #d1e4ff;
+  --md-sys-color-secondary: var(--vscode-descriptionForeground);
+  --md-sys-color-on-secondary: var(--bg);
+  --md-sys-color-secondary-container: color-mix(in srgb, var(--md-sys-color-secondary) 22%, var(--bg));
+  --md-sys-color-on-secondary-container: var(--fg-theme);
+  --md-sys-color-tertiary: var(--vscode-charts-purple, var(--vscode-terminal-ansiMagenta));
+  --md-sys-color-on-tertiary: var(--bg);
+  --md-sys-color-tertiary-container: color-mix(in srgb, var(--md-sys-color-tertiary) 22%, var(--bg));
+  --md-sys-color-on-tertiary-container: var(--fg-theme);
+  --md-sys-color-error: var(--vscode-errorForeground);
+  --md-sys-color-on-error: var(--bg);
+  --md-sys-color-error-container: var(--vscode-inputValidation-errorBackground, color-mix(in srgb, var(--md-sys-color-error) 22%, var(--bg)));
+  --md-sys-color-on-error-container: var(--fg-theme);
+  --md-sys-color-on-surface: var(--fg-theme);
+  --md-sys-color-on-surface-variant: var(--vscode-descriptionForeground);
+  --md-sys-color-outline: var(--vscode-editorWidget-border, var(--vscode-panel-border, var(--vscode-descriptionForeground)));
+  --md-sys-color-outline-variant: var(--vscode-panel-border, var(--vscode-editorWidget-border, var(--vscode-descriptionForeground)));
+  --md-sys-color-inverse-surface: var(--fg-theme);
+  --md-sys-color-inverse-on-surface: var(--bg);
+  --md-sys-color-inverse-primary: var(--vscode-textLink-activeForeground, var(--md-sys-color-primary));
+  --md-sys-color-surface-container-lowest: var(--bg);
+  --md-sys-color-surface-container-low: color-mix(in srgb, var(--fg-theme) 4%, var(--bg));
+  --md-sys-color-surface-container: color-mix(in srgb, var(--fg-theme) 6%, var(--bg));
+  --md-sys-color-surface-container-high: color-mix(in srgb, var(--fg-theme) 9%, var(--bg));
+  --md-sys-color-surface-container-highest: color-mix(in srgb, var(--fg-theme) 12%, var(--bg));
+
+  --md-ext-amber: #edc21f;
+  --md-ext-on-amber: #3c2f00;
+  --md-ext-amber-container: color-mix(in srgb, var(--md-ext-amber) 22%, var(--bg));
+  --md-ext-on-amber-container: var(--fg-theme);
+  --md-ext-green: #76daa1;
+  --md-ext-on-green: #003920;
+  --md-ext-green-container: color-mix(in srgb, var(--md-ext-green) 22%, var(--bg));
+  --md-ext-on-green-container: var(--fg-theme);
+  --md-ext-rose: var(--vscode-terminal-ansiMagenta, var(--vscode-charts-purple));
+  --md-ext-on-rose: var(--bg);
+  --md-ext-rose-container: color-mix(in srgb, var(--md-ext-rose) 22%, var(--bg));
+  --md-ext-on-rose-container: var(--fg-theme);
+  --md-ext-teal: var(--vscode-terminal-ansiCyan, var(--vscode-charts-blue));
+  --md-ext-on-teal: var(--bg);
+  --md-ext-teal-container: color-mix(in srgb, var(--md-ext-teal) 22%, var(--bg));
+  --md-ext-on-teal-container: var(--fg-theme);
+  --md-ext-orange: #ffb77b;
+  --md-ext-on-orange: #4c2700;
+  --md-ext-orange-container: color-mix(in srgb, var(--md-ext-orange) 22%, var(--bg));
+  --md-ext-on-orange-container: var(--fg-theme);
+  --md-shadow: var(--vscode-widget-shadow, rgb(0 0 0 / 0.36));
+}
+/* Light themes: filled roles use dark-on-light Material tones so the label text stays readable. */
+body.vscode-light,
+body.vscode-high-contrast-light {
+  --md-sys-color-primary: #0061a4;
+  --md-sys-color-on-primary: #ffffff;
+  --md-sys-color-primary-container: #d1e4ff;
+  --md-sys-color-on-primary-container: #001d36;
+  --md-ext-amber: #725c00;
+  --md-ext-on-amber: #ffffff;
+  --md-ext-green: #006d43;
+  --md-ext-on-green: #ffffff;
+  --md-ext-orange: #8f4e00;
+  --md-ext-on-orange: #ffffff;
+}
+
+body {
+  /* Material 3 motion. */
+  --md-motion-emphasized: cubic-bezier(0.2, 0, 0, 1);
+  --md-motion-emphasized-decelerate: cubic-bezier(0.05, 0.7, 0.1, 1);
+  --md-motion-emphasized-accelerate: cubic-bezier(0.3, 0, 0.8, 0.15);
+  --md-motion-standard: cubic-bezier(0.2, 0, 0, 1);
+  --md-duration-short2: 100ms;
+  --md-duration-short4: 200ms;
+  --md-duration-medium2: 300ms;
+  --md-duration-medium4: 400ms;
+  /* Material 3 state layers: the content color over the container, at these opacities. */
+  --md-state-hover: 8%;
+  --md-state-press: 10%;
+
+
+  /* Semantic: subagent roles. */
+  --role-research: var(--md-sys-color-primary);
+  --role-research-container: var(--md-sys-color-primary-container);
+  --on-role-research-container: var(--md-sys-color-on-primary-container);
+  --role-implementation: var(--md-ext-green);
+  --role-implementation-container: var(--md-ext-green-container);
+  --on-role-implementation-container: var(--md-ext-on-green-container);
+  --role-testing: var(--md-ext-teal);
+  --role-testing-container: var(--md-ext-teal-container);
+  --on-role-testing-container: var(--md-ext-on-teal-container);
+  --role-review: var(--md-ext-amber);
+  --role-review-container: var(--md-ext-amber-container);
+  --on-role-review-container: var(--md-ext-on-amber-container);
+  --role-documentation: var(--md-ext-rose);
+  --role-documentation-container: var(--md-ext-rose-container);
+  --on-role-documentation-container: var(--md-ext-on-rose-container);
+
+  /* Semantic: status and log levels. */
+  --ok: var(--md-ext-green);
+  --warn: var(--md-ext-amber);
+  --bad: var(--md-sys-color-error);
+  --info: var(--md-sys-color-primary);
+  --debug: var(--md-ext-teal);
+  /* Stop buttons (agent, subagent, command): tomato red. */
+  --stop: #ff6347;
+  --on-stop: #fff;
+
+  /* Semantic: surfaces and text. */
+  --fg: var(--vscode-foreground);
+  --muted: var(--vscode-descriptionForeground);
+  --surface: var(--md-sys-color-surface-container-low);
+  --surface-high: var(--md-sys-color-surface-container-high);
+  --surface-highest: var(--md-sys-color-surface-container-highest);
+  --on-surface: var(--md-sys-color-on-surface);
+  --on-surface-variant: var(--md-sys-color-on-surface-variant);
+  --border: var(--md-sys-color-outline-variant);
+  --outline: var(--md-sys-color-outline);
+  --chip: var(--md-sys-color-secondary-container);
+  --on-chip: var(--md-sys-color-on-secondary-container);
+  --raise: color-mix(in srgb, var(--on-surface) 6%, transparent);
+  --shadow: var(--md-shadow);
+  --mono: "Fira Code", var(--vscode-editor-font-family), ui-monospace, monospace;
+  --ease: var(--md-motion-emphasized);
+  --soft-mix: 12%;
+  --line-mix: 40%;
+
+  /* Accent from the VS Code theme: primary button color, and the selected-list color for containers. */
+  --accent: var(--vscode-button-background, var(--vscode-focusBorder, #0078d4));
+  --on-accent: var(--vscode-button-foreground, #ffffff);
+  --accent-container: var(--vscode-list-activeSelectionBackground, color-mix(in srgb, var(--accent) 22%, var(--bg)));
+  --on-accent-container: var(--vscode-list-activeSelectionForeground, var(--fg-theme));
+}
+
+/* Derived from the accent, so tints follow the VS Code theme. */
+body {
+  --accent-soft: color-mix(in srgb, var(--accent) var(--soft-mix), transparent);
+  --accent-line: color-mix(in srgb, var(--accent) var(--line-mix), transparent);
+}
+
+/* High contrast: no tints or shadows; solid borders carry the meaning. */
+body.vscode-high-contrast,
+body.vscode-high-contrast-light {
+  --soft-mix: 0%;
+  --line-mix: 100%;
+  --border: var(--vscode-contrastBorder, var(--fg));
+  --surface: var(--vscode-editor-background);
+  --surface-high: var(--vscode-editor-background);
+  --surface-highest: var(--vscode-editor-background);
+  --shadow: transparent;
+}
+
+/* Shared motion: elements enter with Material's emphasized-decelerate curve. */
+@keyframes md-enter { from { opacity: 0; transform: translateY(6px); } }
+@keyframes md-pop { from { opacity: 0; transform: scale(0.92); } }
+@media (prefers-reduced-motion: reduce) {
+  @keyframes md-enter { from { opacity: 0; } }
+  @keyframes md-pop { from { opacity: 0; } }
+}
