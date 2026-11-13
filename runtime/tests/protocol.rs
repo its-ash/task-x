@@ -312,6 +312,17 @@ async fn mcp_discover_imports_other_tools_servers() {
     assert_eq!(rt.until_response(2).await.0["result"]["servers"][0]["disabled"], true);
     rt.send(json!({"jsonrpc":"2.0","id":3,"method":"mcp/discover","params":{ "import": ["plod"] }})).await;
     assert_eq!(rt.until_response(3).await.0["error"]["code"], -32602);
+
+    // No `import` (a client with its own import): only what the client's servers lack is filled in.
+    let some = json!({ "servers": { "neon": { "url": "https://mcp.neon.tech/mcp" } } });
+    rt.send(json!({"jsonrpc":"2.0","id":4,"method":"mcp/discover","params": some})).await;
+    let names: Vec<Value> = rt.until_response(4).await.0["result"]["servers"].as_array().unwrap().iter().map(|s| s["name"].clone()).collect();
+    assert_eq!(names, [json!("chrome-devtools"), json!("neon")], "the skipped server is filled in");
+    let same = json!({ "servers": { "chrome": { "command": "npx", "args": ["-y", "chrome-devtools-mcp@latest"] } } });
+    rt.send(json!({"jsonrpc":"2.0","id":5,"method":"mcp/discover","params": same})).await;
+    assert_eq!(rt.until_response(5).await.0["result"]["servers"].as_array().unwrap().len(), 1, "the same command under another name is not started twice");
+    rt.send(json!({"jsonrpc":"2.0","id":6,"method":"mcp/discover","params":{ "import": [] }})).await;
+    assert_eq!(rt.until_response(6).await.0["result"]["servers"], json!([]), "import: [] imports nothing");
     std::fs::remove_dir_all(home).ok();
 }
 

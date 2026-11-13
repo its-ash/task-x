@@ -159,7 +159,7 @@ impl StreamDecoder for Decoder {
         for tc in msg["tool_calls"].as_array().into_iter().flatten() {
             let f = &tc["function"];
             let input = match &f["arguments"] {
-                Value::String(s) => serde_json::from_str(s).map_err(|e| ProviderError::protocol(format!("invalid tool arguments: {e}")))?,
+                Value::String(s) => serde_json::from_str(s).map_err(|e| ProviderError::bad_tool_call(format!("invalid tool arguments: {e}")))?,
                 Value::Null => json!({}),
                 other => other.clone(),
             };

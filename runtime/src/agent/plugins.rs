@@ -172,8 +172,10 @@ pub fn load(workspace: Option<&Path>, home: Option<&Path>, extra: &[PathBuf], di
 }
 
 /// `(name, path)` of the enabled plugins, for the skill, agent, and command loaders.
-pub fn enabled_dirs(plugins: &[Plugin]) -> Vec<(String, PathBuf)> {
-    plugins.iter().filter(|p| p.enabled).map(|p| (p.name.clone(), p.path.clone())).collect()
+/// The folders of the enabled plugins. A workspace's own plugins count only in a trusted workspace:
+/// their agents and skills shape what the agent does, and a cloned repository could ship them.
+pub fn enabled_dirs(plugins: &[Plugin], workspace_trusted: bool) -> Vec<(String, PathBuf)> {
+    plugins.iter().filter(|p| p.enabled && (workspace_trusted || p.source != "workspace")).map(|p| (p.name.clone(), p.path.clone())).collect()
 }
 
 #[cfg(test)]
@@ -224,7 +226,7 @@ mod tests {
         assert!(!all.iter().find(|p| p.name == "old").unwrap().enabled, "settings.json turns it off");
         assert!(!all.iter().find(|p| p.name == "team").unwrap().enabled, ".task-x/plugins.json turns it off");
         assert_eq!(all.iter().find(|p| p.name == "mine").unwrap().source, "user");
-        let on = enabled_dirs(&all);
+        let on = enabled_dirs(&all, true);
         assert_eq!(on.len(), 2);
         assert!(on.iter().any(|(n, _)| n == "seo") && on.iter().any(|(n, _)| n == "mine"));
         std::fs::remove_dir_all(base).ok();

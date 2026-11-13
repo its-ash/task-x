@@ -58,9 +58,14 @@ pub fn tools() -> Vec<ToolDef> {
     ]
 }
 
+/// Settings that keep git from running a program the repository names. Git runs outside the
+/// sandbox, and a sandboxed command can write `.git/config`, so `core.fsmonitor` (run on every
+/// status) and hooks are turned off; diff and show also pass `--no-ext-diff --no-textconv`.
+pub const SAFE_GIT: &[&str] = &["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false"];
+
 fn git(c: &ToolCtx, args: &[&str]) -> Result<String, ToolError> {
     let mut argv: Vec<String> =
-        ["git", "--no-pager", "-c", "core.quotepath=off", "-c", "color.ui=false"].iter().map(|s| s.to_string()).collect();
+        ["git", "--no-pager", "-c", "core.quotepath=off", "-c", "color.ui=false"].iter().chain(SAFE_GIT).map(|s| s.to_string()).collect();
     argv.extend(args.iter().map(|s| s.to_string()));
     let o = exec::run(&argv, &c.root, ".", GIT_TIMEOUT, &c.cancel)?;
     if o.timed_out {
@@ -118,7 +123,7 @@ struct DiffIn {
 
 fn git_diff(c: &ToolCtx, input: Value) -> ToolResult {
     let i: DiffIn = parse(input)?;
-    let mut args = vec!["diff", "--no-ext-diff"];
+    let mut args = vec!["diff", "--no-ext-diff", "--no-textconv"];
     if i.staged {
         args.push("--cached");
     }
@@ -175,7 +180,7 @@ fn git_show(c: &ToolCtx, input: Value) -> ToolResult {
         rev: String,
     }
     let i: In = parse(input)?;
-    let out = git(c, &["show", "--stat", "--patch", "--no-ext-diff", valid_rev(&i.rev)?, "--"])?;
+    let out = git(c, &["show", "--stat", "--patch", "--no-ext-diff", "--no-textconv", valid_rev(&i.rev)?, "--"])?;
     Ok(json!({ "rev": i.rev, "show": out }))
 }
 

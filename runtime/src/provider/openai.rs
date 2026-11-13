@@ -77,21 +77,42 @@ pub fn chat_request(cfg: &ResolvedConfig, req: &ChatRequest) -> HttpRequest {
     } else {
         body["max_tokens"] = json!(req.max_tokens());
     }
-    if let Some(t) = req.temperature {
+    // Reasoning models reject a temperature other than the default, and only they take
+    // `reasoning_effort`.
+    let reasoning = is_reasoning(&cfg.model);
+    if let Some(t) = req.temperature.filter(|_| !reasoning) {
         body["temperature"] = json!(t);
     }
-    // Only reasoning models take `reasoning_effort`; others reject the field.
-    let name = cfg.model.rsplit('/').next().unwrap_or_default();
-    if let Some(e) = req
-        .effort
-        .filter(|_| name.starts_with("gpt-5") || name.strip_prefix('o').is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit())))
-    {
+    if let Some(e) = req.effort.filter(|_| reasoning) {
         body["reasoning_effort"] = json!(e.three_level());
     }
     if !req.tools.is_empty() {
         body["tools"] = json!(tool_specs(&req.tools));
     }
     HttpRequest::post(cfg.endpoint("/chat/completions"), headers(cfg), body)
+}
+
+/// `gpt-5*` and `o1`, `o3`, `o4`, … (also behind a `vendor/` prefix): the models that reason before
+/// answering.
+pub fn is_reasoning(model: &str) -> bool {
+    let name = model.rsplit('/').next().unwrap_or_default();
+    name.starts_with("gpt-5") || name.strip_prefix('o').is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// The reply size an agent turn asks for. Reasoning models (`gpt-5`, `o1`/`o3`/`o4`) spend part
+/// of it on hidden reasoning, so they get the most; GPT-4o and 4.1 allow 16K; older GPT-4 and
+/// 3.5 models 4K.
+pub fn output_tokens(model: &str) -> u32 {
+    let m = model.rsplit('/').next().unwrap_or_default();
+    if is_reasoning(m) {
+        32_768
+    } else if m.starts_with("gpt-4o") || m.starts_with("gpt-4.1") || m.starts_with("chatgpt-4o") {
+        16_384
+    } else if m.starts_with("gpt-4") || m.starts_with("gpt-3.5") {
+        4_096
+    } else {
+        16_384
+    }
 }
 
 /// Context window in tokens. Conservative: model families with a known larger window, else 128K.
@@ -281,8 +302,7 @@ impl Decoder {
         }
         let v: Value = serde_json::from_str(data).map_err(|e| ProviderError::protocol(format!("invalid chat completion chunk: {e}")))?;
         if let Some(e) = v.get("error") {
-            let msg = e["message"].as_str().or(e.as_str()).unwrap_or("provider stream error");
-            return Err(ProviderError::new(ErrorKind::Server, msg));
+            return Err(ProviderError::from_stream_error(e));
         }
         let mut out = Vec::new();
         if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
@@ -351,8 +371,8 @@ impl Decoder {
             let input = match parse_arguments(pc.args.trim()) {
                 Some(v) => v,
                 None => {
-                    return Err(ProviderError::protocol(format!(
-                        "the model streamed tool arguments for '{}' that are not valid JSON; retry the request",
+                    return Err(ProviderError::bad_tool_call(format!(
+                        "the model streamed tool arguments for '{}' that are not valid JSON (cut off at the output limit, or malformed)",
                         pc.name
                     )));
                 }

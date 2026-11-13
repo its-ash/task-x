@@ -1,6 +1,7 @@
 //! The agent loop: enriched request → model → tool calls (policy-checked, approved, executed) →
 //! results back to the model → … until the model finishes or a limit stops it.
 
+pub mod activity;
 pub mod agents;
 pub mod approvals;
 pub mod session;
@@ -54,6 +55,11 @@ const VALIDATION_TOOLS: &[&str] = &["run_tests", "check_build", "run_linter", "f
 const COMMAND_HANDOFF: Duration = Duration::from_secs(30);
 /// How often a reply with no text and no tool call is answered with `EMPTY_ANSWER_NUDGE`.
 const MAX_EMPTY_ANSWERS: u32 = 2;
+/// Replies cut off at the output limit that the agent recovers from per task: unreadable tool
+/// calls sent again, and answers continued. Past it, the task stops with the error.
+const MAX_CUT_OFFS: u32 = 3;
+const BAD_TOOL_CALL_NUDGE: &str = "Your last tool call could not be read: its arguments were cut off (the reply reached the output limit) or were not valid JSON, so it did not run. Send it again. If it carried a large edit or file, split the work into several smaller calls.";
+const CONTINUE_NUDGE: &str = "Your reply stopped at the output limit. Continue exactly where it stopped, without repeating what you already wrote.";
 /// How often a stop hook may send the agent back to work in one run (a hook that always blocks
 /// would otherwise keep the task going until a limit stops it).
 const MAX_STOP_BLOCKS: u32 = 3;
@@ -296,6 +302,7 @@ struct SubJob {
 
 impl SubJob {
     fn emit(&self, event: Value) {
+        activity::observe(&self.parent_id, &event);
         (self.parent_emit)(&self.parent_id, event);
     }
 
@@ -411,6 +418,25 @@ pub struct Question {
     pub text: String,
     pub kind: QuestionKind,
     pub options: Vec<String>,
+    /// The options the agent recommends (at most one for a radio question): a client can offer
+    /// "Proceed with recommendation", which answers every question with these.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recommended: Vec<String>,
+}
+
+/// The options `recommended` names that are offered, else those labelled "(Recommended)" (the
+/// Claude Code convention); at most one for a radio question.
+pub fn recommended_options(kind: QuestionKind, options: &[String], recommended: &[String]) -> Vec<String> {
+    let marked = |o: &&String| o.trim_end().to_ascii_lowercase().ends_with("(recommended)");
+    let mut out: Vec<String> = recommended.iter().filter(|r| options.contains(r)).cloned().collect();
+    if out.is_empty() {
+        out = options.iter().filter(marked).cloned().collect();
+    }
+    out.dedup();
+    if kind == QuestionKind::Radio {
+        out.truncate(1);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -508,9 +534,20 @@ fn mode_note(chat: ChatMode, p: &PolicyConfig) -> String {
     }
 }
 
+/// The wait before retry `attempt` (1-based): what the provider asked for (`Retry-After`), else
+/// 1 s, 2 s, 4 s, … with up to 25% jitter, so parallel subagents do not retry in lockstep.
+fn retry_wait(attempt: u32, retry_after_ms: Option<u64>) -> Duration {
+    let base = retry_after_ms.unwrap_or(1_000 * 2u64.pow(attempt.saturating_sub(1).min(6)));
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as u64);
+    let jitter = if retry_after_ms.is_some() { 0 } else { nanos % (base / 4 + 1) };
+    Duration::from_millis(base + jitter)
+}
+
 /// Short human-readable preview shown in approval prompts.
 fn preview(name: &str, input: &Value) -> Option<String> {
     match name {
+        policy::COMMAND_DELETE => tools::validate::command_deletes(input)
+            .map(|line| format!("This command deletes files, and the delete cannot be undone:\n{}", truncate(&line, 2_000))),
         "replace_text" | "replace_all" => Some(format!(
             "{}:\n- {}\n+ {}",
             input["path"].as_str()?,
@@ -789,6 +826,42 @@ struct Background {
     changed: tokio::sync::Notify,
 }
 
+/// One background job (a command or a subagent) counted as running until it is dropped, a panic
+/// included: a job that crashed must not leave the task waiting for it forever. A job dropped
+/// without `done()` (it panicked) reports that, so the model knows its result will not come.
+struct BackgroundJob {
+    bg: Arc<Background>,
+    what: String,
+    finished: bool,
+    /// A subagent's task id: a crash also ends its entry in the activity list.
+    task: Option<String>,
+}
+
+impl BackgroundJob {
+    fn start(bg: &Arc<Background>, what: String) -> Self {
+        bg.running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { bg: bg.clone(), what, finished: false, task: None }
+    }
+
+    fn done(mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for BackgroundJob {
+    fn drop(&mut self) {
+        if !self.finished {
+            let report = format!("{} ended unexpectedly (an internal error), so it has no result. Check its effects yourself before relying on them.", self.what);
+            self.bg.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(report);
+            if let Some(t) = &self.task {
+                activity::ended(t, "failed");
+            }
+        }
+        self.bg.running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.bg.changed.notify_waiters();
+    }
+}
+
 /// Output of a finished background command given to the model.
 const MAX_BACKGROUND_REPORT_CHARS: usize = 12_000;
 
@@ -978,7 +1051,13 @@ fn parse_questions(input: &Value) -> Result<Vec<Question>, String> {
             if !(2..=MAX_OPTIONS).contains(&options.len()) || distinct.len() != options.len() {
                 return Err(format!("questions[{i}] needs 2 to {MAX_OPTIONS} different options"));
             }
-            Ok(Question { id: format!("q{}", i + 1), text: text.into(), kind, options })
+            let asked: Vec<String> = match &q["recommended"] {
+                Value::String(s) => vec![s.trim().to_owned()],
+                Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_owned())).collect(),
+                _ => Vec::new(),
+            };
+            let recommended = recommended_options(kind, &options, &asked);
+            Ok(Question { id: format!("q{}", i + 1), text: text.into(), kind, options, recommended })
         })
         .collect()
 }
@@ -991,7 +1070,11 @@ fn answer_json(qs: &[Question], answers: Option<Answers>) -> Value {
     let list: Vec<Value> = qs
         .iter()
         .map(|q| {
-            let mut a = json!({ "question": q.text, "selected": answers.picked(q) });
+            let picked = answers.picked(q);
+            let mut a = json!({ "question": q.text, "selected": picked });
+            if !q.recommended.is_empty() {
+                a["tookRecommendation"] = json!(picked == q.recommended);
+            }
             if let Some(t) = answers.other(q) {
                 a["other"] = json!(t);
             }
@@ -1004,7 +1087,7 @@ fn answer_json(qs: &[Question], answers: Option<Answers>) -> Value {
 fn ask_spec() -> crate::provider::ToolSpec {
     crate::provider::ToolSpec {
         name: ASK_USER.into(),
-        description: "Ask the user one to four questions and wait for the answers. Use it only when a choice blocks progress and only the user can make it. Use radio when exactly one option applies, checkbox when several can. Each question has 2 to 8 options. The user can also type their own answer. Returns the chosen option texts per question, and `other` when the user typed an answer.".into(),
+        description: "Ask the user one to four questions and wait for the answers. Use it only when a choice blocks progress and only the user can make it. Use radio when exactly one option applies, checkbox when several can. Each question has 2 to 8 options. Put the option(s) you recommend in `recommended` (copied exactly from `options`; one for radio): the user can accept every recommendation with one 'Proceed with recommendation' button. The user can also type their own answer. Returns the chosen option texts per question, `tookRecommendation` when you recommended something, and `other` when the user typed an answer.".into(),
         input_schema: json!({
             "type": "object",
             "properties": { "questions": { "type": "array", "minItems": 1, "maxItems": MAX_QUESTIONS, "items": {
@@ -1012,7 +1095,8 @@ fn ask_spec() -> crate::provider::ToolSpec {
                 "properties": {
                     "question": { "type": "string" },
                     "type": { "type": "string", "enum": ["radio", "checkbox"] },
-                    "options": { "type": "array", "minItems": 2, "maxItems": MAX_OPTIONS, "items": { "type": "string" } }
+                    "options": { "type": "array", "minItems": 2, "maxItems": MAX_OPTIONS, "items": { "type": "string" } },
+                    "recommended": { "type": "array", "items": { "type": "string" }, "description": "The option texts you recommend, copied from options (one for radio)" }
                 },
                 "required": ["question", "type", "options"],
                 "additionalProperties": false
@@ -1080,6 +1164,7 @@ impl Target {
 
 impl Run {
     fn emit(&self, event: Value) {
+        activity::observe(&self.rec.id, &event);
         (self.host.emit)(&self.rec.id, event);
     }
 
@@ -1090,8 +1175,13 @@ impl Run {
         }
     }
 
+    /// Tokens this task has spent, its subagents included: those of earlier prompts (merged into
+    /// the metrics) and those that ended during this one (still in `sub_totals`), so the token
+    /// budget holds in team mode too.
     fn total_tokens(&self) -> u64 {
-        self.rec.usage.input_tokens.unwrap_or(0) + self.rec.usage.output_tokens.unwrap_or(0)
+        let own = self.rec.usage.input_tokens.unwrap_or(0) + self.rec.usage.output_tokens.unwrap_or(0);
+        let live = self.sub_totals.lock().expect("subtotals lock").tokens;
+        own + self.rec.metrics.subagent_tokens + live
     }
 
     fn add_usage(&mut self, u: Usage) {
@@ -1182,30 +1272,36 @@ impl Run {
                 system: Some(self.rec.system.clone()),
                 messages: self.rec.messages.clone(),
                 tools: if with_tools { self.tool_specs.clone() } else { Vec::new() },
-                max_tokens: self.limits.max_output_tokens,
+                // Unset: the model's own room for an agent turn, not the request's 4096 default.
+                max_tokens: Some(self.limits.max_output_tokens.unwrap_or_else(|| crate::provider::output_tokens(&self.provider))),
                 temperature: None,
                 context_window: u32::try_from(window).ok(),
                 effort: self.limits.effort,
             };
             debug!(estimate = estimate, window = window, model = %self.provider.model, "Starting model turn");
             let started = Instant::now();
+            // Whether this attempt already streamed text: a retry then tells the client to drop it.
+            let streamed = std::sync::atomic::AtomicBool::new(false);
             let res = self
                 .host
                 .providers
                 .stream_chat(&self.provider, &req, &self.cancel, |ev| {
                     if let StreamEvent::TextDelta { text } = ev {
+                        streamed.store(true, std::sync::atomic::Ordering::Relaxed);
                         emit(&id, json!({ "type": "textDelta", "text": text }));
                     }
                 })
                 .await;
+            let streamed = streamed.into_inner();
             self.rec.metrics.model_calls += 1;
             self.rec.metrics.model_ms += started.elapsed().as_millis() as u64;
             match res {
                 Err(e) if e.retryable && attempt + 1 < PROVIDER_RETRIES => {
                     attempt += 1;
                     self.rec.metrics.retries += 1;
-                    let wait = Duration::from_millis(1_000 * 2u64.pow(attempt - 1));
-                    self.emit(json!({ "type": "retry", "attempt": attempt, "reason": e.message, "waitMs": wait.as_millis() as u64 }));
+                    let wait = retry_wait(attempt, e.retry_after_ms);
+                    // `discardText`: the text streamed in the failed attempt is not part of the answer.
+                    self.emit(json!({ "type": "retry", "attempt": attempt, "reason": e.message, "waitMs": wait.as_millis() as u64, "discardText": streamed }));
                     tokio::select! {
                         _ = self.cancel.cancelled() => return Err(ProviderError::new(ErrorKind::Cancelled, "cancelled")),
                         _ = tokio::time::sleep(wait) => {}
@@ -1258,21 +1354,23 @@ impl Run {
         let note = json!({ "taskId": self.rec.id, "kind": "question", "message": qs.first().map_or("task-x has a question", |q| q.text.as_str()) });
         let _ = self.hook_event(hooks::Event::Notification, None, note, None).await;
         let req = AskRequest { task_id: self.rec.id.clone(), call_id: call.id.clone(), questions: qs.to_vec() };
+        activity::asking(&self.rec.id, true);
         let answers = (self.host.ask)(req, self.cancel.clone()).await;
+        activity::asking(&self.rec.id, false);
         answer_json(qs, answers)
     }
 
     /// Applies the permission policy and the user's answer. A policy denial is `Forbidden` (Blocked:
     /// nothing the model sends can change it); a denial the user chose is a plain failure it can
     /// react to by changing the approach.
-    async fn decide(&mut self, call: &ToolCall, name: &str, permission: Permission, hook_approved: bool) -> Result<(), tools::ToolError> {
+    async fn decide(&mut self, call: &ToolCall, name: &str, permission: Permission, decision: Decision, hook_approved: bool) -> Result<(), tools::ToolError> {
         let denied = |why: &str| {
             tools::ToolError::new(
                 ToolErrorKind::Forbidden,
                 format!("Permission denied: {name} ({permission:?}) is blocked by the permission policy; {why}"),
             )
         };
-        match self.policy.decide(name, permission) {
+        match decision {
             Decision::Allow => Ok(()),
             Decision::Deny => Err(denied("do not call it again, use another way or tell the user what they must allow")),
             // A trusted hook (user settings or an installed plugin) answered for the user.
@@ -1425,8 +1523,13 @@ impl Run {
         if VALIDATION_TOOLS.contains(&call.name.as_str()) {
             self.hook(hooks::Event::BeforeValidation, &call.name, payload, None).await.map_err(|e| blocked(&e))?;
         }
-        let name = call.name.clone();
-        self.decide(call, &name, permission, before.approve).await?;
+        // A command that deletes files skips the edit log, so it asks in every mode (see policy).
+        let deletes = (call.name == "run_command").then(|| tools::validate::command_deletes(&call.input)).flatten();
+        let (name, permission, decision) = match &deletes {
+            Some(_) => (policy::COMMAND_DELETE.to_owned(), Permission::Delete, self.policy.decide_command_delete()),
+            None => (call.name.clone(), permission, self.policy.decide(&call.name, permission)),
+        };
+        self.decide(call, &name, permission, decision, before.approve).await?;
         Ok(target)
     }
 
@@ -1455,7 +1558,15 @@ impl Run {
         }
         let ctx = self.hook_context(event, tool, payload, severity);
         let (hooks, cwd, cancel) = (self.hooks.clone(), self.cwd.clone(), self.cancel.clone());
-        let results = tokio::task::spawn_blocking(move || hooks::run(&hooks, &ctx, &cwd, &cancel)).await.unwrap_or_default();
+        // A hook that crashed may have been the one meant to block, so a crash blocks (fails closed).
+        let results = match tokio::task::spawn_blocking(move || hooks::run(&hooks, &ctx, &cwd, &cancel)).await {
+            Ok(r) => r,
+            Err(e) => {
+                let why = format!("the {event:?} hooks crashed ({e}); the action is blocked to be safe");
+                self.emit(json!({ "type": "warning", "message": format!("Hooks: {why}") }));
+                return Err(why);
+            }
+        };
         for o in &results {
             self.emit(json!({ "type": "hook", "event": event, "command": o.command, "blocked": o.blocked, "message": o.message(), "durationMs": o.duration_ms }));
         }
@@ -1501,7 +1612,8 @@ impl Run {
         // A background subagent: the lead goes on at once, and the report comes as a message.
         let job = self.setup_sub(role, agent, call, &[], None, None).await?;
         let (bg, name, child) = (self.background.clone(), job.name.clone(), job.child_id.clone());
-        bg.running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = BackgroundJob::start(&bg, format!("Background subagent {name} (task {child})"));
+        guard.task = Some(child.clone());
         let (n2, c2) = (name.clone(), child.clone());
         tokio::spawn(async move {
             let report = match job.finish().await {
@@ -1512,9 +1624,8 @@ impl Run {
                 ),
                 Err(e) => format!("Background subagent {n2} (task {c2}) failed: {e}"),
             };
-            bg.done.lock().expect("background lock").push(report);
-            bg.running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            bg.changed.notify_waiters();
+            bg.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(report);
+            guard.done();
         });
         Ok(json!({
             "background": true, "name": name, "taskId": child,
@@ -1602,6 +1713,8 @@ impl Run {
             limits: Limits {
                 max_iterations: agent.and_then(|a| a.max_iterations).unwrap_or(SUBAGENT_ITERATIONS),
                 deadline_secs: SUBAGENT_DEADLINE_SECS,
+                // A subagent may spend only what is left of the lead's budget, not a budget of its own.
+                max_total_tokens: self.limits.max_total_tokens.map(|m| m.saturating_sub(self.total_tokens()).max(1)),
                 ..self.limits.clone()
             },
             task_id: Some(child_id.clone()),
@@ -1982,7 +2095,8 @@ impl Run {
             let w = ws.as_ref().ok_or_else(|| fail("no workspace is open".into()))?;
             let mut pieces = Vec::new();
             let mut texts = HashMap::new();
-            for f in w.index.files() {
+            // Secret-looking files are never sent to the embedding provider.
+            for f in w.index.files().filter(|f| !crate::context::index::is_secret(&f.rel)) {
                 let Some(c) = f.content.clone() else { continue };
                 pieces.extend(semantic::code_pieces(&f.rel, &c));
                 texts.insert(f.rel.clone(), c);
@@ -2301,7 +2415,7 @@ impl Run {
         let (bg, emit, task, call_id, tool) =
             (self.background.clone(), self.host.emit.clone(), self.rec.id.clone(), call.id.clone(), call.name.clone());
         let task_cancel = self.cancel.clone();
-        bg.running.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let guard = BackgroundJob::start(&bg, format!("Background command `{command}` (call {call_id})"));
         let (tx, rx) = tokio::sync::oneshot::channel();
         let job = command.clone();
         tokio::spawn(async move {
@@ -2325,10 +2439,9 @@ impl Run {
                     "Background command `{job}` (call {call_id}) {state}. Its result:\n{}",
                     truncate(&output, MAX_BACKGROUND_REPORT_CHARS)
                 );
-                bg.done.lock().expect("background lock").push(report);
+                bg.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(report);
             }
-            bg.running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            bg.changed.notify_waiters();
+            guard.done();
         });
         let pending = json!({
             "background": true,
@@ -2442,6 +2555,9 @@ impl Run {
         let mut empty_answers = 0;
         // Times a stop hook sent the agent back to work.
         let mut stop_blocks = 0;
+        // Replies cut off at the output limit: tool calls that could not be read, and text that
+        // stopped mid-way (kept in `cut_text` so the answer is whole once the model continues).
+        let (mut bad_calls, mut cut_offs, mut cut_text) = (0, 0, String::new());
         self.rec.status = Status::Running;
         self.save();
         let prompt = self.rec.checkpoints.last().map(|c| c.prompt.clone()).unwrap_or_default();
@@ -2465,6 +2581,19 @@ impl Run {
             let out = match self.model_turn(true).await {
                 Ok(o) => o,
                 Err(e) if e.kind == ErrorKind::Cancelled => break Status::Cancelled,
+                // A tool call cut off at the output limit (or malformed): ask for it again, smaller.
+                Err(e) if e.kind == ErrorKind::BadToolCall && bad_calls < MAX_CUT_OFFS => {
+                    bad_calls += 1;
+                    self.emit(json!({ "type": "warning", "message": format!("The model's tool call could not be read ({}); task-x asks it to send it again.", e.message) }));
+                    // The history ends with the user's turn (a prompt or tool results): the note
+                    // joins it, since some providers refuse two user messages in a row.
+                    let note = ContentPart::Text { text: BAD_TOOL_CALL_NUDGE.into() };
+                    match self.rec.messages.last_mut() {
+                        Some(m) if m.role == Role::User => m.content.push(note),
+                        _ => self.rec.messages.push(Message { role: Role::User, content: vec![note] }),
+                    }
+                    continue;
+                }
                 Err(e) => {
                     self.rec.error = Some(e.message.clone());
                     self.emit(json!({ "type": "error", "error": e }));
@@ -2476,7 +2605,21 @@ impl Run {
             let mut content = Vec::new();
             if !out.text.is_empty() {
                 content.push(ContentPart::Text { text: out.text.clone() });
-                self.rec.final_text = out.text.clone();
+                self.rec.final_text = format!("{cut_text}{}", out.text);
+            }
+            let cut_off = out.stop_reason == crate::provider::StopReason::MaxTokens && out.tool_calls.is_empty() && !out.text.trim().is_empty();
+            if cut_off && cut_offs < MAX_CUT_OFFS {
+                // The answer stopped at the output limit: keep it and ask for the rest.
+                cut_offs += 1;
+                cut_text = self.rec.final_text.clone();
+                self.rec.messages.push(Message { role: Role::Assistant, content });
+                self.emit(json!({ "type": "assistantMessage", "text": out.text, "toolCalls": 0 }));
+                self.emit(json!({ "type": "warning", "message": "The reply reached the model's output limit; task-x asks it to continue." }));
+                self.rec.messages.push(Message { role: Role::User, content: vec![ContentPart::Text { text: CONTINUE_NUDGE.into() }] });
+                continue;
+            }
+            if !out.tool_calls.is_empty() {
+                cut_text.clear();
             }
             content.extend(out.tool_calls.iter().map(|c| ContentPart::ToolUse {
                 id: c.id.clone(),
@@ -2628,9 +2771,34 @@ fn run_boxed(host: Host, p: RunParams, cancel: CancellationToken) -> BoxFuture<'
 pub async fn run(host: Host, p: RunParams, cancel: CancellationToken) -> Result<TaskRecord, String> {
     let run = prepare(host.clone(), p, cancel).await?;
     let id = run.rec.id.clone();
-    host.steers.lock().expect("steers lock").insert(id.clone(), Vec::new());
-    let rec = run.run().await;
-    host.steers.lock().expect("steers lock").remove(&id);
+    let fallback = run.rec.clone();
+    host.steers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.clone(), Vec::new());
+    // The loop runs in its own task, so a panic in it ends the task as failed (saved, with `error`
+    // and `done` events) instead of leaving the client waiting and the record "running".
+    /// Aborts the loop's task when `run`'s future is dropped, as awaiting it in place would.
+    struct AbortOnDrop(tokio::task::JoinHandle<TaskRecord>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut handle = AbortOnDrop(tokio::spawn(run.run()));
+    let rec = match (&mut handle.0).await {
+        Ok(rec) => rec,
+        Err(e) => {
+            let mut rec = host.store.load(&id).unwrap_or(fallback);
+            rec.status = Status::Failed;
+            rec.error = Some(format!("internal error: the task stopped unexpectedly ({e})"));
+            rec.updated_ms = store::now_ms();
+            let _ = host.store.save(&rec);
+            let err = ProviderError::new(ErrorKind::Server, rec.error.clone().unwrap_or_default());
+            (host.emit)(&id, json!({ "type": "error", "error": err }));
+            (host.emit)(&id, json!({ "type": "done", "summary": summary(&rec) }));
+            activity::ended(&id, "failed");
+            rec
+        }
+    };
+    host.steers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
     Ok(rec)
 }
 
@@ -2688,8 +2856,11 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     let root = host.workspace.read().expect("workspace lock").as_ref().map(|w| w.index.root().to_path_buf());
     let plugin_settings = host.plugins.read().expect("plugins lock").clone();
     let plugin_list = plugins::load(root.as_deref(), plugins::home().as_deref(), &plugin_settings.dirs, &plugin_settings.disabled);
-    let plugin_dirs = plugins::enabled_dirs(&plugin_list);
-    let all_agents = agents::load(root.as_deref(), &agents::user_dirs(), &plugin_dirs);
+    let plugin_dirs = plugins::enabled_dirs(&plugin_list, plugin_settings.workspace_trusted);
+    // A workspace's own skills, commands, and agents load only when it is trusted: a cloned
+    // repository could ship an agent with every tool, or replace a built-in command.
+    let content_root = root.as_deref().filter(|_| plugin_settings.workspace_trusted);
+    let all_agents = agents::load(content_root, &agents::user_dirs(), &plugin_dirs);
     // The lead names a subagent's agent; a top-level prompt that starts with `@name` picks one itself.
     let (agent, prompt_owned): (Option<agents::AgentDef>, String) = match &p.agent {
         Some(a) => (Some(a.clone()), prompt_text.to_owned()),
@@ -2742,7 +2913,7 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     let fallbacks: Vec<ProviderConfig> = p.fallbacks.iter().filter(|f| f.resolve().is_ok()).cloned().collect();
     let mut focus: Vec<String> = enriched.sources.iter().map(|s| s.path.clone()).collect();
     focus.extend(p.editor.active_file.iter().cloned());
-    let all_skills = skills::load(root.as_deref(), &skills::user_dirs(), &plugin_dirs);
+    let all_skills = skills::load(content_root, &skills::user_dirs(), &plugin_dirs);
     let active_skills = skills::select(&all_skills, prompt_text, &focus);
     let skill_index = skills::index(&all_skills, &active_skills);
     // The tools an active skill or the agent allows; empty means every tool of the mode.
@@ -2809,6 +2980,9 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     }
     if p.depth == 0 {
         tool_specs.push(ask_spec());
+        system.push_str(
+            "\n\nWhen you would end by offering the user a choice of next steps (\"should I do A or B?\"), ask it with ask_user instead of writing the options as text, and put your pick in `recommended`: the user then gets a 'Proceed with recommendation' button.",
+        );
         // Subagents work to a deadline set by the lead: only top-level tasks sleep and wake.
         tool_specs.extend(wakeup::specs());
     }
@@ -2968,6 +3142,7 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     if let Some(w) = team_warning {
         (host.emit)(&rec.id, json!({ "type": "warning", "message": w }));
     }
+    activity::begin(&rec.id, &rec.title, &rec.model);
     (host.emit)(
         &rec.id,
         json!({
@@ -3178,7 +3353,8 @@ mod tests {
             subagents: Arc::default(),
             steers: Arc::default(),
             tool_cancels: Arc::default(),
-            plugins: Arc::default(),
+            // The test repositories are the user's own: trusted, so their skills and agents load.
+            plugins: Arc::new(RwLock::new(plugins::Settings { workspace_trusted: true, ..Default::default() })),
         }
     }
 
@@ -3207,6 +3383,92 @@ mod tests {
             depth: 0,
             agent: None,
         }
+    }
+
+    #[test]
+    fn a_crashed_background_job_never_leaves_the_task_waiting() {
+        let bg: Arc<Background> = Arc::default();
+        let ok = BackgroundJob::start(&bg, "Background command `make` (call c1)".into());
+        let crashed = BackgroundJob::start(&bg, "Background command `cargo test` (call c2)".into());
+        assert_eq!(bg.running.load(std::sync::atomic::Ordering::SeqCst), 2);
+        ok.done();
+        // A panic in the job's task drops the guard without `done()`.
+        let _ = std::thread::spawn(move || {
+            let _held = crashed;
+            panic!("job crashed");
+        })
+        .join();
+        assert_eq!(bg.running.load(std::sync::atomic::Ordering::SeqCst), 0, "both are counted as ended");
+        let reports = bg.done.lock().unwrap();
+        assert_eq!(reports.len(), 1, "only the crashed one reports");
+        assert!(reports[0].contains("cargo test") && reports[0].contains("ended unexpectedly"));
+    }
+
+    #[tokio::test]
+    async fn cut_off_replies_are_continued_and_unreadable_calls_sent_again() {
+        let root = temp_repo(&[("a.txt", "a\n")]);
+        // 1: a tool call whose arguments stop mid-way; 2: the call again; 3: an answer cut off at
+        // the output limit; 4: the rest of it.
+        let broken = json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "id": "c1", "function": { "name": "read_file", "arguments": "{\"path\": \"a.t" } }] }, "finish_reason": "length" }] });
+        let cut = json!({ "choices": [{ "index": 0, "delta": { "content": "The file says " }, "finish_reason": "length" }] });
+        let (base, seen) = mock(vec![
+            format!("data: {broken}\n\ndata: [DONE]\n\n"),
+            sse_tool("c2", "read_file", json!({ "path": "a.txt" })),
+            format!("data: {cut}\n\ndata: [DONE]\n\n"),
+            sse_text("a."),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let r = run(host(&root, ApprovalDecision::Allow, events.clone()), params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        assert_eq!(r.final_text, "The file says a.", "the cut-off answer and its rest are one answer");
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 4);
+        assert!(reqs[1]["messages"].to_string().contains("could not be read"), "the model hears its call did not run");
+        assert!(reqs[3]["messages"].to_string().contains("Continue exactly where it stopped"));
+        assert!(reqs[0]["max_tokens"].as_u64().unwrap() > 4_096, "agent turns get more room than the 4096 default");
+        let warned = events.lock().unwrap().iter().filter(|e| e["type"] == "warning").count();
+        assert_eq!(warned, 2);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_deleting_command_asks_even_in_auto_mode() {
+        let root = temp_repo(&[("build/out.txt", "x\n"), ("a.txt", "a\n")]);
+        let (base, seen) = mock(vec![
+            sse_tool("c1", "run_command", json!({ "command": "rm -rf build" })),
+            sse_tool("c2", "run_command", json!({ "command": ["cat", "a.txt"] })),
+            sse_text("Done."),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut p = params(&base, ChatMode::Agent, Mode::Autonomous);
+        p.policy.edit_mode = Some(policy::EditMode::Auto);
+        p.policy.allow_all = true;
+        let r = run(host(&root, ApprovalDecision::Deny, events.clone()), p, CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed);
+        assert!(root.join("build/out.txt").exists(), "the user said no, so nothing was deleted");
+        let ev = events.lock().unwrap();
+        let asked: Vec<&str> = ev.iter().filter(|e| e["type"] == "approvalRequested").filter_map(|e| e["tool"].as_str()).collect();
+        assert_eq!(asked, ["run_command:delete"], "only the delete asks; cat runs in auto mode");
+        let reqs = seen.lock().unwrap();
+        assert!(reqs[1]["messages"].to_string().contains("The user denied this action"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn questions_carry_recommendations() {
+        let qs = parse_questions(&json!({ "questions": [
+            { "question": "Which batch?", "type": "radio", "options": ["security", "reliability"], "recommended": ["security", "reliability", "bogus"] },
+            { "question": "Which checks?", "type": "checkbox", "options": ["lint", "test (Recommended)", "build"] },
+            { "question": "Name?", "type": "radio", "options": ["a", "b"], "recommended": "zzz" }
+        ] }))
+        .unwrap();
+        assert_eq!(qs[0].recommended, ["security"], "offered options only, one for radio");
+        assert_eq!(qs[1].recommended, ["test (Recommended)"], "the (Recommended) label counts");
+        assert!(qs[2].recommended.is_empty() && serde_json::to_value(&qs[2]).unwrap().get("recommended").is_none());
+        let took = Answers { selected: HashMap::from([("q1".into(), vec!["security".into()]), ("q2".into(), vec!["lint".into()])]), other: HashMap::new() };
+        let r = answer_json(&qs, Some(took));
+        assert_eq!((r["answers"][0]["tookRecommendation"].clone(), r["answers"][1]["tookRecommendation"].clone()), (json!(true), json!(false)));
+        assert!(r["answers"][2].get("tookRecommendation").is_none(), "nothing recommended, nothing said");
     }
 
     #[tokio::test]

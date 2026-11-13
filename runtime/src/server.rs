@@ -266,9 +266,11 @@ struct McpParams {
     servers: std::collections::BTreeMap<String, mcp::ServerConfig>,
     #[serde(default)]
     workspace_trusted: bool,
-    /// Also start the servers set up for these: `claude`, `vscode`, `copilotCli`, `cursor`.
+    /// Also start the servers set up for these: `claude`, `vscode`, `copilotCli`, `cursor`. Left
+    /// out, every source fills in only what `servers` lacks (for clients with their own, older
+    /// import); `[]` imports nothing.
     #[serde(default)]
-    import: Vec<String>,
+    import: Option<Vec<String>>,
     /// Server names not to start, whatever file has them.
     #[serde(default)]
     disabled: Vec<String>,
@@ -551,6 +553,7 @@ impl Server {
             "provider/capabilities" => self.reply(&id, Ok(provider::capability_table())),
             "tools/list" => self.reply(&id, Ok(json!(tools::infos()))),
             "mcp/discover" => self.reply(&id, self.discover_mcp(msg.params)),
+            "agent/active" => self.reply(&id, Ok(agent::activity::json())),
             "tools/setApproval" => self.reply(
                 &id,
                 params::<ApprovalParams>(msg.params).and_then(|p| {
@@ -578,11 +581,11 @@ impl Server {
             "skills/resolve" => self.reply(
                 &id,
                 params::<SkillsResolveParams>(msg.params).map(|p| {
-                    json!({ "active": skills::resolve(&skills::load(self.root().as_deref(), &skills::user_dirs(), &self.plugin_dirs()), &p.prompt, &p.paths) })
+                    json!({ "active": skills::resolve(&skills::load(self.content_root().as_deref(), &skills::user_dirs(), &self.plugin_dirs()), &p.prompt, &p.paths) })
                 }),
             ),
             "memory/search" | "memory/forget" => self.reply(&id, self.memory(&method, msg.params)),
-            "agents/list" => self.reply(&id, Ok(json!(agents::load(self.root().as_deref(), &agents::user_dirs(), &self.plugin_dirs())))),
+            "agents/list" => self.reply(&id, Ok(json!(agents::load(self.content_root().as_deref(), &agents::user_dirs(), &self.plugin_dirs())))),
             "plugins/list" => self.reply(&id, Ok(json!(self.list_plugins()))),
             "plugins/configure" => self.reply(&id, self.configure_plugins(msg.params)),
             "worktrees/list" => self.reply(
@@ -764,7 +767,11 @@ impl Server {
         let this = self.clone();
         self.tasks.spawn(async move {
             let started = Instant::now();
-            let res = match method.as_str() {
+            // A handler that panics answers with an internal error, so the client never waits on a
+            // request that will not end, and the request id is freed.
+            let handler = {
+                let (this, id, token, method) = (this.clone(), id.clone(), token.clone(), method.clone());
+                async move { match method.as_str() {
                 "provider/test" => this.provider_test(p, &token).await,
                 "provider/listModels" => this.list_models(p, &token).await,
                 "provider/models" => this.model_infos(p, &token).await,
@@ -826,8 +833,12 @@ impl Server {
                     Err(e) => Err(e),
                 },
                 _ => this.chat(&id, p, &token).await,
+            } }
             };
-            this.inflight.lock().expect("inflight lock").remove(&key);
+            let res = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(handler))
+                .await
+                .unwrap_or_else(|_| Err(RpcError::new(rpc::INTERNAL_ERROR, format!("internal error: the {method} handler crashed"))));
+            this.inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&key);
             log(format_args!("-> {method} {key} {}ms ok={}", started.elapsed().as_millis(), res.is_ok()));
             this.reply(&id, res);
         });
@@ -1317,21 +1328,34 @@ impl Server {
     /// The servers other tools set up (`import`), then the workspace's `.task-x/mcp.json`, then the
     /// client's own `servers`: a later one wins for a name. `disabled` names are not started.
     fn mcp_servers(&self, p: &McpParams) -> Result<(std::collections::BTreeMap<String, mcp::ServerConfig>, Option<crate::mcp_import::Imported>), RpcError> {
-        if let Some(bad) = p.import.iter().find(|s| !crate::mcp_import::SOURCES.contains(&s.as_str())) {
+        if let Some(bad) = p.import.iter().flatten().find(|s| !crate::mcp_import::SOURCES.contains(&s.as_str())) {
             return Err(RpcError::new(rpc::INVALID_PARAMS, format!("unknown import source '{bad}' (use {})", crate::mcp_import::SOURCES.join(", "))));
         }
         let root = self.root();
-        let imported = (!p.import.is_empty()).then(|| {
+        let fill = p.import.is_none();
+        let sources: Vec<String> = p.import.clone().unwrap_or_else(|| crate::mcp_import::SOURCES.iter().map(|s| s.to_string()).collect());
+        let mut imported = (!sources.is_empty()).then(|| {
             let env = crate::mcp_import::Env::current(home_dir().unwrap_or_default(), root.clone(), p.workspace_trusted);
-            crate::mcp_import::import(&p.import, &env, &crate::mcp_import::read_file)
+            crate::mcp_import::import(&sources, &env, &crate::mcp_import::read_file)
         });
-        let mut servers = imported.as_ref().map(|i| i.servers.clone()).unwrap_or_default();
+        let mut servers = if fill { Default::default() } else { imported.as_ref().map(|i| i.servers.clone()).unwrap_or_default() };
         if p.workspace_trusted {
             if let Some(r) = &root {
                 servers.extend(mcp::load_workspace(r).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?);
             }
         }
         servers.extend(p.servers.clone());
+        if let (true, Some(i)) = (fill, imported.as_mut()) {
+            // Only what the client lacks: a name it does not have, and not the same command or URL
+            // under another name.
+            let same = |a: &mcp::ServerConfig, b: &mcp::ServerConfig| (a.command.trim(), &a.args, &a.url) == (b.command.trim(), &b.args, &b.url);
+            let added: Vec<String> = i.servers.keys().filter(|n| !servers.contains_key(*n) && !servers.values().any(|s| same(s, &i.servers[*n]))).cloned().collect();
+            for n in &added {
+                servers.insert(n.clone(), i.servers[n].clone());
+            }
+            i.origins.retain(|n, _| added.contains(n));
+            i.servers.retain(|n, _| added.contains(n));
+        }
         for name in &p.disabled {
             if let Some(s) = servers.get_mut(name) {
                 s.disabled = true;
@@ -1407,7 +1431,7 @@ impl Server {
     }
 
     fn list_skills(&self) -> Value {
-        json!(skills::load(self.root().as_deref(), &skills::user_dirs(), &self.plugin_dirs()))
+        json!(skills::load(self.content_root().as_deref(), &skills::user_dirs(), &self.plugin_dirs()))
     }
 
     /// Every plugin found on this machine and in the workspace, with the client's settings applied.
@@ -1418,7 +1442,13 @@ impl Server {
 
     /// `(name, path)` of the enabled plugins, for the skill, command, and agent loaders.
     fn plugin_dirs(&self) -> Vec<(String, PathBuf)> {
-        plugins::enabled_dirs(&self.list_plugins())
+        plugins::enabled_dirs(&self.list_plugins(), self.plugins.read().expect("plugins lock").workspace_trusted)
+    }
+
+    /// The workspace, for loading its own skills, commands, and agents: only when it is trusted
+    /// (`plugins/configure { workspaceTrusted }`), since a cloned repository can ship them.
+    fn content_root(&self) -> Option<PathBuf> {
+        self.root().filter(|_| self.plugins.read().expect("plugins lock").workspace_trusted)
     }
 
     /// `plugins/configure`: extra plugin folders and names to turn off. Returns the resulting list.

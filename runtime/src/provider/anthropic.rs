@@ -98,6 +98,22 @@ fn effort(model: &str, e: Effort) -> Option<&'static str> {
     }
 }
 
+/// The reply size an agent turn asks for: room for a large edit or a long plan (requests always
+/// stream, so a large value cannot hit an HTTP timeout). Model caps: Claude 3 4K, 3.5 8K, Opus 4
+/// and 4.1 32K, Sonnet 3.7 / 4 / 4.5, Opus 4.5 and Haiku 4.5 64K, Claude 4.6 and later 128K.
+pub fn output_tokens(model: &str) -> u32 {
+    let m = model.trim_start_matches("anthropic.");
+    if m.starts_with("claude-3-5") || m.starts_with("claude-3.5") {
+        8_192
+    } else if m.starts_with("claude-3-") && !m.starts_with("claude-3-7") {
+        4_096
+    } else if m == "claude-opus-4" || m.starts_with("claude-opus-4-1") || m.starts_with("claude-opus-4-2025") {
+        32_000
+    } else {
+        64_000
+    }
+}
+
 /// Context window in tokens: 1M for Claude 4.6 and later (Haiku 4.5: 200K), 200K for older models.
 pub fn context_window(model: &str) -> usize {
     let m = model.trim_start_matches("anthropic.");
@@ -237,7 +253,7 @@ fn finish_tool(tb: ToolBlock) -> Result<StreamEvent, ProviderError> {
     let input = if tb.json.trim().is_empty() {
         json!({})
     } else {
-        serde_json::from_str(&tb.json).map_err(|e| ProviderError::protocol(format!("invalid tool input JSON for '{}': {e}", tb.name)))?
+        serde_json::from_str(&tb.json).map_err(|e| ProviderError::bad_tool_call(format!("invalid tool input JSON for '{}': {e}", tb.name)))?
     };
     Ok(StreamEvent::ToolCall { id: tb.id, name: tb.name, input })
 }

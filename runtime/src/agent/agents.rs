@@ -109,7 +109,11 @@ pub fn parse(text: &str, fallback_name: &str, source: &str) -> Option<AgentDef> 
     }
     let tools: Vec<String> = fields.get("tools").map(|v| list(v)).unwrap_or_default().iter().flat_map(|t| map_tool(t)).collect();
     let mode = fields.get("mode").map(|m| m.to_ascii_lowercase());
+    // A `tools:` line that names nothing (`[]`, or a shape not understood) fails closed:
+    // read-only, never "every tool", which is what an empty list means.
+    let unknown_tools = fields.get("tools").is_some_and(|v| !v.trim().is_empty()) && tools.is_empty();
     let writes = match mode.as_deref() {
+        _ if unknown_tools => false,
         Some("read" | "readonly" | "read-only" | "ask" | "plan") => false,
         Some("write" | "edit" | "agent") => true,
         _ => !reads_only(&tools),
@@ -324,6 +328,15 @@ mod tests {
         assert!(parse("---\nname: bad name\n---\nx", "a", "mem").is_none());
         assert!(parse("---\nname: empty\n---\n", "a", "mem").is_none(), "an agent needs instructions");
         assert!(!parse("---\nmode: read\ntools: Bash\n---\nx", "a", "mem").unwrap().writes, "mode wins over tools");
+    }
+
+    #[test]
+    fn yaml_lists_and_unknown_tools_never_mean_every_tool() {
+        let listed = parse("---\ntools:\n  - Read\n  - Grep\ndescription: >\n  Reviews\n  code\n---\nreview", "r", "mem").unwrap();
+        assert!(listed.tools.contains(&"read_file".to_string()) && !listed.writes, "a YAML list is read");
+        assert_eq!(listed.description, "Reviews code", "folded text is joined");
+        let empty = parse("---\ntools: []\n---\nx", "u", "mem").unwrap();
+        assert!(!empty.writes && empty.role() == Role::Research, "a tools line that names nothing: read-only, not every tool");
     }
 
     #[test]

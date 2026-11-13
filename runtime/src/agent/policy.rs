@@ -69,6 +69,9 @@ pub struct PolicyConfig {
     pub sandboxed: Option<bool>,
 }
 
+/// The name an approval for a deleting command goes by: in `allow`, `deny`, and session grants.
+pub const COMMAND_DELETE: &str = "run_command:delete";
+
 /// Whether an allow or deny entry names `tool`: the exact name, or a prefix ending in `*`
 /// (`mcp__chrome-devtools__*`, `git_*`). A bare `*` names nothing: the edit modes and
 /// `allowAll` are the way to let every tool run.
@@ -107,6 +110,23 @@ impl Policy {
             (Mode::Autonomous, P::Write | P::Execute) => Allow,
             (Mode::Autonomous, _) => Ask,
         }
+    }
+
+    /// `run_command` with a command that deletes files (`rm`, `git clean`, `find -delete`; see
+    /// `tools::validate::command_deletes`). Such deletes skip the edit log and cannot be undone, so
+    /// they ask in every mode, `auto` and `allowAll` too. Only `run_command:delete` in `allow` (or
+    /// "allow for this session" on such a prompt) lets them run unasked; denying `run_command` or
+    /// `run_command:delete` refuses them, and a read-only mode refuses them.
+    pub fn decide_command_delete(&self) -> Decision {
+        let denied = |t: &str| self.config.deny.iter().any(|d| tool_matches(d, t));
+        if denied("run_command") || denied(COMMAND_DELETE) || self.config.mode == Mode::ReadOnly {
+            return Decision::Deny;
+        }
+        // Exact entry only: `run_*` or `run_command` must not lift it by accident.
+        if self.config.allow.iter().any(|a| a == COMMAND_DELETE) || self.session_grants.contains(COMMAND_DELETE) {
+            return Decision::Allow;
+        }
+        Decision::Ask
     }
 
     pub fn decide(&self, tool: &str, p: Permission) -> Decision {
@@ -253,6 +273,27 @@ mod tests {
         assert_eq!(p.decide("replace_text", Permission::Write), Decision::Allow);
         let ro = Policy::new(PolicyConfig { mode: Mode::ReadOnly, allow: vec!["replace_text".into()], ..Default::default() });
         assert_eq!(ro.decide("replace_text", Permission::Write), Decision::Deny, "allow list cannot lift read-only");
+    }
+
+    #[test]
+    fn deleting_commands_ask_in_every_mode() {
+        let with = |edit_mode, allow: &[&str], deny: &[&str]| {
+            Policy::new(PolicyConfig {
+                mode: Mode::Autonomous,
+                edit_mode,
+                allow_all: true,
+                allow: allow.iter().map(|s| s.to_string()).collect(),
+                deny: deny.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            })
+        };
+        assert_eq!(with(Some(EditMode::Auto), &["run_command", "run_*"], &[]).decide_command_delete(), Decision::Ask, "auto, allowAll, and run_command in allow still ask");
+        assert_eq!(with(Some(EditMode::Safe), &[COMMAND_DELETE], &[]).decide_command_delete(), Decision::Allow);
+        assert_eq!(with(None, &[COMMAND_DELETE], &["run_command"]).decide_command_delete(), Decision::Deny);
+        let mut p = with(Some(EditMode::Auto), &[], &[]);
+        p.grant_session(COMMAND_DELETE);
+        assert_eq!(p.decide_command_delete(), Decision::Allow, "allow for this session");
+        assert_eq!(Policy::new(PolicyConfig { mode: Mode::ReadOnly, ..Default::default() }).decide_command_delete(), Decision::Deny);
     }
 
     #[test]

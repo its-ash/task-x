@@ -121,6 +121,21 @@ fn home() -> Option<std::path::PathBuf> {
 
 const CACHE_DIRS: &[&str] = &[".cargo", ".rustup", ".npm", ".cache", ".pnpm-store", ".yarn", ".gradle", ".m2", "go", "Library/Caches"];
 
+/// Inside the writable places, what runs later outside the sandbox stays read-only: git's hooks
+/// and config (`core.fsmonitor`, aliases), and the folders of installed programs and their config.
+/// `(path relative to the workspace or home, is a folder)`.
+const WORKSPACE_READ_ONLY: &[(&str, bool)] = &[(".git/hooks", true), (".git/config", false)];
+const HOME_READ_ONLY: &[(&str, bool)] = &[(".cargo/bin", true), (".cargo/config.toml", false), (".cargo/config", false), ("go/bin", true)];
+
+/// The read-only paths that exist, as absolute paths.
+fn read_only_paths(root: &Path) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = WORKSPACE_READ_ONLY.iter().map(|(p, dir)| (root.join(p).to_string_lossy().into_owned(), *dir)).collect();
+    if let Some(h) = home() {
+        out.extend(HOME_READ_ONLY.iter().map(|(p, dir)| (h.join(p).to_string_lossy().into_owned(), *dir)));
+    }
+    out
+}
+
 /// Wraps argv in the platform sandbox when one is available; returns the new argv and whether it applies.
 fn sandboxed_argv(argv: &[String], sb: &Sandbox) -> (Vec<String>, bool) {
     if !sandbox_available() {
@@ -134,9 +149,16 @@ fn sandboxed_argv(argv: &[String], sb: &Sandbox) -> (Vec<String>, bool) {
         if let Some(h) = home().map(|h| h.to_string_lossy().to_string()).filter(|h| safe(h)) {
             allow.extend(CACHE_DIRS.iter().map(|d| format!("(subpath \"{h}/{d}\")")));
         }
+        // Later rules win in a sandbox profile, so the read-only paths come last.
+        let deny: Vec<String> = read_only_paths(sb.writable_root)
+            .into_iter()
+            .filter(|(p, _)| safe(p))
+            .map(|(p, dir)| if dir { format!("(subpath \"{p}\")") } else { format!("(literal \"{p}\")") })
+            .collect();
         let profile = format!(
-            "(version 1)(allow default)(deny file-write*)(allow file-write* {} (literal \"/dev/null\") (literal \"/dev/stdout\") (literal \"/dev/stderr\") (regex #\"^/dev/tty\") (regex #\"^/dev/fd/\"))",
-            allow.join(" ")
+            "(version 1)(allow default)(deny file-write*)(allow file-write* {} (literal \"/dev/null\") (literal \"/dev/stdout\") (literal \"/dev/stderr\") (regex #\"^/dev/tty\") (regex #\"^/dev/fd/\")){}",
+            allow.join(" "),
+            if deny.is_empty() { String::new() } else { format!("(deny file-write* {})", deny.join(" ")) }
         );
         let mut out = vec![SANDBOX_EXEC.into(), "-p".into(), profile];
         out.extend(argv.iter().cloned());
@@ -156,6 +178,12 @@ fn sandboxed_argv(argv: &[String], sb: &Sandbox) -> (Vec<String>, bool) {
                         let p = p.to_string_lossy().to_string();
                         out.extend(["--bind".into(), p.clone(), p]);
                     }
+                }
+            }
+            // Later binds win: the read-only paths that exist go back to read-only.
+            for (p, _) in read_only_paths(sb.writable_root) {
+                if Path::new(&p).exists() {
+                    out.extend(["--ro-bind".into(), p.clone(), p]);
                 }
             }
             out.push("--".into());
@@ -308,6 +336,29 @@ pub fn run(argv: &[String], cwd: &Path, cwd_label: &str, timeout: Duration, canc
     run_with_input(argv, cwd, cwd_label, timeout, cancel, None)
 }
 
+/// Variables named on top of the built-in ones (the CLI's `--api-key-env`).
+static HIDDEN_ENV: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Hides one more environment variable from commands and MCP servers (a model key's variable).
+pub fn hide_env(name: &str) {
+    let mut h = HIDDEN_ENV.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !h.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+        h.push(name.to_owned());
+    }
+}
+
+/// task-x's own secrets in the environment: `TASK_X_*` (the VS Code browser bridge token, keys
+/// given as `TASK_X_API_KEY`), `TASKX_*`, `ANVIL_*`, and the variables `hide_env` names (the model
+/// key the terminal client read). Commands, MCP servers, and `${env:…}` in imported MCP settings
+/// never see them. The project's own variables (`GITHUB_TOKEN`, `DATABASE_URL`, …) pass through.
+pub fn private_env(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    n.starts_with("TASK_X_")
+        || n.starts_with("TASKX_")
+        || n.starts_with("ANVIL_")
+        || HIDDEN_ENV.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|h| h.eq_ignore_ascii_case(&n))
+}
+
 /// Like `run`, optionally writing `input` to the child's stdin (then closing it).
 pub fn run_with_input(
     argv: &[String],
@@ -332,6 +383,11 @@ pub fn run_with_input(
         .env("TERM", "dumb")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat");
+    for (k, _) in std::env::vars_os() {
+        if private_env(&k.to_string_lossy()) {
+            cmd.env_remove(k);
+        }
+    }
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let started = Instant::now();
@@ -453,6 +509,14 @@ mod tests {
         assert!(run(&argv(&["definitely-not-a-binary-xyz"]), &tmp, ".", Duration::from_secs(1), &CancellationToken::new()).is_err());
     }
 
+    #[test]
+    fn task_x_secrets_stay_out_of_commands() {
+        assert!(private_env("TASK_X_VSCODE_BROWSER_TOKEN") && private_env("taskx_log") && private_env("ANVIL_KEY"));
+        assert!(!private_env("GITHUB_TOKEN") && !private_env("PATH"), "the project's own variables pass");
+        hide_env("MY_MODEL_KEY_FOR_TEST");
+        assert!(private_env("my_model_key_for_test"));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn sandbox_blocks_writes_outside_the_workspace() {
@@ -478,6 +542,15 @@ mod tests {
         let o = run_sandboxed(&argv(&["sh", "-c", &script]), &ws, ".", Duration::from_secs(10), &c, &sb).unwrap();
         assert!(!o.success, "write outside the workspace must fail");
         assert!(!outside.exists());
+        // Git's hooks and config run later outside the sandbox, so they stay read-only.
+        std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+        std::fs::write(ws.join(".git/config"), "[core]\n").unwrap();
+        let hook = run_sandboxed(&argv(&["sh", "-c", "echo evil > .git/hooks/pre-commit"]), &ws, ".", Duration::from_secs(10), &c, &sb).unwrap();
+        let cfg = run_sandboxed(&argv(&["sh", "-c", "echo '[core] fsmonitor = evil' >> .git/config"]), &ws, ".", Duration::from_secs(10), &c, &sb).unwrap();
+        assert!(!hook.success && !ws.join(".git/hooks/pre-commit").exists());
+        assert!(!cfg.success && std::fs::read_to_string(ws.join(".git/config")).unwrap() == "[core]\n");
+        let other = run_sandboxed(&argv(&["sh", "-c", "echo ok > .git/description"]), &ws, ".", Duration::from_secs(10), &c, &sb).unwrap();
+        assert!(other.success, "the rest of .git stays writable: {}", other.stderr);
         std::fs::remove_dir_all(&ws).ok();
     }
 }

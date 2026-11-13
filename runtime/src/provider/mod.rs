@@ -142,11 +142,13 @@ impl Providers {
         if status.is_success() {
             return Ok(res);
         }
+        let header = |n: &str| res.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let (wait_ms, wait) = (header("retry-after-ms"), header("retry-after"));
         let body = tokio::select! {
             _ = cancel.cancelled() => return Err(cancelled()),
             b = tokio::time::timeout(timeout, read_bounded(res, MAX_ERROR_BODY)) => b.unwrap_or_default(),
         };
-        Err(ProviderError::from_status(status.as_u16(), error_message(&body)))
+        Err(ProviderError::from_status(status.as_u16(), error_message(&body)).with_retry_after(wait_ms.as_deref(), wait.as_deref()))
     }
 
     async fn get_json(&self, req: HttpRequest, timeout: Duration, cancel: &CancellationToken) -> Result<Value, ProviderError> {
@@ -347,6 +349,18 @@ pub async fn context_window_dynamic(providers: &Providers, p: &ProviderConfig, c
     Ok(window)
 }
 
+/// How many tokens an agent turn lets the model write. The request's own default (4096) is too
+/// small for an agent: a large edit or a reasoning model's hidden thinking runs out, and the reply
+/// is cut off. Unknown OpenAI-compatible servers keep 8192, which nearly all of them accept.
+pub fn output_tokens(p: &ProviderConfig) -> u32 {
+    match p.kind {
+        ProviderKind::Anthropic => anthropic::output_tokens(&p.model),
+        ProviderKind::OpenAi => openai::output_tokens(&p.model),
+        ProviderKind::Ollama => 16_384,
+        ProviderKind::OpenAiCompatible => 8_192,
+    }
+}
+
 /// Legacy context window function (static fallback)
 pub fn context_window(p: &ProviderConfig) -> usize {
     match p.kind {
@@ -363,6 +377,27 @@ pub fn capability_table() -> Value {
         .iter()
         .map(|k| json!({ "kind": k, "capabilities": k.capabilities(), "requiresApiKey": k.requires_api_key() }))
         .collect()
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn agent_turns_get_room_to_write() {
+        let p = |kind, model: &str| output_tokens(&ProviderConfig { kind, model: model.into(), base_url: None, api_key: None, timeout_ms: None });
+        assert_eq!(p(ProviderKind::Anthropic, "claude-opus-5-5"), 64_000);
+        assert_eq!(p(ProviderKind::Anthropic, "claude-haiku-4-5"), 64_000);
+        assert_eq!(p(ProviderKind::Anthropic, "claude-opus-4-1-20250805"), 32_000);
+        assert_eq!(p(ProviderKind::Anthropic, "claude-3-5-haiku-20241022"), 8_192);
+        assert_eq!(p(ProviderKind::Anthropic, "claude-3-opus-20240229"), 4_096);
+        assert_eq!(p(ProviderKind::Anthropic, "anthropic.claude-sonnet-5-5"), 64_000);
+        assert_eq!(p(ProviderKind::OpenAi, "gpt-5"), 32_768);
+        assert_eq!(p(ProviderKind::OpenAi, "o3-mini"), 32_768);
+        assert_eq!(p(ProviderKind::OpenAi, "gpt-4o"), 16_384);
+        assert_eq!(p(ProviderKind::OpenAi, "gpt-4-turbo"), 4_096);
+        assert_eq!(p(ProviderKind::OpenAiCompatible, "deepseek-chat"), 8_192);
+    }
 }
 
 #[cfg(test)]

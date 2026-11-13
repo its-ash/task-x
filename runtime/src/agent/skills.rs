@@ -80,12 +80,38 @@ pub fn front_matter(text: &str) -> (BTreeMap<String, String>, &str) {
         Some((meta, body)) => (meta, body.trim_start_matches(['-', '\r', '\n'])),
         None => ("", text),
     };
-    for line in meta.lines() {
-        if let Some((k, v)) = line.split_once(':') {
-            if !k.starts_with([' ', '\t', '-']) {
-                fields.insert(k.trim().to_ascii_lowercase(), v.trim().trim_matches(['"', '\'']).to_owned());
-            }
+    let lines: Vec<&str> = meta.lines().collect();
+    let unquote = |s: &str| s.trim().trim_matches(['"', '\'']).to_owned();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+        let Some((k, v)) = line.split_once(':') else { continue };
+        if k.starts_with([' ', '\t', '-']) {
+            continue;
         }
+        let v = v.trim();
+        // A YAML block under the key: `- item` lines (a list, kept as `a, b`), or the indented
+        // lines of `>` / `|` text (joined with spaces).
+        let value = if v.is_empty() || matches!(v, ">" | "|" | ">-" | "|-" | ">+" | "|+") {
+            let text = !v.is_empty();
+            let mut items = Vec::new();
+            while let Some(l) = lines.get(i) {
+                let t = l.trim_start();
+                let item = t.strip_prefix("- ").or_else(|| (t == "-").then_some(""));
+                match item {
+                    Some(it) if !text => items.push(unquote(it)),
+                    _ if text && (l.starts_with([' ', '\t']) || l.trim().is_empty()) => items.push(t.trim_end().to_owned()),
+                    _ => break,
+                }
+                i += 1;
+            }
+            items.retain(|s| !s.is_empty());
+            if text { items.join(" ") } else { items.join(", ") }
+        } else {
+            unquote(v)
+        };
+        fields.insert(k.trim().to_ascii_lowercase(), value);
     }
     (fields, body)
 }

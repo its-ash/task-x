@@ -78,6 +78,7 @@ impl<'de> Deserialize<'de> for Role {
 
 fn git(args: &[&str], cwd: &Path, cancel: &CancellationToken) -> Result<String, String> {
     let mut argv = vec!["git".to_string(), "--no-pager".into(), "-c".into(), "core.quotepath=off".into()];
+    argv.extend(crate::tools::git::SAFE_GIT.iter().map(|s| s.to_string()));
     argv.extend(args.iter().map(|s| s.to_string()));
     let o = exec::run(&argv, cwd, ".", GIT_TIMEOUT, cancel).map_err(|e| e.message)?;
     if o.success { Ok(o.stdout) } else { Err(format!("git {}: {}", args.first().unwrap_or(&""), o.stderr.trim())) }

@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-/// The sources, as named in `mcp/configure { import }` and the `--mcp-import` option.
+/// The sources, as named in `mcp/configure { import }`.
 pub const SOURCES: [&str; 4] = ["claude", "vscode", "copilotCli", "cursor"];
 const MAX_SERVERS: usize = 50;
 
@@ -175,11 +175,13 @@ fn expand(s: &str, env: &Env) -> Option<String> {
             if key == "userHome" {
                 return env.home.to_string_lossy().into_owned();
             }
+            // task-x's own secrets never fill another tool's settings (a URL could carry them off).
+            let var = |n: &str| env.vars.get(n).filter(|_| !crate::tools::exec::private_env(n)).cloned();
             if let Some(name) = key.strip_prefix("env:") {
-                return env.vars.get(name).cloned().unwrap_or_default();
+                return var(name).unwrap_or_default();
             }
             match NAMED.captures(key) {
-                Some(m) => env.vars.get(&m[1]).cloned().or_else(|| m.get(2).map(|d| d.as_str().to_owned())).unwrap_or_default(),
+                Some(m) => var(&m[1]).or_else(|| m.get(2).map(|d| d.as_str().to_owned())).unwrap_or_default(),
                 None => c[0].to_owned(),
             }
         })
@@ -301,7 +303,7 @@ mod tests {
             home: PathBuf::from("/h"),
             root: Some(PathBuf::from("/w")),
             trusted,
-            vars: HashMap::from([("TOKEN".to_string(), "t0k".to_string())]),
+            vars: HashMap::from([("TOKEN".to_string(), "t0k".to_string()), ("TASK_X_VSCODE_BROWSER_TOKEN".to_string(), "bridge".to_string())]),
             os: "macos",
         }
     }
@@ -354,5 +356,6 @@ mod tests {
         assert_eq!(short_name("io.github.ChromeDevTools/chrome-devtools-mcp").as_deref(), Some("chrome-devtools"));
         assert_eq!(short_name("acme/tool").as_deref(), Some("tool"));
         assert_eq!(parse_jsonc("{\"a\": \"// not a comment\", /* x */ \"b\": [1,],}"), Some(json!({ "a": "// not a comment", "b": [1] })));
+        assert_eq!(expand("https://x/?k=${env:TASK_X_VSCODE_BROWSER_TOKEN}&t=${TOKEN}", &env(true)).as_deref(), Some("https://x/?k=&t=t0k"), "task-x's own secrets stay out");
     }
 }

@@ -527,6 +527,9 @@ pub enum ErrorKind {
     Timeout,
     Cancelled,
     Protocol,
+    /// The model's tool call could not be read: its arguments were cut off (the reply hit the
+    /// output limit) or are not JSON. The agent asks the model to send it again, smaller.
+    BadToolCall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
@@ -538,13 +541,48 @@ pub struct ProviderError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     pub retryable: bool,
+    /// How long the provider asked to wait before trying again (`Retry-After`, `retry-after-ms`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ProviderError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         let retryable =
             matches!(kind, ErrorKind::RateLimited | ErrorKind::Overloaded | ErrorKind::Server | ErrorKind::Network | ErrorKind::Timeout);
-        Self { kind, message: message.into(), status: None, retryable }
+        Self { kind, message: message.into(), status: None, retryable, retry_after_ms: None }
+    }
+
+    /// The error an OpenAI-style `error` object in a stream stands for, by its `type` and `code`:
+    /// a prompt that is too long or a spent quota is not retried, unlike an outage.
+    pub fn from_stream_error(e: &serde_json::Value) -> Self {
+        let msg = e["message"].as_str().or(e.as_str()).unwrap_or("provider stream error");
+        let tag = format!("{} {}", e["type"].as_str().unwrap_or_default(), e["code"].as_str().unwrap_or_default()).to_ascii_lowercase();
+        let kind = if tag.contains("context_length") || tag.contains("invalid_request") || tag.contains("too_long") {
+            ErrorKind::InvalidRequest
+        } else if tag.contains("insufficient_quota") || tag.contains("billing") {
+            ErrorKind::PermissionDenied
+        } else if tag.contains("rate_limit") {
+            ErrorKind::RateLimited
+        } else if tag.contains("auth") || tag.contains("invalid_api_key") {
+            ErrorKind::Auth
+        } else if tag.contains("overloaded") {
+            ErrorKind::Overloaded
+        } else {
+            ErrorKind::Server
+        };
+        Self::new(kind, msg)
+    }
+
+    /// The wait a response asks for: `retry-after-ms`, else `Retry-After` in seconds (an HTTP date
+    /// is not read). At most 2 minutes, so a bad header cannot stall a task.
+    pub fn with_retry_after(mut self, retry_after_ms: Option<&str>, retry_after: Option<&str>) -> Self {
+        let ms = retry_after_ms
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .or_else(|| retry_after.and_then(|v| v.trim().parse::<f64>().ok()).map(|s| s * 1000.0))
+            .filter(|v| v.is_finite() && *v >= 0.0);
+        self.retry_after_ms = ms.map(|v| (v as u64).min(120_000));
+        self
     }
 
     /// Maps an HTTP status and (already-extracted) provider error message into a normalized error.
@@ -565,6 +603,31 @@ impl ProviderError {
 
     pub fn protocol(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Protocol, message)
+    }
+
+    /// A tool call whose arguments could not be read (cut off, or not JSON).
+    pub fn bad_tool_call(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::BadToolCall, message)
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn retry_after_and_stream_errors() {
+        let e = ProviderError::from_status(429, "slow down").with_retry_after(None, Some("7"));
+        assert_eq!((e.kind, e.retryable, e.retry_after_ms), (ErrorKind::RateLimited, true, Some(7_000)));
+        assert_eq!(ProviderError::from_status(529, "x").with_retry_after(Some("250"), Some("9")).retry_after_ms, Some(250), "ms wins");
+        assert_eq!(ProviderError::from_status(429, "x").with_retry_after(None, Some("999999")).retry_after_ms, Some(120_000), "capped");
+        assert_eq!(ProviderError::from_status(429, "x").with_retry_after(None, Some("Wed, 21 Oct 2026 07:28:00 GMT")).retry_after_ms, None);
+        let too_long = ProviderError::from_stream_error(&json!({ "message": "too many tokens", "code": "context_length_exceeded" }));
+        assert_eq!((too_long.kind, too_long.retryable), (ErrorKind::InvalidRequest, false), "not retried");
+        assert_eq!(ProviderError::from_stream_error(&json!({ "type": "insufficient_quota" })).kind, ErrorKind::PermissionDenied);
+        assert!(ProviderError::from_stream_error(&json!({ "message": "boom" })).retryable, "an unknown stream error is an outage");
+        assert!(!ProviderError::bad_tool_call("cut").retryable, "the agent handles it, not the transport retry");
     }
 }
 

@@ -867,16 +867,13 @@ async fn ask_user(mut input: Value, call_id: String, task_id: &str, host: &Appro
     let questions: Vec<Question> = asked
         .iter()
         .enumerate()
-        .map(|(i, q)| Question {
-            id: format!("q{}", i + 1),
-            text: q["question"].as_str().unwrap_or_default().to_owned(),
-            kind: if q["multiSelect"].as_bool() == Some(true) { QuestionKind::Checkbox } else { QuestionKind::Radio },
-            options: q["options"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|o| o["label"].as_str().or_else(|| o.as_str()).map(str::to_owned))
-                .collect(),
+        .map(|(i, q)| {
+            let kind = if q["multiSelect"].as_bool() == Some(true) { QuestionKind::Checkbox } else { QuestionKind::Radio };
+            let options: Vec<String> =
+                q["options"].as_array().into_iter().flatten().filter_map(|o| o["label"].as_str().or_else(|| o.as_str()).map(str::to_owned)).collect();
+            // Claude Code marks its pick by ending the label with "(Recommended)".
+            let recommended = crate::agent::recommended_options(kind, &options, &[]);
+            Question { id: format!("q{}", i + 1), text: q["question"].as_str().unwrap_or_default().to_owned(), kind, options, recommended }
         })
         .collect();
     if questions.is_empty() || questions.iter().any(|q| q.text.is_empty() || q.options.is_empty()) {

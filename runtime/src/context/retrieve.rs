@@ -146,7 +146,13 @@ pub struct Options<'a> {
 pub fn retrieve(index: &Index, query: &str, opts: &Options) -> Retrieval {
     let terms = terms(query);
     let focus: HashSet<&str> = opts.focus_paths.iter().map(String::as_str).collect();
-    let texts: Vec<(&FileEntry, String)> = index.files().filter_map(|f| f.content.as_deref().map(|c| (f, c.to_lowercase()))).collect();
+    // Secret-looking files (`.env`, keys, credentials) never go into automatic context; the model
+    // can still read one on purpose with read_file, which the user sees.
+    let texts: Vec<(&FileEntry, String)> = index
+        .files()
+        .filter(|f| !super::index::is_secret(&f.rel))
+        .filter_map(|f| f.content.as_deref().map(|c| (f, c.to_lowercase())))
+        .collect();
     let n = texts.len().max(1) as f32;
     let idf: HashMap<&str, f32> = terms
         .iter()
@@ -329,6 +335,18 @@ mod tests {
         assert!(!r.snippets.iter().any(|s| s.path == "src/other.rs"));
         let tiny = retrieve(&idx, "parse_config", &Options { budget_tokens: 10, focus_paths: &[] });
         assert!(tiny.used_tokens <= 10);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn secret_files_never_reach_automatic_context() {
+        let root = temp_repo(&[(".env", "STRIPE_KEY=sk_live_123\n"), ("src/pay.rs", "pub fn stripe_key() {}\n")]);
+        let mut idx = Index::new(root.clone(), &[]).unwrap();
+        idx.refresh();
+        let focus = [".env".to_string()];
+        let r = retrieve(&idx, "where is the stripe_key STRIPE_KEY set", &Options { budget_tokens: 1000, focus_paths: &focus });
+        assert!(r.snippets.iter().any(|s| s.path == "src/pay.rs"));
+        assert!(!r.snippets.iter().any(|s| s.path == ".env"), "not even when it is open in the editor");
         std::fs::remove_dir_all(root).ok();
     }
 }

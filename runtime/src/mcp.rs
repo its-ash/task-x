@@ -461,6 +461,12 @@ impl Client {
             return Err("command must be non-empty".into());
         }
         let mut cmd = Command::new(&cfg.command);
+        // task-x's own secrets stay out; the server's configured `env` is added on top.
+        for (k, _) in std::env::vars_os() {
+            if crate::tools::exec::private_env(&k.to_string_lossy()) {
+                cmd.env_remove(k);
+            }
+        }
         cmd.args(&cfg.args).envs(&cfg.env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         if let Some(d) = cfg.cwd.as_deref().or(root) {
             cmd.current_dir(d);

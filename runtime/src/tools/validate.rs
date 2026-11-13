@@ -256,6 +256,82 @@ pub(super) fn split_args(line: &str) -> Vec<String> {
     out
 }
 
+/// Programs that delete what they are given.
+const DELETERS: &[&str] = &["rm", "rmdir", "unlink", "shred", "srm", "trash", "trash-put", "rimraf", "del", "erase", "rd", "remove-item"];
+/// Words that run the next word as the command (`sudo rm`, `xargs rm`, `env X=1 rm`).
+const WRAPPERS: &[&str] = &["sudo", "doas", "env", "command", "nohup", "time", "nice", "xargs", "exec", "npx", "busybox"];
+
+/// The git subcommand after git's own options (`-C dir`, `-c k=v`, `--no-pager`).
+fn git_subcommand(args: &[String]) -> Option<&str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" => {
+                it.next();
+            }
+            s if s.starts_with('-') => {}
+            s => return Some(s),
+        }
+    }
+    None
+}
+
+/// Whether one simple command (no separators) deletes files or folders.
+fn segment_deletes(words: &[String]) -> bool {
+    let mut i = 0;
+    while let Some(w) = words.get(i) {
+        let base = w.rsplit(['/', '\\']).next().unwrap_or(w).to_ascii_lowercase();
+        let base = base.strip_suffix(".exe").unwrap_or(&base);
+        // Before the command: `X=1`, a wrapper, or a wrapper's option.
+        if (w.contains('=') && !w.starts_with('-')) || WRAPPERS.contains(&base) || (i > 0 && w.starts_with('-')) {
+            i += 1;
+            continue;
+        }
+        let rest = &words[i + 1..];
+        let has = |a: &str| rest.iter().any(|r| r == a);
+        return DELETERS.contains(&base)
+            || (base == "find" && (has("-delete") || rest.windows(2).any(|p| p[0].starts_with("-exec") && DELETERS.contains(&p[1].rsplit('/').next().unwrap_or(&p[1])))))
+            || (base == "git" && git_subcommand(rest).is_some_and(|sub| sub == "clean" || sub == "rm"));
+    }
+    false
+}
+
+/// The command `run_command` would run, when it deletes files or folders: `rm`, `rmdir`, `unlink`,
+/// `find … -delete`, `git clean`, `git rm`, and the same behind `sudo`, `xargs`, `env`, or inside
+/// `sh -c` / `bash -c` scripts and `&&`, `;`, `|` chains. Such a delete bypasses the edit log, so it
+/// cannot be undone, and the agent asks before it in every mode.
+pub fn command_deletes(input: &Value) -> Option<String> {
+    let i: RunIn = serde_json::from_value(input.clone()).ok()?;
+    let argv = i.command.into_vec().ok()?;
+    let line = argv.join(" ");
+    let mut words: Vec<String> = Vec::new();
+    for (n, a) in argv.iter().enumerate() {
+        // A shell script: its own words, split the same way.
+        let shell = n > 0 && argv[n - 1] == "-c" && argv.first().is_some_and(|s| ["sh", "bash", "zsh", "dash", "fish"].contains(&s.rsplit('/').next().unwrap_or(s)));
+        if shell {
+            words.push(";".into());
+            words.extend(split_args(&a.replace(['\n', ';', '|', '&', '(', ')'], " ; ")));
+        } else {
+            words.extend(split_args(&a.replace(['\n'], " ; ")).into_iter().flat_map(|w| {
+                // `a&&b`, `a;b` with no spaces.
+                let mut parts = Vec::new();
+                let mut cur = String::new();
+                for c in w.chars() {
+                    if matches!(c, ';' | '|' | '&') {
+                        parts.extend((!cur.is_empty()).then(|| std::mem::take(&mut cur)));
+                        parts.push(";".into());
+                    } else {
+                        cur.push(c);
+                    }
+                }
+                parts.extend((!cur.is_empty()).then_some(cur));
+                parts
+            }));
+        }
+    }
+    words.split(|w| w == ";").any(segment_deletes).then_some(line)
+}
+
 /// Input of `run_command`; at module scope so the shapes it accepts can be tested directly.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -417,6 +493,43 @@ mod tests {
         assert_eq!((d[1].path.as_str(), d[1].line, d[1].column), ("src/app.ts", 10, Some(7)));
         assert!(d[1].message.starts_with("Type 'string'"));
         assert_eq!((d[2].path.as_str(), d[2].line, d[2].message.as_str()), ("pkg/x.go", 4, "undefined: foo"));
+    }
+
+    #[test]
+    fn finds_commands_that_delete() {
+        let d = |c: Value| command_deletes(&json!({ "command": c })).is_some();
+        for yes in [
+            json!(["rm", "-rf", "build"]),
+            json!("rm -rf build"),
+            json!(["/bin/rm", "a"]),
+            json!("sudo rm a"),
+            json!("cargo build && rm -rf target"),
+            json!("echo hi;rm x"),
+            json!(["sh", "-c", "cd out && rm -r *"]),
+            json!(["bash", "-c", "ls | xargs rm"]),
+            json!("find . -name '*.tmp' -delete"),
+            json!("find . -exec rm {} ;"),
+            json!("git clean -fdx"),
+            json!("git -C sub rm file"),
+            json!("env FOO=1 rmdir empty"),
+            json!("npx rimraf dist"),
+            json!("unlink link"),
+        ] {
+            assert!(d(yes.clone()), "{yes} deletes");
+        }
+        for no in [
+            json!(["cargo", "test"]),
+            json!("git status"),
+            json!("npm install"),
+            json!("curl https://example.com"),
+            json!(["echo", "rm -rf /"]),
+            json!("grep -r rm src"),
+            json!("git commit -m 'rm old code'"),
+            json!("find . -name x"),
+            json!("cat format.rm"),
+        ] {
+            assert!(!d(no.clone()), "{no} does not delete");
+        }
     }
 
     /// The three shapes a model sends for `command`. A string used to fail with

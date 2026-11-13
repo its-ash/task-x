@@ -48,8 +48,9 @@ Options:
   --quiet                   Print only the final answer
   --watch                   Index file changes while the session runs (chat)
   --no-mcp-import           Start only .task-x/mcp.json servers, not the ones set up for Claude, VS Code, Copilot CLI, or Cursor
+  --trust                   Trust this folder: its hooks, MCP servers, skills, and agents may run (asked once otherwise)
 
-In chat: /exit, /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], /timeline, /restore <step>, /export [turns] [file.html] (asks for the start and end turn; or give 2-5), /mcp, /approvals, /allow|/ask|/deny <tool or server>, and every skill and command (/init, /review, ...).";
+In chat: /exit, /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], /timeline, /restore <step>, /export [turns] [file.html] (asks for the start and end turn; or give 2-5), /agents, /mcp, /approvals, /allow|/ask|/deny <tool or server>, and every skill and command (/init, /review, ...).";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
@@ -73,6 +74,7 @@ pub struct Options {
     pub quiet: bool,
     pub watch: bool,
     pub no_mcp_import: bool,
+    pub trust: bool,
 }
 
 /// Reads the command line (without the program name).
@@ -103,6 +105,7 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
         quiet: false,
         watch: false,
         no_mcp_import: false,
+        trust: false,
     };
     let mut words: Vec<String> = Vec::new();
     while let Some(a) = it.next() {
@@ -132,6 +135,7 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
             "--quiet" | "-q" => o.quiet = true,
             "--watch" => o.watch = true,
             "--no-mcp-import" => o.no_mcp_import = true,
+            "--trust" => o.trust = true,
             "--" => words.extend(it.by_ref().cloned()),
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             _ => words.push(a.clone()),
@@ -179,6 +183,10 @@ pub fn provider(o: &Options, env: &dyn Fn(&str) -> Option<String>) -> Result<Pro
     }
     let cfg = ProviderConfig { kind, model, base_url: o.base_url.clone().or_else(|| env("TASK_X_BASE_URL")), api_key: env(&key_var), timeout_ms: None };
     cfg.resolve().map_err(|e| format!("{}{}", e.message, if kind.requires_api_key() { format!(" (set {key_var})") } else { String::new() }))?;
+    // The key the agent runs on stays out of the commands and MCP servers it starts.
+    if cfg.api_key.is_some() {
+        tools::exec::hide_env(&key_var);
+    }
     Ok(cfg)
 }
 
@@ -274,6 +282,48 @@ impl SleepLine {
     }
 }
 
+/// Every agent of this session as an indented board: what each one does now. Shown when a
+/// subagent starts or ends, and by `/agents`.
+fn agents_board() -> String {
+    let list = agent::activity::snapshot();
+    if list.is_empty() {
+        return "  No agent has run in this session yet.".into();
+    }
+    let running = list.iter().filter(|(_, s)| s.running).count();
+    let mut out = format!("  Agents: {running} running, {} done\n", list.len() - running);
+    let now = agent::store::now_ms();
+    for (depth, s) in &list {
+        let (mark, color) = match s.status.as_str() {
+            _ if s.running && s.status == "waitingApproval" => ("?", "33"),
+            _ if s.running && s.status == "waitingAnswer" => ("?", "33"),
+            _ if s.running && s.status == "sleeping" => ("☾", SLEEP_COLOR),
+            _ if s.running => ("●", "36"),
+            "completed" => ("✓", "32"),
+            _ => ("✗", "31"),
+        };
+        let what = match (&s.current_tool, s.running) {
+            (Some(t), true) if s.status == "waitingApproval" => format!("waiting for your approval: {t}"),
+            (Some(t), true) => t.clone(),
+            (None, true) if s.status == "waitingAnswer" => "waiting for your answer".into(),
+            (None, true) => s.status.clone(),
+            _ => s.status.clone(),
+        };
+        let secs = (s.ended_ms.unwrap_or(now).saturating_sub(s.started_ms)) / 1000;
+        let role = s.agent.as_deref().or(s.role.as_deref()).map(|r| format!(" ({r})")).unwrap_or_default();
+        let title: String = s.title.chars().take(50).collect();
+        out.push_str(&format!(
+            "  {}{} {}{} · {} {}\n",
+            "  ".repeat(*depth),
+            paint(color, mark),
+            s.name,
+            role,
+            what,
+            paint(DIM, &format!("· turn {} · {} tools · {} tokens · {}s · {title}", s.iteration, s.tool_calls, s.tokens, secs))
+        ));
+    }
+    out.trim_end().to_owned()
+}
+
 /// Longest `<kbd>…` held back while waiting for its `</kbd>`; past it the text goes out as it is.
 const KEY_HOLD: usize = 48;
 
@@ -363,6 +413,16 @@ pub fn render(event: &Value, quiet: bool) -> Option<(bool, String)> {
         "error" => (true, format!("\n  ! {}\n", event["error"]["message"].as_str().unwrap_or("model error"))),
         "hook" if event["blocked"] == true => (true, format!("  ! a {} hook blocked: {}\n", event["event"].as_str().unwrap_or(""), short(&event["message"]))),
         "compacted" => (true, "  (history compressed)\n".into()),
+        "retry" => (
+            true,
+            format!(
+                "\n  ↻ {}retrying in {:.1}s (attempt {}): {}\n",
+                if event["discardText"] == true { "the partial reply above is dropped; " } else { "" },
+                event["waitMs"].as_u64().unwrap_or(0) as f64 / 1000.0,
+                event["attempt"],
+                short(&event["reason"])
+            ),
+        ),
         // The static line, for logs and pipes; a terminal animates it instead (`SleepLine`).
         "sleeping" => {
             (true, format!("\n  {}\n", paint(SLEEP_COLOR, &format!("☾ Sleeping · next wake-up in {}{}", until(&event["untilMs"]), sleeping_tail(event)))))
@@ -419,15 +479,38 @@ fn ask_terminal(req: &AskRequest) -> Option<Answers> {
         return None;
     }
     let mut a = Answers::default();
-    for q in &req.questions {
-        eprintln!("\n? {}", q.text);
-        for (i, opt) in q.options.iter().enumerate() {
-            eprintln!("  {}) {opt}", i + 1);
-        }
-        eprint!("answer (numbers, or your own text): ");
+    let read = || {
         let _ = std::io::stderr().flush();
         let mut line = String::new();
         let _ = std::io::stdin().lock().read_line(&mut line);
+        line
+    };
+    // Every question has a recommendation: one key takes them all.
+    if req.questions.iter().all(|q| !q.recommended.is_empty()) {
+        eprintln!("\nThe agent asks {} question{}. Its recommendation:", req.questions.len(), if req.questions.len() == 1 { "" } else { "s" });
+        for q in &req.questions {
+            eprintln!("  {} → {}", q.text, paint("32", &q.recommended.join(", ")));
+        }
+        eprint!("Proceed with recommendation? [Y]es / [n]o, answer each: ");
+        if matches!(read().trim().to_ascii_lowercase().as_str(), "" | "y" | "yes") {
+            for q in &req.questions {
+                a.selected.insert(q.id.clone(), q.recommended.clone());
+            }
+            return Some(a);
+        }
+    }
+    for q in &req.questions {
+        eprintln!("\n? {}", q.text);
+        for (i, opt) in q.options.iter().enumerate() {
+            let star = if q.recommended.contains(opt) { paint("32", "  ★ recommended") } else { String::new() };
+            eprintln!("  {}) {opt}{star}", i + 1);
+        }
+        eprint!("answer (numbers, or your own text{}): ", if q.recommended.is_empty() { "" } else { "; Enter takes the recommendation" });
+        let line = read();
+        if line.trim().is_empty() && !q.recommended.is_empty() {
+            a.selected.insert(q.id.clone(), q.recommended.clone());
+            continue;
+        }
         let picks: Vec<String> = line.split([',', ' ']).filter_map(|s| s.trim().parse::<usize>().ok()).filter_map(|n| q.options.get(n.wrapping_sub(1)).cloned()).collect();
         if picks.is_empty() && !line.trim().is_empty() {
             a.other.insert(q.id.clone(), line.trim().to_owned());
@@ -488,11 +571,77 @@ fn pick_turns(turns: &[agent::export::Turn]) -> Result<agent::export::Range, Str
     Ok(agent::export::Range { from: Some(from), to: Some(to) })
 }
 
+/// Whether this folder's own hooks, MCP servers, skills, and agents may run. Trusted folders are
+/// remembered in `<data>/trusted.json`. `--trust` trusts it (and remembers that); otherwise a
+/// terminal asks once, and with no terminal the folder stays untrusted. The home folder is the
+/// user's own and always trusted.
+fn workspace_trust(data: &std::path::Path, root: &std::path::Path, flag: bool, quiet: bool) -> bool {
+    let file = data.join("trusted.json");
+    let mut list: Vec<String> = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let key = root.to_string_lossy().into_owned();
+    if list.contains(&key) || home().is_some_and(|h| h == root) {
+        return true;
+    }
+    let yes = flag || {
+        let has = |p: &str| root.join(p).exists();
+        let ships = [".task-x", ".mcp.json", ".vscode/mcp.json", ".cursor/mcp.json", ".claude", ".github/prompts"].iter().any(|p| has(p));
+        if !ships {
+            // Nothing in it would run: trusting it changes nothing yet, so it is not asked about.
+            return false;
+        }
+        if !std::io::stdin().is_terminal() {
+            if !quiet {
+                eprintln!("task-x: {} is not trusted, so its hooks, MCP servers, skills, and agents are off (use --trust).", root.display());
+            }
+            return false;
+        }
+        eprint!(
+            "task-x: {} has its own hooks, MCP servers, skills, or agents, which can run commands.\nTrust this folder? [y]es / [N]o: ",
+            root.display()
+        );
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    };
+    if yes {
+        list.push(key);
+        let _ = std::fs::create_dir_all(data);
+        let _ = std::fs::write(&file, serde_json::to_string_pretty(&list).unwrap_or_default());
+    }
+    yes
+}
+
+/// Ctrl-C while a task runs cancels the task (its record is saved as cancelled, and running
+/// commands are stopped); a second Ctrl-C during the same task, or one at the prompt, quits.
+fn watch_ctrl_c(current: Arc<Mutex<Option<CancellationToken>>>) {
+    tokio::spawn(async move {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            let token = current.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            match token {
+                Some(t) if !t.is_cancelled() => {
+                    t.cancel();
+                    eprintln!("\n  ^C Cancelling the task... (press Ctrl-C again to quit)");
+                }
+                _ => {
+                    eprintln!();
+                    std::process::exit(130);
+                }
+            }
+        }
+    });
+}
+
 struct Session {
     host: Host,
     options: Options,
     provider: ProviderConfig,
     task_id: Option<String>,
+    /// The running task's token: Ctrl-C cancels it (see `watch_ctrl_c`).
+    current: Arc<Mutex<Option<CancellationToken>>>,
     /// Where each MCP server came from, and what the import found or skipped.
     mcp_origins: std::collections::BTreeMap<String, String>,
     mcp_notes: Vec<String>,
@@ -519,8 +668,10 @@ impl Session {
         let store = Store::new(Some(&data));
         store.fail_interrupted();
         let edits = Arc::new(Mutex::new(EditLog::open(data.join("checkpoints").join(format!("{key}.json")))));
-        // The user runs the agent in this folder, so its hooks and MCP servers count as trusted.
-        let mut hook_list = agent::hooks::load_workspace(&root).unwrap_or_default();
+        // A folder's own hooks, MCP servers, skills, and agents run only once the user trusts it: a
+        // freshly cloned repository could ship any of them.
+        let trusted = workspace_trust(&data, &root, o.trust, quiet);
+        let mut hook_list = if trusted { agent::hooks::load_workspace(&root).unwrap_or_default() } else { Vec::new() };
         if let Some(h) = home() {
             hook_list.extend(agent::hooks::load_workspace(&h).unwrap_or_default().into_iter().map(|h| agent::hooks::Hook { trusted: true, ..h }));
         }
@@ -530,12 +681,12 @@ impl Session {
         if !o.no_mcp_import {
             if let Some(h) = home() {
                 let sources: Vec<String> = crate::mcp_import::SOURCES.iter().map(|s| s.to_string()).collect();
-                imported = crate::mcp_import::import(&sources, &crate::mcp_import::Env::current(h, Some(root.clone()), true), &crate::mcp_import::read_file);
+                imported = crate::mcp_import::import(&sources, &crate::mcp_import::Env::current(h, Some(root.clone()), trusted), &crate::mcp_import::read_file);
             }
         }
         let mut servers = imported.servers.clone();
         let mut origins = imported.origins.clone();
-        for (name, cfg) in crate::mcp::load_workspace(&root).unwrap_or_default() {
+        for (name, cfg) in if trusted { crate::mcp::load_workspace(&root).unwrap_or_default() } else { Default::default() } {
             origins.insert(name.clone(), "task-x (.task-x/mcp.json)".into());
             servers.insert(name, cfg);
         }
@@ -575,8 +726,14 @@ impl Session {
                         let _ = std::io::stdout().flush();
                     }
                 }
+                // With several agents at work, each start and end shows the whole board.
+                let board = !emit_quiet && matches!(ev["type"].as_str(), Some("subagentStarted" | "subagentFinished"));
                 if let Some((err, text)) = render(&ev, emit_quiet) {
                     sleep_line.stop();
+                    if board {
+                        eprintln!("{text}{}", agents_board());
+                        return;
+                    }
                     if err {
                         eprint!("{text}");
                     } else {
@@ -601,13 +758,15 @@ impl Session {
             subagents: Arc::default(),
             steers: Arc::default(),
             tool_cancels: Arc::default(),
-            plugins: Arc::new(RwLock::new(agent::plugins::Settings { workspace_trusted: true, ..Default::default() })),
+            plugins: Arc::new(RwLock::new(agent::plugins::Settings { workspace_trusted: trusted, ..Default::default() })),
         };
         let mut task_id = o.resume.clone();
         if o.continue_last && task_id.is_none() {
             task_id = host.store.list(1).first().and_then(|t| t["id"].as_str().map(str::to_owned));
         }
-        Ok(Self { host, options: o, provider, task_id, mcp_origins: origins, mcp_notes: imported.notes })
+        let current: Arc<Mutex<Option<CancellationToken>>> = Arc::default();
+        watch_ctrl_c(current.clone());
+        Ok(Self { host, options: o, provider, task_id, current, mcp_origins: origins, mcp_notes: imported.notes })
     }
 
     async fn run(&mut self, prompt: &str) -> Result<TaskRecord, String> {
@@ -630,7 +789,11 @@ impl Session {
             depth: 0,
             agent: None,
         };
-        let rec = agent::run(self.host.clone(), p, CancellationToken::new()).await?;
+        let cancel = CancellationToken::new();
+        *self.current.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel.clone());
+        let res = agent::run(self.host.clone(), p, cancel).await;
+        *self.current.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let rec = res?;
         self.task_id = Some(rec.id.clone());
         Ok(rec)
     }
@@ -802,6 +965,7 @@ impl Session {
             }),
             "/approvals" => Ok(self.approvals().await),
             "/mcp" => Ok(self.mcp_list().await),
+            "/agents" => Ok(agents_board()),
             "/allow" => self.set_approval(agent::approvals::Choice::Allow, arg).await,
             "/ask" => self.set_approval(agent::approvals::Choice::Ask, arg).await,
             "/deny" => self.set_approval(agent::approvals::Choice::Deny, arg).await,
