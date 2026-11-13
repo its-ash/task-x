@@ -242,6 +242,25 @@ fn fail_all(pending: &Pending) {
     }
 }
 
+/// The VS Code extension's server for VS Code's own tools (they run through `vscode.lm.invokeTool`).
+const VSCODE_BRIDGE: &str = "vscode";
+
+/// Whether `bridged`, a tool of VS Code's bridge, is VS Code's copy of a tool of an MCP server task-x
+/// runs itself. VS Code names it `mcp_<server, maybe cut short>_<tool>`. Through VS Code it waits for
+/// VS Code's own approval, which task-x's chat cannot show, and fails when nobody answers; the direct
+/// copy follows task-x's approval settings.
+fn bridged_copy(bridged: &str, direct: &[McpTool]) -> bool {
+    let norm = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect::<String>();
+    let b = norm(bridged);
+    let Some(rest) = b.strip_prefix("mcp_") else { return false };
+    direct.iter().any(|t| {
+        let server = norm(&t.server);
+        rest.strip_suffix(&norm(&t.name))
+            .and_then(|p| p.strip_suffix('_'))
+            .is_some_and(|p| p.len() >= 3 && (server.starts_with(p) || p.starts_with(&server)))
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpTool {
@@ -890,8 +909,13 @@ impl Manager {
         err.map_or(Ok(()), Err)
     }
 
+    /// The tools of the running servers. VS Code's copy of a tool task-x runs itself is left out
+    /// (see `bridged_copy`).
     pub fn tools(&self) -> Vec<McpTool> {
-        let mut t: Vec<McpTool> = self.clients.values().filter(|c| c.alive()).flat_map(|c| c.tools.clone()).collect();
+        let all: Vec<McpTool> = self.clients.values().filter(|c| c.alive()).flat_map(|c| c.tools.clone()).collect();
+        let (bridged, direct): (Vec<McpTool>, Vec<McpTool>) = all.into_iter().partition(|t| t.server == VSCODE_BRIDGE);
+        let kept: Vec<McpTool> = bridged.into_iter().filter(|b| !bridged_copy(&b.name, &direct)).collect();
+        let mut t: Vec<McpTool> = kept.into_iter().chain(direct).collect();
         t.sort_by(|a, b| a.qualified.cmp(&b.qualified));
         t
     }
@@ -950,6 +974,23 @@ while IFS= read -r line; do
   esac
 done
 "#;
+
+    #[test]
+    fn vscode_copies_of_direct_tools_are_left_out() {
+        let tool = |server: &str, name: &str| McpTool {
+            server: server.into(),
+            name: name.into(),
+            qualified: format!("mcp__{server}__{name}"),
+            description: String::new(),
+            input_schema: json!({}),
+        };
+        let direct = [tool("chrome-devtools", "new_page"), tool("chrome-devtools", "take_snapshot")];
+        assert!(bridged_copy("mcp_chrome_devtoo_new_page", &direct), "VS Code cuts the server name short");
+        assert!(bridged_copy("mcp_chrome-devtools_take_snapshot", &direct));
+        assert!(!bridged_copy("mcp_chrome_devtoo_click", &direct), "a tool task-x does not have stays");
+        assert!(!bridged_copy("mcp_figma_new_page", &direct), "another server's tool of the same name stays");
+        assert!(!bridged_copy("open_browser_page", &direct), "VS Code's own tools stay");
+    }
 
     #[tokio::test]
     async fn starts_lists_and_calls_tools() {

@@ -27,11 +27,13 @@ pub struct Env {
     pub trusted: bool,
     pub vars: HashMap<String, String>,
     pub os: &'static str,
+    /// The entries of a folder, sorted (VS Code keeps one folder per server installed from its gallery).
+    pub list: fn(&Path) -> Vec<PathBuf>,
 }
 
 impl Env {
     pub fn current(home: PathBuf, root: Option<PathBuf>, trusted: bool) -> Self {
-        Self { home, root, trusted, vars: std::env::vars().collect(), os: std::env::consts::OS }
+        Self { home, root, trusted, vars: std::env::vars().collect(), os: std::env::consts::OS, list: list_dir }
     }
 
     /// `%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` elsewhere.
@@ -82,6 +84,55 @@ fn vscode_setting(j: &Value, _: &Env) -> Option<Value> {
     j["mcp"]["servers"].as_object().or_else(|| j["mcp.servers"].as_object()).map(|o| Value::Object(o.clone()))
 }
 
+/// A server VS Code installed from its MCP gallery (`User/mcp/<id>/manifest.json`). Such a server
+/// is not in `mcp.json`, and without this task-x reaches it only through VS Code, whose own
+/// approval prompt task-x's chat cannot show. An npm package runs with `npx`, a PyPI one with
+/// `uvx`, a remote one over HTTP; a value the user must type becomes `${input:…}`, which skips it.
+fn gallery(j: &Value, _: &Env) -> Option<Value> {
+    let name = j["name"].as_str()?;
+    let m = &j["manifest"];
+    let pkg = m["packages"].as_array().into_iter().flatten().find(|p| {
+        matches!(p["registryType"].as_str(), Some("npm" | "pypi")) && p["transport"]["type"].as_str().is_none_or(|t| t == "stdio")
+    });
+    let value = |a: &Value| a["value"].as_str().or_else(|| a["default"].as_str()).map(str::to_owned);
+    let typed = |a: &Value| format!("${{input:{}}}", a["name"].as_str().unwrap_or("value"));
+    let server = if let Some(p) = pkg {
+        let id = p["identifier"].as_str()?;
+        let version = p["version"].as_str().filter(|v| !v.is_empty());
+        let mut args = match p["registryType"].as_str() {
+            Some("npm") => vec!["-y".to_owned(), version.map_or_else(|| id.to_owned(), |v| format!("{id}@{v}"))],
+            _ => vec![version.map_or_else(|| id.to_owned(), |v| format!("{id}=={v}"))],
+        };
+        for a in p["packageArguments"].as_array().into_iter().flatten() {
+            let v = value(a).or_else(|| (a["isRequired"] == true).then(|| typed(a)));
+            match (a["type"].as_str(), v) {
+                (Some("named"), v) => {
+                    args.extend(a["name"].as_str().map(str::to_owned));
+                    args.extend(v);
+                }
+                (_, Some(v)) => args.push(v),
+                _ => {}
+            }
+        }
+        let env: serde_json::Map<String, Value> = p["environmentVariables"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                let v = value(e).or_else(|| (e["isRequired"] == true).then(|| typed(e)))?;
+                Some((e["name"].as_str()?.to_owned(), Value::String(v)))
+            })
+            .collect();
+        let command = if p["registryType"] == "npm" { "npx" } else { "uvx" };
+        serde_json::json!({ "type": "stdio", "command": command, "args": args, "env": env })
+    } else {
+        let r = m["remotes"].as_array()?.first()?;
+        let kind = if r["type"] == "sse" { "sse" } else { "http" };
+        serde_json::json!({ "type": kind, "url": r["url"].as_str()? })
+    };
+    Some(serde_json::json!({ name: server }))
+}
+
 /// The files to read, from the most general to the most specific: (source, label, path, pick).
 fn files(env: &Env, sources: &[String]) -> Vec<(&'static str, String, PathBuf, Pick)> {
     let mut out: Vec<(&'static str, String, PathBuf, Pick)> = Vec::new();
@@ -97,6 +148,9 @@ fn files(env: &Env, sources: &[String]) -> Vec<(&'static str, String, PathBuf, P
     add("cursor", "Cursor", env.home.join(".cursor").join("mcp.json"), mcp_servers, false);
     for (app_name, label) in [("Code", "VS Code"), ("Code - Insiders", "VS Code Insiders")] {
         let user = app.join(app_name).join("User");
+        for dir in (env.list)(&user.join("mcp")) {
+            add("vscode", &format!("{label} gallery"), dir.join("manifest.json"), gallery, false);
+        }
         add("vscode", label, user.join("mcp.json"), servers, false);
         add("vscode", &format!("{label} settings"), user.join("settings.json"), vscode_setting, false);
     }
@@ -293,6 +347,13 @@ pub fn read_file(p: &Path) -> Option<String> {
     std::fs::read_to_string(p).ok()
 }
 
+/// Lists a folder from disk (nothing when it is missing).
+pub fn list_dir(p: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    v.sort();
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,7 +366,38 @@ mod tests {
             trusted,
             vars: HashMap::from([("TOKEN".to_string(), "t0k".to_string()), ("TASK_X_VSCODE_BROWSER_TOKEN".to_string(), "bridge".to_string())]),
             os: "macos",
+            list: |_| Vec::new(),
         }
+    }
+
+    const GALLERY: &str = "/h/Library/Application Support/Code/User/mcp";
+
+    #[test]
+    fn imports_servers_installed_from_the_vscode_gallery() {
+        let mut e = env(false);
+        e.list = |p| {
+            if p == Path::new(GALLERY) {
+                ["chrome", "keyed", "remote", "docker"].iter().map(|d| Path::new(GALLERY).join(d)).collect()
+            } else {
+                Vec::new()
+            }
+        };
+        let manifest = |name: &str, m: serde_json::Value| json!({ "name": name, "manifest": m }).to_string();
+        let read = fake(vec![
+            ("/h/Library/Application Support/Code/User/mcp/chrome/manifest.json", manifest("io.github.ChromeDevTools/chrome-devtools-mcp", json!({ "packages": [{ "identifier": "chrome-devtools-mcp", "registryType": "npm", "transport": { "type": "stdio" }, "version": "0.23.0" }] }))),
+            ("/h/Library/Application Support/Code/User/mcp/keyed/manifest.json", manifest("acme/keyed", json!({ "packages": [{ "identifier": "keyed", "registryType": "pypi", "environmentVariables": [{ "name": "API_KEY", "isRequired": true }] }] }))),
+            ("/h/Library/Application Support/Code/User/mcp/remote/manifest.json", manifest("acme/remote", json!({ "remotes": [{ "type": "streamable-http", "url": "https://mcp.acme.dev/mcp" }] }))),
+            ("/h/Library/Application Support/Code/User/mcp/docker/manifest.json", manifest("acme/boxed", json!({ "packages": [{ "identifier": "acme/boxed", "registryType": "oci" }] }))),
+            // A server of the same name in mcp.json wins: it is the more specific setting.
+            ("/h/Library/Application Support/Code/User/mcp.json", json!({ "servers": { "remote": { "type": "http", "url": "https://mine/mcp" } } }).to_string()),
+        ]);
+        let got = import(&all(), &e, &read);
+        let chrome = &got.servers["chrome-devtools"];
+        assert_eq!((chrome.command.as_str(), chrome.args.clone()), ("npx", vec!["-y".to_string(), "chrome-devtools-mcp@0.23.0".to_string()]), "{:?}", got.notes);
+        assert!(got.origins["chrome-devtools"].starts_with("VS Code gallery"));
+        assert_eq!(got.servers["remote"].url.as_deref(), Some("https://mine/mcp"));
+        assert!(!got.servers.contains_key("keyed") && got.notes.iter().any(|n| n.contains("\"acme/keyed\": it asks for an ${input")), "{:?}", got.notes);
+        assert!(!got.servers.contains_key("boxed"), "container images are not started");
     }
 
     fn fake(files: Vec<(&str, String)>) -> impl Fn(&Path) -> Option<String> {

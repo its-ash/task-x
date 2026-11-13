@@ -59,6 +59,8 @@ const MAX_EMPTY_ANSWERS: u32 = 2;
 /// calls sent again, and answers continued. Past it, the task stops with the error.
 const MAX_CUT_OFFS: u32 = 3;
 const BAD_TOOL_CALL_NUDGE: &str = "Your last tool call could not be read: its arguments were cut off (the reply reached the output limit) or were not valid JSON, so it did not run. Send it again. If it carried a large edit or file, split the work into several smaller calls.";
+/// The prompt that continues an interrupted task (`agent/run` with its `taskId` and an empty prompt).
+const RESUME_PROMPT: &str = "The run was interrupted before you finished (the editor reloaded or the runtime stopped). Continue the task where you stopped: check what is already done, then finish the rest.";
 const CONTINUE_NUDGE: &str = "Your reply stopped at the output limit. Continue exactly where it stopped, without repeating what you already wrote.";
 /// How often a stop hook may send the agent back to work in one run (a hook that always blocks
 /// would otherwise keep the task going until a limit stops it).
@@ -227,6 +229,10 @@ pub struct RunParams {
     /// that starts with `@name` sets it too).
     #[serde(default, skip_deserializing)]
     pub agent: Option<agents::AgentDef>,
+    /// The lead's token budget, shared by a subagent. Unset: a top-level run makes its own from
+    /// `limits.max_total_tokens`.
+    #[serde(default, skip_deserializing)]
+    pub budget: Option<Arc<Budget>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -267,6 +273,29 @@ pub struct Metrics {
     pub subagent_cost_usd: f64,
     #[serde(default)]
     pub subagent_tokens: u64,
+}
+
+/// The token budget of a task and all of its subagents. Every model call in the tree adds to one
+/// counter, so parallel and background subagents cannot each spend what was left when they
+/// started, and the lead sees what running subagents spend.
+#[derive(Debug)]
+pub struct Budget {
+    limit: u64,
+    spent: std::sync::atomic::AtomicU64,
+}
+
+impl Budget {
+    fn new(limit: u64, spent: u64) -> Self {
+        Self { limit, spent: spent.into() }
+    }
+
+    fn add(&self, tokens: u64) {
+        self.spent.fetch_add(tokens, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn exhausted(&self) -> bool {
+        self.spent.load(std::sync::atomic::Ordering::SeqCst) >= self.limit
+    }
 }
 
 /// Usage of finished subagents, added to the lead's metrics when the task ends.
@@ -674,6 +703,8 @@ struct Run {
     worktrees: Mutex<HashMap<String, bool>>,
     sub_count: std::sync::atomic::AtomicU32,
     sub_totals: Arc<Mutex<SubTotals>>,
+    /// The token budget shared with this task's subagents (`limits.max_total_tokens`).
+    budget: Option<Arc<Budget>>,
     /// Real prompt tokens ÷ character estimate, from the last response (calibrates estimates).
     token_ratio: f64,
     prices: Vec<cost::PriceRule>,
@@ -1184,7 +1215,18 @@ impl Run {
         own + self.rec.metrics.subagent_tokens + live
     }
 
+    /// Whether the token budget is spent, by this task or by any task of its tree.
+    fn over_budget(&self) -> bool {
+        match &self.budget {
+            Some(b) => b.exhausted(),
+            None => self.limits.max_total_tokens.is_some_and(|m| self.total_tokens() >= m),
+        }
+    }
+
     fn add_usage(&mut self, u: Usage) {
+        if let Some(b) = &self.budget {
+            b.add(u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0));
+        }
         let add = |a: Option<u64>, b: Option<u64>| match (a, b) {
             (None, None) => None,
             (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
@@ -1726,6 +1768,7 @@ impl Run {
             embeddings: self.embeddings.clone(),
             depth: self.depth + 1,
             agent: agent.cloned(),
+            budget: self.budget.clone(),
         };
         Ok(SubJob {
             host,
@@ -2572,7 +2615,7 @@ impl Run {
             if self.started.elapsed().saturating_sub(self.slept) > deadline {
                 break Status::DeadlineExceeded;
             }
-            if self.limits.max_total_tokens.is_some_and(|m| self.total_tokens() >= m) {
+            if self.over_budget() {
                 break Status::BudgetExceeded;
             }
             self.take_steers();
@@ -2664,7 +2707,8 @@ impl Run {
                     }
                 }
                 // Pending wake-ups: the task sleeps until one fires (or a message arrives), then goes on.
-                if self.wakeups.pending() > 0 {
+                // With the budget spent there is nothing to wake up for.
+                if self.wakeups.pending() > 0 && !self.over_budget() {
                     if self.sleep_until_wakeup().await {
                         continue;
                     }
@@ -2673,7 +2717,7 @@ impl Run {
                     }
                 }
                 // A stop hook can send the agent back to work (for example "run the tests first").
-                if stop_blocks < MAX_STOP_BLOCKS {
+                if stop_blocks < MAX_STOP_BLOCKS && !self.over_budget() {
                     if let Some(reason) = self.stop_reason(stop_blocks > 0).await {
                         stop_blocks += 1;
                         self.emit(json!({ "type": "warning", "message": format!("A stop hook asked the agent to continue: {reason}") }));
@@ -2702,7 +2746,9 @@ impl Run {
         };
         let limit = match status {
             Status::MaxIterations => Some("The iteration limit was reached."),
-            Status::BudgetExceeded => Some("The token budget was reached."),
+            // A subagent stops without one more model call: the budget is shared, and the lead
+            // writes the summary.
+            Status::BudgetExceeded if self.depth == 0 => Some("The token budget was reached."),
             _ => None,
         };
         if let Some(limit) = limit {
@@ -2848,7 +2894,10 @@ pub fn edit_steer(steers: &Steers, task_id: &str, old: &str, text: &str) -> Resu
 
 /// Builds a task (prompt enrichment, tools, skills, hooks, record) without running the loop.
 async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<Run, String> {
-    let prompt_text = p.prompt.trim();
+    // An empty prompt for an interrupted task continues it where it stopped.
+    let resume = p.prompt.trim().is_empty()
+        && p.task_id.as_deref().and_then(|id| host.store.load(id)).is_some_and(|r| r.status == Status::Interrupted);
+    let prompt_text = if resume { RESUME_PROMPT } else { p.prompt.trim() };
     if prompt_text.is_empty() || prompt_text.len() > 200_000 {
         return Err("prompt must be 1..=200000 characters".into());
     }
@@ -3083,7 +3132,8 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
                 .messages
                 .last()
                 .is_some_and(|m| m.role == Role::User && m.content.iter().any(|p| matches!(p, ContentPart::ToolResult { .. })));
-            if unanswered {
+            // A resumed task keeps its last prompt too: the run may have stopped before any reply.
+            if unanswered || (resume && r.messages.last().is_some_and(|m| m.role == Role::User)) {
                 // The interrupted run's results stay; the new request joins them in the same turn.
                 if let Some(m) = r.messages.last_mut() {
                     m.content.extend(user_msg.content);
@@ -3151,6 +3201,11 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         }),
     );
     let wakeups = wakeup::Scheduler::new(&rec.id, host.emit.clone(), cancel.clone());
+    // Tokens of earlier prompts of this conversation count too.
+    let budget = p.budget.clone().or_else(|| {
+        let spent = rec.usage.input_tokens.unwrap_or(0) + rec.usage.output_tokens.unwrap_or(0) + rec.metrics.subagent_tokens;
+        limits.max_total_tokens.map(|limit| Arc::new(Budget::new(limit, spent)))
+    });
     Ok(Run {
         host,
         rec,
@@ -3171,6 +3226,7 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         worktrees: Mutex::default(),
         sub_count: Default::default(),
         sub_totals: Arc::default(),
+        budget,
         token_ratio: 1.0,
         prices: p.prices,
         role_providers: p.role_providers,
@@ -3233,6 +3289,7 @@ pub async fn best_of(host: Host, p: BestOfParams, cancel: CancellationToken) -> 
         embeddings: None,
         depth: 0,
         agent: None,
+        budget: None,
     };
     let lead = prepare(host, params, cancel).await?;
     if !lead.cwd.join(".git").exists() {
@@ -3336,6 +3393,13 @@ mod tests {
         )
     }
 
+    /// A tool call with the token counts a real server reports.
+    fn sse_tool_usage(id: &str, name: &str, args: Value, prompt: u64, completion: u64) -> String {
+        let chunk = json!({ "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "id": id, "function": { "name": name, "arguments": args.to_string() } }] }, "finish_reason": "tool_calls" }] });
+        let usage = json!({ "choices": [], "usage": { "prompt_tokens": prompt, "completion_tokens": completion } });
+        format!("data: {chunk}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
+    }
+
     fn host(root: &std::path::Path, decision: ApprovalDecision, events: Arc<Mutex<Vec<Value>>>) -> Host {
         let ws = Workspace::open(root, &[]).unwrap();
         Host {
@@ -3382,6 +3446,7 @@ mod tests {
             role_providers: Vec::new(),
             depth: 0,
             agent: None,
+            budget: None,
         }
     }
 
@@ -3596,6 +3661,25 @@ mod tests {
             "the new request joins the same turn"
         );
         assert_eq!(repair_history(&mut r.rec.messages.clone()), 0, "the history is valid as saved");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// After a reload, an empty prompt continues an interrupted task; for any other task it is refused.
+    #[tokio::test]
+    async fn an_empty_prompt_resumes_an_interrupted_task() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        let h = host(&root, ApprovalDecision::Allow, Arc::default());
+        let mut saved = saved_record("t1", vec![Message { role: Role::User, content: vec![ContentPart::Text { text: "read a.txt".into() }] }]);
+        saved.status = Status::Interrupted;
+        h.store.save(&saved).unwrap();
+        let mut p = params("http://127.0.0.1:1/v1", ChatMode::Agent, Mode::AskBeforeEdit);
+        (p.task_id, p.prompt) = (Some("t1".into()), "  ".into());
+        let r = prepare(h.clone(), p.clone(), CancellationToken::new()).await.unwrap();
+        assert!(r.rec.messages.iter().any(|m| m.content.iter().any(|c| matches!(c, ContentPart::Text { text } if text.contains(RESUME_PROMPT)))), "the resume prompt joins");
+        assert!(r.rec.messages.iter().any(|m| m.content.iter().any(|c| matches!(c, ContentPart::Text { text } if text.contains("read a.txt")))), "the earlier conversation stays");
+        saved.status = Status::Cancelled;
+        h.store.save(&saved).unwrap();
+        assert!(prepare(h, p, CancellationToken::new()).await.is_err(), "only an interrupted task resumes without a prompt");
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -4886,6 +4970,31 @@ mod tests {
         let reqs = seen.lock().unwrap();
         assert!(reqs[0]["tools"].as_array().is_none_or(Vec::is_empty), "only the summary turn runs, without tools");
         assert!(reqs[0]["messages"].to_string().contains("token budget was reached"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A subagent spends from the lead's budget: once it is gone the subagent stops at once,
+    /// without a summary call of its own, and only the lead writes the summary.
+    #[tokio::test]
+    async fn a_subagent_stops_when_the_shared_budget_is_spent() {
+        let root = git_repo(&[("a.txt", "x\n")]);
+        let (base, seen) = mock(vec![
+            sse_tool_usage("c1", "read_file", json!({ "path": "a.txt" }), 50, 10),
+            sse_tool("s1", "run_subagent", json!({ "role": "research", "objective": "look at a.txt", "name": "look" })),
+            sse_tool_usage("r1", "read_file", json!({ "path": "a.txt" }), 40, 10),
+            sse_text("Budget reached; a.txt holds x."),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut p = params(&base, ChatMode::Agent, Mode::AskBeforeEdit);
+        p.limits.max_total_tokens = Some(100);
+        let r = run(host(&root, ApprovalDecision::Allow, events.clone()), p, CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::BudgetExceeded, "{:?}", r.error);
+        assert_eq!(r.final_text, "Budget reached; a.txt holds x.");
+        let ev = events.lock().unwrap();
+        assert!(ev.iter().any(|e| e["type"] == "subagentFinished" && e["status"] == "budgetExceeded"), "the subagent stopped on the budget");
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 4, "lead, lead, subagent, then only the lead's summary");
+        assert!(reqs[3]["tools"].as_array().is_none_or(Vec::is_empty), "the summary turn has no tools");
         std::fs::remove_dir_all(root).ok();
     }
 

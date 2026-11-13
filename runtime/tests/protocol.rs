@@ -451,9 +451,10 @@ async fn session_controls_work_on_a_saved_task() {
 }
 
 /// A runtime that was killed mid-run leaves `status: "running"` behind; the next start must clear it,
-/// or the task list and the status bar show work that is not happening.
+/// or the task list and the status bar show work that is not happening. It becomes `interrupted`,
+/// which an empty `agent/run` prompt can continue.
 #[tokio::test]
-async fn interrupted_tasks_are_marked_failed_on_start() {
+async fn stale_tasks_are_marked_interrupted_on_start() {
     let dir = std::env::temp_dir().join(format!("taskx-stale-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(dir.join("tasks")).unwrap();
@@ -475,6 +476,6 @@ async fn interrupted_tasks_are_marked_failed_on_start() {
     rt.send(json!({"jsonrpc":"2.0","id":1,"method":"agent/tasks"})).await;
     let (res, _) = rt.until_response(1).await;
     let task = res["result"].as_array().unwrap().iter().find(|t| t["id"] == "stale1").expect("the record is listed");
-    assert_eq!(task["status"], "failed", "{task}");
+    assert_eq!(task["status"], "interrupted", "{task}");
     std::fs::remove_dir_all(dir).ok();
 }

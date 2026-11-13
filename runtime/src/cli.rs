@@ -28,6 +28,7 @@ pub const USAGE: &str = "task-x: a coding agent for your terminal
 
 Usage:
   task-x-runtime exec [options] <prompt...>   Run one task and exit (0 when it completes). Use - to read the prompt from stdin.
+                                              With --resume or --continue and no prompt, an interrupted task continues.
   task-x-runtime chat [options]               Start an interactive session.
 
 Options:
@@ -50,7 +51,7 @@ Options:
   --no-mcp-import           Start only .task-x/mcp.json servers, not the ones set up for Claude, VS Code, Copilot CLI, or Cursor
   --trust                   Trust this folder: its hooks, MCP servers, skills, and agents may run (asked once otherwise)
 
-In chat: /exit, /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], /timeline, /restore <step>, /export [turns] [file.html] (asks for the start and end turn; or give 2-5), /agents, /mcp, /approvals, /allow|/ask|/deny <tool or server>, and every skill and command (/init, /review, ...).";
+In chat: /exit, /continue (an interrupted task; Enter on an empty line does it too), /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], /timeline, /restore <step>, /export [turns] [file.html] (asks for the start and end turn; or give 2-5), /agents, /mcp, /approvals, /allow|/ask|/deny <tool or server>, and every skill and command (/init, /review, ...).";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
@@ -142,7 +143,8 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
         }
     }
     o.prompt = words.join(" ");
-    if o.command == "exec" && o.prompt.trim().is_empty() {
+    // No prompt is allowed only to continue a task (an interrupted one; checked once it is loaded).
+    if o.command == "exec" && o.prompt.trim().is_empty() && o.resume.is_none() && !o.continue_last {
         return Err("exec needs a prompt (or - to read it from stdin)".into());
     }
     Ok(o)
@@ -666,7 +668,7 @@ impl Session {
         ws.graph_file = Some(data.join("graphs").join(format!("{key}.json")));
         let root = ws.index.root().to_path_buf();
         let store = Store::new(Some(&data));
-        store.fail_interrupted();
+        store.interrupt_stale();
         let edits = Arc::new(Mutex::new(EditLog::open(data.join("checkpoints").join(format!("{key}.json")))));
         // A folder's own hooks, MCP servers, skills, and agents run only once the user trusts it: a
         // freshly cloned repository could ship any of them.
@@ -788,6 +790,7 @@ impl Session {
             embeddings: None,
             depth: 0,
             agent: None,
+            budget: None,
         };
         let cancel = CancellationToken::new();
         *self.current.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancel.clone());
@@ -796,6 +799,11 @@ impl Session {
         let rec = res?;
         self.task_id = Some(rec.id.clone());
         Ok(rec)
+    }
+
+    /// The session's task when the runtime stopped it before it ended, so it can be continued.
+    fn interrupted(&self) -> Option<TaskRecord> {
+        self.task_id.as_deref().and_then(|id| self.host.store.load(id)).filter(|r| r.status == Status::Interrupted)
     }
 
     fn policy(&self) -> PolicyConfig {
@@ -1021,6 +1029,16 @@ impl Session {
     }
 }
 
+/// The Continue offer for a task the runtime stopped before it ended (`interrupted`).
+fn continue_offer(rec: &TaskRecord) -> String {
+    format!(
+        "{} {}\n  {}",
+        paint("33", "⏸ Interrupted:"),
+        rec.title,
+        paint(DIM, "Press Enter (or /continue) to continue it where it stopped, or type a new prompt.")
+    )
+}
+
 fn status_code(s: Status) -> ExitCode {
     if s == Status::Completed { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
@@ -1046,6 +1064,11 @@ pub async fn main(args: &[String]) -> ExitCode {
         }
     };
     if o.command == "exec" {
+        if o.prompt.trim().is_empty() && session.interrupted().is_none() {
+            let which = session.task_id.as_deref().map_or("no task to continue".to_owned(), |id| format!("task {id} was not interrupted"));
+            eprintln!("task-x: {which}; give a prompt");
+            return ExitCode::from(2);
+        }
         return match session.run(&o.prompt).await {
             Ok(rec) => {
                 if o.json {
@@ -1076,6 +1099,9 @@ pub async fn main(args: &[String]) -> ExitCode {
         });
     }
     eprintln!("task-x chat ({} {}). Type /exit to leave.", serde_json::to_value(session.provider.kind).unwrap_or_default().as_str().unwrap_or(""), session.provider.model);
+    if let Some(rec) = session.interrupted() {
+        eprintln!("{}", continue_offer(&rec));
+    }
     let stdin = std::io::stdin();
     loop {
         eprint!("\n> ");
@@ -1084,12 +1110,19 @@ pub async fn main(args: &[String]) -> ExitCode {
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
             break;
         }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+        let mut line = line.trim();
         if matches!(line, "/exit" | "/quit") {
             break;
+        }
+        // Continue: an empty prompt makes the runtime pick the interrupted task up where it stopped.
+        if line.is_empty() || line == "/continue" {
+            if session.interrupted().is_none() {
+                if line == "/continue" {
+                    eprintln!("task-x: there is no interrupted task to continue");
+                }
+                continue;
+            }
+            line = "";
         }
         if let Some(r) = session.command(line).await {
             match r {
@@ -1151,11 +1184,22 @@ mod tests {
         assert_eq!((o.mode, o.edit, o.max_turns, o.json), (ChatMode::Plan, EditMode::Auto, Some(5), true));
         assert_eq!(o.deny, ["run_command"]);
         assert!(parse_args(&args("exec")).is_err(), "exec needs a prompt");
+        assert!(parse_args(&args("exec --resume t1")).is_ok(), "or a task to continue");
+        assert!(parse_args(&args("exec --continue")).is_ok());
         assert!(parse_args(&args("chat --frobnicate")).is_err());
         assert!(parse_args(&args("exec --mode wild x")).is_err());
         assert!(parse_args(&args("serve")).is_err());
         assert_eq!(parse_args(&args("exec -- --not-an-option")).unwrap().prompt, "--not-an-option");
         assert!(parse_args(&args("chat")).unwrap().prompt.is_empty());
+    }
+
+    #[test]
+    fn offers_to_continue_an_interrupted_task() {
+        let mut rec = agent::store::tests::record("t1", Status::Interrupted);
+        rec.title = "fix the login bug".into();
+        let offer = continue_offer(&rec);
+        assert!(offer.contains("Interrupted:") && offer.contains("fix the login bug"), "{offer}");
+        assert!(offer.contains("Press Enter (or /continue)"), "{offer}");
     }
 
     #[test]

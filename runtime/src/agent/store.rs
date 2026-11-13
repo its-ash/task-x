@@ -8,6 +8,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 pub const RECORD_VERSION: u32 = 1;
+/// The `error` of an interrupted task.
+const INTERRUPTED: &str = "the runtime stopped before this task finished; send an empty prompt with its taskId to continue it";
 /// Largest task record the list reads; a bigger file is skipped instead of parsed.
 const MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -25,6 +27,9 @@ pub enum Status {
     ProviderError,
     Stuck,
     Failed,
+    /// The runtime stopped (VS Code reloaded or quit, the runtime crashed) before the task ended.
+    /// Its conversation is saved: `agent/run` with its `taskId` and an empty prompt continues it.
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,30 +159,46 @@ impl Store {
         self.path(id).is_some_and(|p| std::fs::remove_file(p).is_ok())
     }
 
-    /// Marks the records a crashed or killed runtime left as `running` as failed. Nothing runs before
-    /// this at startup, so a `running` record is always stale; without this the task list and the
-    /// status bar would show phantom work forever. Returns how many records were updated.
-    pub fn fail_interrupted(&self) -> usize {
-        let Some(dir) = &self.dir else { return 0 };
-        let mut updated = 0;
-        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+    /// The saved records, read one by one (unreadable files are skipped).
+    fn records(&self) -> impl Iterator<Item = TaskRecord> + '_ {
+        self.dir.iter().flat_map(std::fs::read_dir).flatten().flatten().filter_map(|e| {
             if !e.path().extension().is_some_and(|x| x == "json") {
-                continue;
+                return None;
             }
-            let Ok(bytes) = std::fs::read(e.path()) else { continue };
-            let Ok(mut r) = serde_json::from_slice::<TaskRecord>(&bytes) else { continue };
-            // A sleeping task's wake-ups lived in the runtime that stopped: they will never fire.
-            if !matches!(r.status, Status::Running | Status::Sleeping) {
-                continue;
-            }
-            r.status = Status::Failed;
-            r.error = Some("the runtime stopped before this task finished".into());
-            r.updated_ms = now_ms();
-            if self.save(&r).is_ok() {
-                updated += 1;
-            }
-        }
-        updated
+            serde_json::from_slice::<TaskRecord>(&std::fs::read(e.path()).ok()?).ok()
+        })
+    }
+
+    /// Ids of the tasks saved as running or sleeping.
+    pub fn active_ids(&self) -> Vec<String> {
+        self.records().filter(|r| matches!(r.status, Status::Running | Status::Sleeping)).map(|r| r.id).collect()
+    }
+
+    fn mark_interrupted(&self, mut r: TaskRecord) -> bool {
+        r.status = Status::Interrupted;
+        r.error = Some(INTERRUPTED.into());
+        r.updated_ms = now_ms();
+        self.save(&r).is_ok()
+    }
+
+    /// Marks the records a crashed or killed runtime left as `running` (or `sleeping`) as
+    /// interrupted. Nothing runs before this at startup, so such a record is always stale; without
+    /// this the task list and the status bar would show phantom work forever. Returns how many
+    /// records were updated.
+    pub fn interrupt_stale(&self) -> usize {
+        // A sleeping task's wake-ups lived in the runtime that stopped: they will never fire.
+        let stale: Vec<TaskRecord> = self.records().filter(|r| matches!(r.status, Status::Running | Status::Sleeping)).collect();
+        stale.into_iter().filter(|r| self.mark_interrupted(r.clone())).count()
+    }
+
+    /// Marks these tasks, stopped because the runtime is shutting down, as interrupted instead of
+    /// cancelled: the user did not stop them. Tasks that ended on their own are left alone.
+    pub fn interrupt(&self, ids: &[String]) -> usize {
+        ids.iter()
+            .filter_map(|id| self.load(id))
+            .filter(|r| matches!(r.status, Status::Running | Status::Sleeping | Status::Cancelled))
+            .filter(|r| self.mark_interrupted(r.clone()))
+            .count()
     }
 }
 
@@ -219,20 +240,36 @@ pub mod tests {
     }
 
     #[test]
-    fn interrupted_runs_are_marked_failed() {
+    fn stale_runs_are_marked_interrupted() {
         let dir = std::env::temp_dir().join(format!("anvil-store-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let store = Store::new(Some(&dir));
         store.save(&record("a", Status::Running)).unwrap();
         store.save(&record("b", Status::Sleeping)).unwrap();
         store.save(&record("c", Status::Completed)).unwrap();
-        assert_eq!(store.fail_interrupted(), 2);
-        assert_eq!(store.load("b").unwrap().status, Status::Failed, "a sleeping task's wake-ups died with the runtime");
+        assert_eq!(store.active_ids().len(), 2);
+        assert_eq!(store.interrupt_stale(), 2);
+        assert_eq!(store.load("b").unwrap().status, Status::Interrupted, "a sleeping task's wake-ups died with the runtime");
         let a = store.load("a").unwrap();
-        assert_eq!(a.status, Status::Failed);
+        assert_eq!(a.status, Status::Interrupted);
         assert!(a.error.as_deref().unwrap().contains("stopped before this task finished"));
         assert_eq!(store.load("c").unwrap().status, Status::Completed, "finished tasks are left alone");
-        assert_eq!(store.fail_interrupted(), 0, "a second start finds nothing stale");
+        assert_eq!(store.interrupt_stale(), 0, "a second start finds nothing stale");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tasks_stopped_by_a_shutdown_are_interrupted_not_cancelled() {
+        let dir = std::env::temp_dir().join(format!("anvil-store-shutdown-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::new(Some(&dir));
+        store.save(&record("a", Status::Cancelled)).unwrap();
+        store.save(&record("b", Status::Completed)).unwrap();
+        store.save(&record("c", Status::Cancelled)).unwrap();
+        assert_eq!(store.interrupt(&["a".into(), "b".into(), "missing".into()]), 1);
+        assert_eq!(store.load("a").unwrap().status, Status::Interrupted);
+        assert_eq!(store.load("b").unwrap().status, Status::Completed, "a task that ended on its own stays as it ended");
+        assert_eq!(store.load("c").unwrap().status, Status::Cancelled, "only the tasks running at shutdown change");
         std::fs::remove_dir_all(dir).ok();
     }
 }

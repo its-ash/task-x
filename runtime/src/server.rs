@@ -400,6 +400,8 @@ pub struct Server {
     plugins: Arc<RwLock<plugins::Settings>>,
     /// Bumped by every `workspace/open`, so the watcher of an earlier workspace stops.
     watch_gen: Arc<AtomicU64>,
+    /// Tasks that were running when the runtime began to shut down.
+    interrupted: Arc<Mutex<Vec<String>>>,
 }
 
 /// How often the watcher looks for changed files, and how long it waits for a burst of writes to settle.
@@ -447,6 +449,7 @@ impl Server {
             data_dir: Arc::default(),
             plugins: Arc::default(),
             watch_gen: Arc::default(),
+            interrupted: Arc::default(),
         })
     }
 
@@ -547,7 +550,7 @@ impl Server {
             "initialize" => self.reply(&id, self.initialize(msg.params)),
             "shutdown" => {
                 self.shutting_down.store(true, Ordering::SeqCst);
-                self.cancel_all();
+                self.stop_for_exit();
                 self.reply(&id, Ok(Value::Null));
             }
             "provider/capabilities" => self.reply(&id, Ok(provider::capability_table())),
@@ -741,9 +744,9 @@ impl Server {
             *self.data_dir.write().expect("data dir lock") = Some(d);
         }
         // Nothing runs yet, so a record left as `running` belongs to a runtime that died mid-task.
-        let stale = self.store.read().expect("store lock").fail_interrupted();
+        let stale = self.store.read().expect("store lock").interrupt_stale();
         if stale > 0 {
-            log(format_args!("marked {stale} interrupted tasks as failed"));
+            log(format_args!("marked {stale} stale tasks as interrupted"));
         }
         self.initialized.store(true, Ordering::SeqCst);
         Ok(json!({
@@ -1593,11 +1596,31 @@ impl Server {
         self.inflight.lock().expect("inflight lock").values().for_each(CancellationToken::cancel);
     }
 
-    /// Cancels outstanding work and waits for every task to send its final reply.
-    pub async fn drain(&self) {
+    /// Notes the tasks running now (they are interrupted, not cancelled by the user), then cancels
+    /// all work. VS Code sends `shutdown` or closes stdin when it reloads or quits.
+    fn stop_for_exit(&self) {
+        let ids = self.store.read().expect("store lock").active_ids();
+        let mut stopped = self.interrupted.lock().expect("interrupted lock");
+        for id in ids {
+            if !stopped.contains(&id) {
+                stopped.push(id);
+            }
+        }
+        drop(stopped);
         self.cancel_all();
+    }
+
+    /// Cancels outstanding work and waits for every task to send its final reply. The tasks that
+    /// were running are saved as `interrupted`, so the client can continue them after a restart.
+    pub async fn drain(&self) {
+        self.stop_for_exit();
         self.tasks.close();
         self.tasks.wait().await;
+        let ids = std::mem::take(&mut *self.interrupted.lock().expect("interrupted lock"));
+        let n = self.store.read().expect("store lock").interrupt(&ids);
+        if n > 0 {
+            log(format_args!("saved {n} running tasks as interrupted"));
+        }
     }
 }
 
