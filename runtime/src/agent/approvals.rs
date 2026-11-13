@@ -141,14 +141,16 @@ pub struct Edit {
 }
 
 /// Sets `name` (a tool, or a pattern such as a server's `mcp__<server>__*`) to `choice`: its own
-/// entries leave both lists, and `allow` or `deny` gets it back. Other entries are kept as they are.
+/// entries leave both lists, and `allow` or `deny` gets it back. A pattern sets the whole group,
+/// so the entries it covers (one tool's exceptions) leave too. Other entries are kept as they are.
 pub fn set(config: &PolicyConfig, name: &str, choice: Choice) -> Result<Edit, String> {
     let name = name.trim();
     if name.is_empty() || name == "*" {
         return Err("give a tool name or a pattern such as mcp__<server>__*".into());
     }
-    let mut allow: Vec<String> = config.allow.iter().filter(|a| a.as_str() != name).cloned().collect();
-    let mut deny: Vec<String> = config.deny.iter().filter(|d| d.as_str() != name).cloned().collect();
+    let keep = |e: &&String| e.as_str() != name && !(name.ends_with('*') && tool_matches(name, e));
+    let mut allow: Vec<String> = config.allow.iter().filter(keep).cloned().collect();
+    let mut deny: Vec<String> = config.deny.iter().filter(keep).cloned().collect();
     let covered_by = match choice {
         Choice::Allow => {
             allow.push(name.to_owned());
@@ -210,7 +212,11 @@ mod tests {
         let e = set(&c, "mcp__chrome-devtools__evaluate_script", Choice::Allow).unwrap();
         assert!(e.allow.contains(&"mcp__chrome-devtools__evaluate_script".to_string()) && e.deny.is_empty() && e.covered_by.is_none());
         let e = set(&c, "mcp__chrome-devtools__*", Choice::Ask).unwrap();
-        assert_eq!((e.allow, e.covered_by), (vec!["run_tests".to_string()], None), "the server goes back to asking");
+        assert_eq!((e.allow, e.deny.len(), e.covered_by), (vec!["run_tests".to_string()], 0, None), "the whole server goes back to asking, exceptions too");
+        let e = set(&c, "mcp__chrome-devtools__*", Choice::Allow).unwrap();
+        assert!(e.deny.is_empty() && e.allow.contains(&"mcp__chrome-devtools__*".to_string()), "enable all: no tool of the server stays refused");
+        let e = set(&c, "mcp__chrome-devtools__*", Choice::Deny).unwrap();
+        assert_eq!((e.allow, e.deny), (vec!["run_tests".to_string()], vec!["mcp__chrome-devtools__*".to_string()]), "disable all");
         let e = set(&c, "mcp__chrome-devtools__new_page", Choice::Ask).unwrap();
         assert_eq!(e.covered_by.as_deref(), Some("mcp__chrome-devtools__*"), "the server pattern still allows it");
         let e = set(&safe(&[], &["mcp__x__*"]), "mcp__x__a", Choice::Allow).unwrap();

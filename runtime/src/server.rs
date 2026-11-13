@@ -266,6 +266,17 @@ struct McpParams {
     servers: std::collections::BTreeMap<String, mcp::ServerConfig>,
     #[serde(default)]
     workspace_trusted: bool,
+    /// Also start the servers set up for these: `claude`, `vscode`, `copilotCli`, `cursor`.
+    #[serde(default)]
+    import: Vec<String>,
+    /// Server names not to start, whatever file has them.
+    #[serde(default)]
+    disabled: Vec<String>,
+}
+
+/// The home folder, for reading other tools' MCP settings.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
 }
 
 #[derive(Deserialize)]
@@ -539,6 +550,7 @@ impl Server {
             }
             "provider/capabilities" => self.reply(&id, Ok(provider::capability_table())),
             "tools/list" => self.reply(&id, Ok(json!(tools::infos()))),
+            "mcp/discover" => self.reply(&id, self.discover_mcp(msg.params)),
             "tools/setApproval" => self.reply(
                 &id,
                 params::<ApprovalParams>(msg.params).and_then(|p| {
@@ -1302,19 +1314,66 @@ impl Server {
         crate::claude_cli::run(host, p, cancel.clone()).await.map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))
     }
 
-    async fn configure_mcp(&self, p: Value) -> Result<Value, RpcError> {
-        let p: McpParams = params(p)?;
-        let mut servers = p.servers;
+    /// The servers other tools set up (`import`), then the workspace's `.task-x/mcp.json`, then the
+    /// client's own `servers`: a later one wins for a name. `disabled` names are not started.
+    fn mcp_servers(&self, p: &McpParams) -> Result<(std::collections::BTreeMap<String, mcp::ServerConfig>, Option<crate::mcp_import::Imported>), RpcError> {
+        if let Some(bad) = p.import.iter().find(|s| !crate::mcp_import::SOURCES.contains(&s.as_str())) {
+            return Err(RpcError::new(rpc::INVALID_PARAMS, format!("unknown import source '{bad}' (use {})", crate::mcp_import::SOURCES.join(", "))));
+        }
         let root = self.root();
+        let imported = (!p.import.is_empty()).then(|| {
+            let env = crate::mcp_import::Env::current(home_dir().unwrap_or_default(), root.clone(), p.workspace_trusted);
+            crate::mcp_import::import(&p.import, &env, &crate::mcp_import::read_file)
+        });
+        let mut servers = imported.as_ref().map(|i| i.servers.clone()).unwrap_or_default();
         if p.workspace_trusted {
             if let Some(r) = &root {
-                let ws = mcp::load_workspace(r).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?;
-                servers.extend(ws);
+                servers.extend(mcp::load_workspace(r).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?);
             }
         }
+        servers.extend(p.servers.clone());
+        for name in &p.disabled {
+            if let Some(s) = servers.get_mut(name) {
+                s.disabled = true;
+            }
+        }
+        Ok((servers, imported))
+    }
+
+    async fn configure_mcp(&self, p: Value) -> Result<Value, RpcError> {
+        let p: McpParams = params(p)?;
+        let (servers, imported) = self.mcp_servers(&p)?;
         let mut m = self.mcp.write().await;
-        m.configure(servers, root).await;
-        Ok(m.status())
+        m.configure(servers, self.root()).await;
+        let mut status = m.status();
+        if let Some(i) = imported {
+            status["imported"] = json!({ "origins": i.origins, "notes": i.notes });
+        }
+        Ok(status)
+    }
+
+    /// `mcp/discover`: what `mcp/configure` with the same params would start, without starting it.
+    /// Commands and URLs only: env values and headers (tokens) stay out.
+    fn discover_mcp(&self, p: Value) -> Result<Value, RpcError> {
+        let p: McpParams = params(p)?;
+        let (servers, imported) = self.mcp_servers(&p)?;
+        let origins = imported.as_ref().map(|i| i.origins.clone()).unwrap_or_default();
+        let list: Vec<Value> = servers
+            .iter()
+            .map(|(name, s)| {
+                let origin = if p.servers.contains_key(name) { "task-x settings".to_owned() } else { origins.get(name).cloned().unwrap_or_else(|| "task-x (.task-x/mcp.json)".into()) };
+                json!({
+                    "name": name,
+                    "origin": origin,
+                    "type": s.transport.clone().unwrap_or_else(|| if s.command.trim().is_empty() { "http".into() } else { "stdio".into() }),
+                    "command": s.command,
+                    "args": s.args,
+                    "url": s.url,
+                    "disabled": s.disabled,
+                })
+            })
+            .collect();
+        Ok(json!({ "servers": list, "notes": imported.map(|i| i.notes).unwrap_or_default() }))
     }
 
     /// `docs/add`: crawls and indexes a docs site, with `docs/progress` notifications as pages come in.

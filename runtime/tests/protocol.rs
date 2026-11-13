@@ -288,6 +288,33 @@ async fn approvals_list_and_set() {
     assert_eq!(r["error"]["code"], -32602);
 }
 
+/// `mcp/discover` finds the servers set up for other tools (here Copilot CLI, with its registry-style
+/// name and `local` type) and says where each came from, without starting them.
+#[tokio::test]
+async fn mcp_discover_imports_other_tools_servers() {
+    let home = std::env::temp_dir().join(format!("taskx-home-{}", std::process::id()));
+    std::fs::create_dir_all(home.join(".copilot")).unwrap();
+    std::fs::write(
+        home.join(".copilot").join("mcp-config.json"),
+        json!({ "mcpServers": { "io.github.ChromeDevTools/chrome-devtools-mcp": { "type": "local", "command": "npx", "args": ["-y", "chrome-devtools-mcp@latest"], "env": { "SECRET": "s3cret" } } } }).to_string(),
+    )
+    .unwrap();
+    let mut rt = Runtime::start_with(&[("HOME", &home)]).await;
+    rt.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}})).await;
+    rt.recv().await;
+    rt.send(json!({"jsonrpc":"2.0","id":1,"method":"mcp/discover","params":{ "import": ["copilotCli"], "disabled": [] }})).await;
+    let (r, _) = rt.until_response(1).await;
+    let s = &r["result"]["servers"][0];
+    assert_eq!((s["name"].clone(), s["type"].clone(), s["command"].clone()), (json!("chrome-devtools"), json!("stdio"), json!("npx")), "{r}");
+    assert!(s["origin"].as_str().unwrap().starts_with("Copilot CLI"));
+    assert!(!r.to_string().contains("s3cret"), "env values stay out");
+    rt.send(json!({"jsonrpc":"2.0","id":2,"method":"mcp/discover","params":{ "import": ["copilotCli"], "disabled": ["chrome-devtools"] }})).await;
+    assert_eq!(rt.until_response(2).await.0["result"]["servers"][0]["disabled"], true);
+    rt.send(json!({"jsonrpc":"2.0","id":3,"method":"mcp/discover","params":{ "import": ["plod"] }})).await;
+    assert_eq!(rt.until_response(3).await.0["error"]["code"], -32602);
+    std::fs::remove_dir_all(home).ok();
+}
+
 /// `plugins/configure` adds a plugin folder; `plugins/list`, `agents/list`, and `skills/list` then
 /// show its agents, skills, and commands, named `<plugin>:<name>`. A disabled plugin adds nothing.
 #[tokio::test]

@@ -5,6 +5,7 @@ mod context;
 mod docs;
 mod errors;
 mod mcp;
+mod mcp_import;
 mod mcp_server;
 mod oauth;
 mod provider;

@@ -90,7 +90,8 @@ enum Kind {
 impl ServerConfig {
     fn kind(&self) -> Result<Kind, String> {
         match self.transport.as_deref() {
-            Some("stdio") => Ok(Kind::Stdio),
+            // Copilot CLI writes "local" for a stdio server.
+            Some("stdio" | "local") => Ok(Kind::Stdio),
             Some("http" | "streamable-http" | "streamableHttp") => Ok(Kind::Http),
             Some("sse") => Ok(Kind::Sse),
             Some(t) => Err(format!("unknown transport type '{t}' (use stdio, http, or sse)")),

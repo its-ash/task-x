@@ -47,8 +47,9 @@ Options:
   --json                    Print the summary as JSON on stdout (exec)
   --quiet                   Print only the final answer
   --watch                   Index file changes while the session runs (chat)
+  --no-mcp-import           Start only .task-x/mcp.json servers, not the ones set up for Claude, VS Code, Copilot CLI, or Cursor
 
-In chat: /exit, /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], /timeline, /restore <step>, /export [turns] [file.html] (asks for the start and end turn; or give 2-5), /approvals, /allow|/ask|/deny <tool or server>, and every skill and command (/init, /review, ...).";
+In chat: /exit, /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], /timeline, /restore <step>, /export [turns] [file.html] (asks for the start and end turn; or give 2-5), /mcp, /approvals, /allow|/ask|/deny <tool or server>, and every skill and command (/init, /review, ...).";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
@@ -71,6 +72,7 @@ pub struct Options {
     pub json: bool,
     pub quiet: bool,
     pub watch: bool,
+    pub no_mcp_import: bool,
 }
 
 /// Reads the command line (without the program name).
@@ -100,6 +102,7 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
         json: false,
         quiet: false,
         watch: false,
+        no_mcp_import: false,
     };
     let mut words: Vec<String> = Vec::new();
     while let Some(a) = it.next() {
@@ -128,6 +131,7 @@ pub fn parse_args(args: &[String]) -> Result<Options, String> {
             "--json" => o.json = true,
             "--quiet" | "-q" => o.quiet = true,
             "--watch" => o.watch = true,
+            "--no-mcp-import" => o.no_mcp_import = true,
             "--" => words.extend(it.by_ref().cloned()),
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             _ => words.push(a.clone()),
@@ -489,6 +493,9 @@ struct Session {
     options: Options,
     provider: ProviderConfig,
     task_id: Option<String>,
+    /// Where each MCP server came from, and what the import found or skipped.
+    mcp_origins: std::collections::BTreeMap<String, String>,
+    mcp_notes: Vec<String>,
 }
 
 impl Session {
@@ -518,8 +525,24 @@ impl Session {
             hook_list.extend(agent::hooks::load_workspace(&h).unwrap_or_default().into_iter().map(|h| agent::hooks::Hook { trusted: true, ..h }));
         }
         let mcp = Arc::new(tokio::sync::RwLock::new(crate::mcp::Manager::default()));
-        let servers = crate::mcp::load_workspace(&root).unwrap_or_default();
+        // The servers set up for Claude, VS Code, Copilot CLI, and Cursor, then .task-x/mcp.json over them.
+        let mut imported = crate::mcp_import::Imported::default();
+        if !o.no_mcp_import {
+            if let Some(h) = home() {
+                let sources: Vec<String> = crate::mcp_import::SOURCES.iter().map(|s| s.to_string()).collect();
+                imported = crate::mcp_import::import(&sources, &crate::mcp_import::Env::current(h, Some(root.clone()), true), &crate::mcp_import::read_file);
+            }
+        }
+        let mut servers = imported.servers.clone();
+        let mut origins = imported.origins.clone();
+        for (name, cfg) in crate::mcp::load_workspace(&root).unwrap_or_default() {
+            origins.insert(name.clone(), "task-x (.task-x/mcp.json)".into());
+            servers.insert(name, cfg);
+        }
         if !servers.is_empty() {
+            if !quiet {
+                eprintln!("task-x: starting {} MCP server{} ...", servers.len(), if servers.len() == 1 { "" } else { "s" });
+            }
             mcp.write().await.configure(servers, Some(root.clone())).await;
         }
         let emit_quiet = quiet;
@@ -584,7 +607,7 @@ impl Session {
         if o.continue_last && task_id.is_none() {
             task_id = host.store.list(1).first().and_then(|t| t["id"].as_str().map(str::to_owned));
         }
-        Ok(Self { host, options: o, provider, task_id })
+        Ok(Self { host, options: o, provider, task_id, mcp_origins: origins, mcp_notes: imported.notes })
     }
 
     async fn run(&mut self, prompt: &str) -> Result<TaskRecord, String> {
@@ -664,6 +687,33 @@ impl Session {
             out.extend(a.tools.iter().filter(|t| t.server.as_deref() == Some(s.name.as_str())).map(|t| line(t) + "\n"));
         }
         out + "\n/allow, /ask, or /deny <tool or server> changes it for this session (use --allow and --deny to start with them)."
+    }
+
+    /// `/mcp`: each server, where it came from, and whether it runs; then what the import skipped.
+    async fn mcp_list(&self) -> String {
+        let status = self.host.mcp.read().await.status();
+        let mut out = String::new();
+        for s in status["servers"].as_array().into_iter().flatten() {
+            let name = s["name"].as_str().unwrap_or_default();
+            let tools = s["tools"].as_array().map_or(0, Vec::len);
+            let state = if s["disabled"] == true {
+                paint(DIM, "off")
+            } else if s["running"] == true {
+                paint("32", &format!("running, {tools} tools"))
+            } else {
+                paint("31", &format!("not running: {}", s["error"].as_str().unwrap_or("no answer")))
+            };
+            let from = self.mcp_origins.get(name).map_or(String::new(), |o| format!("  {}", paint(DIM, &format!("from {o}"))));
+            out.push_str(&format!("  {name}: {state}{from}\n"));
+        }
+        if out.is_empty() {
+            out.push_str("  No MCP server is set up. task-x reads Claude, VS Code, Copilot CLI, and Cursor settings, and .task-x/mcp.json.\n");
+        }
+        let skipped: Vec<&String> = self.mcp_notes.iter().filter(|n| n.contains("skipped") || n.contains("could not") || n.contains("is named")).collect();
+        if !skipped.is_empty() {
+            out.push_str(&format!("Import notes:\n{}\n", skipped.iter().map(|n| format!("  {n}")).collect::<Vec<_>>().join("\n")));
+        }
+        format!("MCP servers:\n{out}See each tool's permission with /approvals; /allow, /ask, or /deny <server> sets a whole server.")
     }
 
     /// `/allow`, `/ask`, `/deny <name>`: a server name stands for all its tools, and a tool's short
@@ -751,6 +801,7 @@ impl Session {
                 Ok(format!("Exported {what} to {} ({} KB).", path.display(), bytes.div_ceil(1024)))
             }),
             "/approvals" => Ok(self.approvals().await),
+            "/mcp" => Ok(self.mcp_list().await),
             "/allow" => self.set_approval(agent::approvals::Choice::Allow, arg).await,
             "/ask" => self.set_approval(agent::approvals::Choice::Ask, arg).await,
             "/deny" => self.set_approval(agent::approvals::Choice::Deny, arg).await,
