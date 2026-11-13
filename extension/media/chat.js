@@ -22,6 +22,8 @@
     Read: 'Read', Write: 'Wrote', Edit: 'Edited', MultiEdit: 'Edited', NotebookEdit: 'Edited notebook', Bash: 'Ran', BashOutput: 'Read output',
     KillShell: 'Stopped shell', Grep: 'Searched', Glob: 'Found files', LS: 'Listed', TodoWrite: 'Updated todos', WebFetch: 'Fetched',
     WebSearch: 'Searched web', browser: 'VS Code browser', Skill: 'Used skill', Task: 'Subagent', ExitPlanMode: 'Finished plan', run_subagent: 'Subagent', worktree_apply: 'Applied worktree', worktree_discard: 'Discarded worktree',
+    // Your message to a running subtask, on its card and its board row.
+    user_message: 'You:',
   };
 
   // A successful edit tool shows as its edit card, not as a row (a failed edit still shows as a row).
@@ -1212,6 +1214,8 @@
       case 'lane': {
         response().append(enter(laneCard(it)));
         current = null;
+        lanes.set(it.taskId, it);
+        renderBoard();
         break;
       }
       case 'questions': {
@@ -1285,8 +1289,14 @@
     goal.title = 'Open this subagent’s activity in a tab';
     goal.addEventListener('click', open);
     card.append(head, goal);
+    // While it runs, one live line says what it does now; the full step list stays folded.
+    if (it.status === 'running') {
+      const now = el('div', 'lane-now');
+      now.append(icon('loading', 'codicon-modifier-spin'), el('span', null, laneNow(it)));
+      card.append(now);
+    }
     const body = el('details', 'lane-body');
-    body.open = it.status === 'running';
+    body.open = false;
     const steps = el('summary', null, `${(it.hidden || 0) + it.steps.length} step${(it.hidden || 0) + it.steps.length === 1 ? '' : 's'}`);
     body.append(steps);
     if (it.hidden) body.append(el('div', 'lane-step muted', `${it.hidden} earlier steps`));
@@ -1327,7 +1337,15 @@
     box.hidden = !expanded;
     const head = el('div', 'term-head');
     head.append(icon('terminal'), el('span', null, 'Output'), el('span', 'spacer'));
+    const expand = button('action term-expand', icon('unfold'), () => {
+      const full = box.classList.toggle('full');
+      expand.replaceChildren(icon(full ? 'fold' : 'unfold'));
+      expand.title = full ? 'Show less' : 'Show more lines';
+      expand.setAttribute('aria-expanded', String(full));
+    }, 'Show more lines');
+    expand.setAttribute('aria-expanded', 'false');
     head.append(
+      expand,
       button('action', icon('copy'), () => vscode.postMessage({ type: 'copyOutput', id }), 'Copy output'),
       button('action', icon('go-to-file'), () => vscode.postMessage({ type: 'openOutput', id }), 'Open in editor'),
     );
@@ -1336,7 +1354,18 @@
     body.setAttribute('aria-label', 'Command output');
     box.append(head, body);
     if (cut) box.append(el('div', 'term-note', 'Showing the start of the output. Open in editor to see all of it.'));
+    fitTerm(box);
     return box;
+  }
+  // Offers Expand only when the output is longer than the ten lines on show. A hidden block is
+  // measured when it opens.
+  const TERM_LINES = 10;
+  function fitTerm(box) {
+    const body = box.querySelector('.term-body');
+    if (body) box.classList.toggle('long', body.textContent.split('\n').length > TERM_LINES || body.scrollHeight > body.clientHeight + 1);
+    requestAnimationFrame(() => {
+      if (body && !box.hidden && body.clientHeight) box.classList.toggle('long', box.classList.contains('full') || body.scrollHeight > body.clientHeight + 1);
+    });
   }
   // Where a browser call ran: VS Code's integrated browser, or Chrome, Edge, ... over a DevTools port.
   function browserChip(name) {
@@ -1393,12 +1422,14 @@
       prev.classList.toggle('running', running);
       if (cut && !prev.querySelector('.term-note')) prev.append(el('div', 'term-note', 'Showing the start of the output. Open in editor to see all of it.'));
       if (!ok) prev.hidden = false;
+      fitTerm(prev);
       return;
     }
     const box = outputBlock(id, text, cut, shell || !ok);
     box.classList.toggle('running', running);
     const toggle = button('action', icon(box.hidden ? 'chevron-right' : 'chevron-down'), () => {
       box.hidden = !box.hidden;
+      fitTerm(box);
       toggle.replaceChildren(icon(box.hidden ? 'chevron-right' : 'chevron-down'));
       toggle.setAttribute('aria-expanded', String(!box.hidden));
     }, 'Show output');
@@ -1755,6 +1786,151 @@
       items.append(li);
     }
     todosBox.replaceChildren(head, bar, items);
+  }
+  // The subtasks of this chat, docked above the input: state, what each does now, time, and
+  // Stop / Retry / Apply / Discard / Open. A row jumps to its card in the chat.
+  const boardBox = $('board');
+  const lanes = new Map();
+  const dismissed = new Set();
+  let boardOpen = true;
+  let boardTimer = 0;
+  // The board redraws on every subtask update; the message box sits outside that part, so typing
+  // in it is never interrupted.
+  const boardDyn = el('div', 'board-dyn');
+  const compose = el('form', 'board-compose');
+  const composeTo = el('span', 'board-to');
+  const composeInput = el('input', 'board-input');
+  composeInput.type = 'text';
+  composeInput.maxLength = 4000;
+  composeInput.setAttribute('aria-label', 'Message to the subtask');
+  let composeFor = null;
+  compose.append(
+    composeTo, composeInput,
+    button('action', icon('send'), () => compose.requestSubmit(), 'Send to this subtask'),
+    button('action', icon('close'), () => closeCompose(), 'Close'),
+  );
+  compose.hidden = true;
+  boardBox.append(boardDyn, compose);
+  compose.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = composeInput.value.trim();
+    if (!text || !composeFor) return;
+    vscode.postMessage({ type: 'steerLane', taskId: composeFor, text });
+    closeCompose();
+  });
+  composeInput.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); closeCompose(); } });
+  function openCompose(it) {
+    composeFor = it.taskId;
+    composeTo.textContent = `To ${it.agent || it.name}:`;
+    composeInput.placeholder = 'It reads this before its next step';
+    compose.hidden = false;
+    boardOpen = true;
+    renderBoard();
+    composeInput.focus();
+  }
+  function closeCompose() {
+    composeFor = null;
+    composeInput.value = '';
+    compose.hidden = true;
+    renderBoard();
+  }
+  const laneState = (it) => (it.status === 'running' ? 'run' : it.status === 'completed' ? 'ok' : it.status === 'cancelled' ? 'stop' : 'fail');
+  const laneNow = (it) => {
+    const last = it.steps[it.steps.length - 1];
+    return last ? `${TOOL_LABELS[last.tool] || last.tool} ${last.detail || ''}`.trim() : 'Starting…';
+  };
+  const elapsed = (it) => {
+    const s = Math.max(0, Math.round(((it.endedMs || Date.now()) - it.startedMs) / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  };
+  const pendingMerge = (it) => it.worktree && it.files && it.status !== 'running' && (!it.merge || it.merge === 'conflict');
+  const MERGE_TEXT = { merged: 'merged', conflict: 'merge conflict', discarded: 'discarded' };
+  function jumpToLane(taskId) {
+    const card = log.querySelector(`.lane[data-task-id="${CSS.escape(taskId)}"]`);
+    if (!card) return vscode.postMessage({ type: 'openSubagent', taskId });
+    card.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    card.classList.remove('flash');
+    void card.offsetWidth;
+    card.classList.add('flash');
+  }
+  // A failed or stopped subtask is retried by the lead agent: it steers a running task, or starts one.
+  function retryLane(it) {
+    const why = it.error ? ` It ended with: ${it.error.split('\n')[0].slice(0, 300)}` : '';
+    vscode.postMessage({ type: 'send', text: `Run the subtask "${it.agent || it.name}" again.${why}\n\nIts goal: ${it.objective}`, queue: false, images: [] });
+  }
+  function boardRow(it) {
+    const st = laneState(it);
+    const li = el('li', 'board-row');
+    li.dataset.state = st;
+    li.dataset.role = it.role;
+    const stateIcon = { run: 'loading codicon-modifier-spin', ok: 'pass-filled', fail: 'error', stop: 'circle-slash' }[st];
+    const main = button('board-main', [icon(stateIcon, 'board-state'), el('span', 'board-name', it.agent || it.name), el('span', 'board-model', it.model || '')], () => jumpToLane(it.taskId), 'Show its card in the chat');
+    const steps = (it.hidden || 0) + it.steps.length;
+    const meta = el('span', 'board-meta', `${steps} step${steps === 1 ? '' : 's'}${it.cost ? ` · ${it.cost}` : ''}`);
+    const time = el('span', 'board-time', it.startedMs ? elapsed(it) : '');
+    if (it.startedMs) time.dataset.taskId = it.taskId;
+    const acts = el('span', 'board-acts');
+    if (st === 'run' && it.stoppable !== false) {
+      const msg = button(`action${composeFor === it.taskId ? ' on' : ''}`, icon('comment'), () => (composeFor === it.taskId ? closeCompose() : openCompose(it)), 'Send this subtask a message');
+      acts.append(msg, button('action stop-btn', icon('debug-stop'), () => vscode.postMessage({ type: 'stopLane', taskId: it.taskId }), 'Stop this subtask'));
+    }
+    if (st === 'fail' || st === 'stop') acts.append(button('action', icon('refresh'), () => retryLane(it), 'Ask the agent to run this subtask again'));
+    if (pendingMerge(it)) {
+      acts.append(
+        button('action', icon('check'), () => vscode.postMessage({ type: 'applyWorktree', name: it.worktree }), 'Apply its worktree to the working tree'),
+        button('action', icon('trash'), () => vscode.postMessage({ type: 'discardWorktree', name: it.worktree }), 'Discard its worktree'),
+      );
+    }
+    acts.append(button('action', icon('open-preview'), () => vscode.postMessage({ type: 'openSubagent', taskId: it.taskId }), 'Open its full activity in a tab'));
+    const line = el('div', 'board-line');
+    line.append(main, el('span', 'spacer'), meta, time, acts);
+    let what;
+    if (st === 'run') what = laneNow(it);
+    else if (st === 'ok') what = it.files ? `${it.files} file${it.files > 1 ? 's' : ''} +${it.added || 0} −${it.removed || 0}` : 'No file changes';
+    else what = it.error ? it.error.split('\n')[0] : LANE_STATUS[it.status] || it.status;
+    if (it.merge) what += ` · ${MERGE_TEXT[it.merge]}`;
+    const detail = el('div', `board-detail${st === 'run' && !it.steps.length ? ' starting' : ''}`, what);
+    detail.title = it.error || it.objective;
+    li.append(line, detail);
+    if (st === 'run') li.append(el('div', 'board-progress'));
+    return li;
+  }
+  function renderBoard() {
+    const all = [...lanes.values()].filter((it) => !dismissed.has(it.taskId));
+    clearInterval(boardTimer);
+    boardTimer = 0;
+    // The message box closes when its subtask stops running.
+    if (composeFor && lanes.get(composeFor)?.status !== 'running') {
+      composeFor = null;
+      composeInput.value = '';
+      compose.hidden = true;
+    }
+    boardBox.hidden = !all.length;
+    if (!all.length) return boardDyn.replaceChildren();
+    const running = all.filter((it) => it.status === 'running');
+    const n = (s) => all.filter((it) => laneState(it) === s).length;
+    const parts = [[running.length, 'running'], [n('ok'), 'done'], [n('fail'), 'failed'], [n('stop'), 'stopped']].filter(([c]) => c).map(([c, w]) => `${c} ${w}`);
+    const head = el('div', 'board-head');
+    const toggle = button('board-toggle', [icon(boardOpen ? 'chevron-down' : 'chevron-right'), icon(running.length ? 'loading' : 'organization', running.length ? 'codicon-modifier-spin board-icon' : 'board-icon'), el('span', 'board-title', 'Subtasks'), el('span', 'board-count', parts.join(' · '))], () => { boardOpen = !boardOpen; renderBoard(); }, boardOpen ? 'Hide the subtasks' : 'Show the subtasks');
+    toggle.setAttribute('aria-expanded', String(boardOpen));
+    head.append(toggle);
+    const stoppable = running.filter((it) => it.stoppable !== false);
+    if (stoppable.length > 1) head.append(button('btn small secondary', [icon('debug-stop'), 'Stop all'], () => stoppable.forEach((it) => vscode.postMessage({ type: 'stopLane', taskId: it.taskId })), 'Stop every running subtask'));
+    if (!running.length) head.append(button('action', icon('clear-all'), () => { all.forEach((it) => dismissed.add(it.taskId)); renderBoard(); }, 'Hide the finished subtasks'));
+    const bar = el('div', 'todos-bar board-bar');
+    bar.style.setProperty('--done', `${((all.length - running.length) / all.length) * 100}%`);
+    const list = el('ul', 'board-list');
+    list.hidden = !boardOpen;
+    for (const it of all) list.append(boardRow(it));
+    boardDyn.replaceChildren(head, bar, list);
+    if (running.length) {
+      boardTimer = setInterval(() => {
+        for (const t of boardBox.querySelectorAll('.board-time[data-task-id]')) {
+          const it = lanes.get(t.dataset.taskId);
+          if (it) t.textContent = elapsed(it);
+        }
+      }, 1000);
+    }
   }
   // Messages waiting for the running task; each one is sent when the one before it finishes.
   const queueBox = $('queue');
@@ -2526,9 +2702,12 @@
       case 'history':
         log.replaceChildren();
         turn = null; current = null; turnFiles = null;
+        lanes.clear();
+        dismissed.clear();
         replaying = true;
         m.items.forEach(renderItem);
         replaying = false;
+        renderBoard();
         // A tab drawn while its answer streams keeps the last message open for the text still to come.
         if (!m.streaming) current = null;
         welcome();
@@ -2591,7 +2770,13 @@
       case 'questionsDone':
         log.querySelector(`.questions[data-call-id="${CSS.escape(m.callId)}"]`)?.remove();
         break;
+      // From the Agents view: scroll to a subtask's card.
+      case 'jumpLane':
+        if (typeof m.taskId === 'string') jumpToLane(m.taskId);
+        break;
       case 'laneUpdate': {
+        lanes.set(m.item.taskId, m.item);
+        renderBoard();
         const old = log.querySelector(`.lane[data-task-id="${CSS.escape(m.item.taskId)}"]`);
         if (old) {
           const open = old.querySelector('details')?.open;

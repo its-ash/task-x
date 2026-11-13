@@ -191,7 +191,7 @@ type Item =
   | Lane;
 
 /** One subagent: its role, model, live tool steps, and result. */
-type Lane = {
+export type Lane = {
   kind: 'lane';
   taskId: string;
   name: string;
@@ -216,6 +216,9 @@ type Lane = {
   mergeError?: string;
   /** False for Claude Code subagents: the CLI cannot stop one subagent alone. */
   stoppable?: boolean;
+  /** When it started and ended (epoch ms), for the elapsed time on the Subtasks board. */
+  startedMs?: number;
+  endedMs?: number;
 };
 
 type Inbound =
@@ -261,6 +264,7 @@ type Inbound =
   | { type: 'copyOutput'; id: string }
   | { type: 'openOutput'; id: string }
   | { type: 'stopLane'; taskId: string }
+  | { type: 'steerLane'; taskId: string; text: string }
   | { type: 'stopTool'; id: string }
   | { type: 'refine'; text: string }
   | { type: 'applyWorktree'; name: string }
@@ -371,6 +375,11 @@ const blankTab = (items: Item[] = [], taskId?: string): ChatTab => ({ id: `t${Da
 
 /** Chat tabs are always on the strip; a subagent's tab only after its lane card opened it. */
 const onStrip = (t: ChatTab): boolean => t.kind === 'chat' || !!t.shown;
+
+/** A chat tab and its subagents, for the Agents view. */
+export type AgentChat = { tabId: string; title: string; running: boolean; lanes: Lane[] };
+/** What the Agents view can do to one subagent. */
+export type LaneAction = 'show' | 'open' | 'stop' | 'message' | 'retry' | 'apply' | 'discard';
 
 function tabTitle(t: ChatTab): string {
   if (t.kind === 'subagent') return t.title || t.role || 'Subagent';
@@ -865,6 +874,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   private postTabs(): void {
+    // Tabs that close or reset take their subagents off the Agents view.
+    this.lanesChanged.fire();
     const tabs = this.tabs.filter(onStrip).map((t) => ({
       id: t.id,
       kind: t.kind,
@@ -920,6 +931,60 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   dispose(): void {
     clearInterval(this.nightWatch);
     this.cancelAll();
+    this.lanesChanged.dispose();
+  }
+
+  private readonly lanesChanged = new vscode.EventEmitter<void>();
+  /** Fires when a subagent starts, changes, or ends in any chat tab, or a tab's run starts or ends. */
+  readonly onDidChangeLanes = this.lanesChanged.event;
+
+  /** Every chat tab that has subagents, with copies of them (the Agents view). */
+  agentChats(): AgentChat[] {
+    return this.tabs
+      .filter((t) => t.kind === 'chat')
+      .map((t) => ({ tabId: t.id, title: tabTitle(t), running: this.runs.has(t.id), lanes: t.items.filter((i): i is Lane => i.kind === 'lane').map((l) => ({ ...l, steps: [...l.steps] })) }))
+      .filter((c) => c.lanes.length);
+  }
+
+  /** Shows a chat tab in the view, revealing the view first. */
+  private async revealTab(tabId: string): Promise<boolean> {
+    if (!this.tabs.some((t) => t.id === tabId && t.kind === 'chat')) return false;
+    await vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
+    if (this.activeTab !== tabId) {
+      this.chatTabId = tabId;
+      this.showTab(tabId);
+    }
+    return true;
+  }
+
+  /** One action on a subagent of any chat tab (the Agents view). `text` is the message for `message`. */
+  async laneAction(tabId: string, taskId: string, action: LaneAction, text?: string): Promise<void> {
+    const lane = this.tabs.find((t) => t.id === tabId)?.items.find((i): i is Lane => i.kind === 'lane' && i.taskId === taskId);
+    if (!lane) return void vscode.window.showInformationMessage('task-x: that subtask is no longer in its chat.');
+    switch (action) {
+      case 'show':
+        if (await this.revealTab(tabId)) this.post({ type: 'jumpLane', taskId });
+        return;
+      case 'open':
+        if (await this.revealTab(tabId)) this.openSubagent(taskId);
+        return;
+      case 'stop':
+        return this.inTab(tabId, () => this.onMessage({ type: 'stopLane', taskId }));
+      case 'message':
+        if (text?.trim()) await this.inTab(tabId, () => this.onMessage({ type: 'steerLane', taskId, text }));
+        return;
+      case 'apply':
+      case 'discard':
+        if (lane.worktree) await this.inTab(tabId, () => this.settleWorktree(lane.worktree!, action === 'apply'));
+        return;
+      case 'retry': {
+        const why = lane.error ? ` It ended with: ${lane.error.split('\n')[0].slice(0, 300)}` : '';
+        const ask = `Run the subtask "${lane.agent || lane.name}" again.${why}\n\nIts goal: ${lane.objective}`;
+        // A running chat reads it as a steer; an idle one starts a new request.
+        await (this.runs.has(tabId) ? this.inTab(tabId, () => this.steer(ask)) : this.send(ask, undefined, false, [], tabId));
+        return;
+      }
+    }
   }
 
   private async setNightRequest(text: string | undefined): Promise<void> {
@@ -1234,10 +1299,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.items.push(item);
     this.postChat({ type: 'item', item });
     if (item.kind === 'user') this.postTabs();
+    if (item.kind === 'lane') this.lanesChanged.fire();
   }
 
   /** After a tab's task starts or ends: the busy context, the status bar, and the tab strip. */
   private runsChanged(): void {
+    this.lanesChanged.fire();
     void vscode.commands.executeCommand('setContext', 'task-x.busy', this.busy);
     this.onBusyChange?.(this.busy);
     this.refreshStatus();
@@ -1586,6 +1653,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (lane?.status === 'running') await (await this.getClient()).request('agent/cancelSubagent', { taskId: lane.taskId }).catch((e) => this.log('warn', `cancelSubagent: ${describeError(e)}`));
         break;
       }
+      case 'steerLane': {
+        // A message for one running subagent: it joins that subagent's conversation at its next step.
+        const lane = this.lane(m.taskId);
+        const text = typeof m.text === 'string' ? m.text.trim() : '';
+        if (!lane || lane.status !== 'running' || lane.stoppable === false || !text) break;
+        const ok = await (await this.getClient())
+          .request<boolean>('agent/steer', { taskId: lane.taskId, text })
+          .catch((e) => (this.log('warn', `steer subagent: ${describeError(e)}`), false));
+        if (!ok) void vscode.window.showWarningMessage(`task-x: ${lane.agent || lane.name} is not taking messages right now. It may be finishing, or it has 10 unread messages.`);
+        break;
+      }
       case 'applyWorktree':
       case 'discardWorktree':
         if (typeof m.name === 'string') await this.settleWorktree(m.name, m.type === 'applyWorktree');
@@ -1674,6 +1752,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private updateLane(lane: Lane, patch: Partial<Lane>): void {
     Object.assign(lane, patch);
     this.postChat({ type: 'laneUpdate', item: lane });
+    this.lanesChanged.fire();
   }
 
   /**
@@ -2311,7 +2390,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.add({ kind: 'context', text: e.message });
         break;
       case 'subagentStarted':
-        this.add({ kind: 'lane', taskId: e.taskId, name: e.name, role: e.role, agent: e.agent ?? null, objective: e.objective, model: e.model, step: e.step, status: 'running', steps: [], dir: e.dir, stoppable: e.kind !== 'claudeCode' });
+        this.add({ kind: 'lane', taskId: e.taskId, name: e.name, role: e.role, agent: e.agent ?? null, objective: e.objective, model: e.model, step: e.step, status: 'running', steps: [], dir: e.dir, stoppable: e.kind !== 'claudeCode', startedMs: Date.now() });
         this.openSubagentTab(e);
         break;
       case 'subagentFinished': {
@@ -2332,6 +2411,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             added: e.added,
             removed: e.removed,
             worktree: e.worktree,
+            endedMs: Date.now(),
           });
         break;
       }
@@ -2361,6 +2441,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           } else if (inner.type === 'toolFinished') {
             const st = lane.steps.find((x) => x.id === inner.callId);
             if (st) this.updateLane(lane, ((st.ok = inner.ok), {}));
+          } else if (inner.type === 'steered') {
+            // The subagent read the user's message: it shows among its steps.
+            lane.steps.push({ id: `steer-${Date.now()}-${lane.steps.length}`, tool: 'user_message', detail: inner.text, ok: true });
+            if (lane.steps.length > MAX_LANE_STEPS) lane.hidden = (lane.hidden ?? 0) + lane.steps.splice(0, lane.steps.length - MAX_LANE_STEPS).length;
+            this.updateLane(lane, {});
           } else if (inner.type === 'approvalRequested') this.view?.show?.(true);
           break;
         }
@@ -2627,7 +2712,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.add({ kind: 'error', text: describeError(e), retryText: e instanceof RpcError && e.cancelled ? undefined : text });
     } finally {
       off();
-      for (const it of this.items) if (it.kind === 'lane' && it.status === 'running') it.status = 'cancelled';
+      for (const it of this.items) if (it.kind === 'lane' && it.status === 'running') this.updateLane(it, { status: 'cancelled', endedMs: Date.now() });
       for (const t of this.tabs) {
         if (t.parent !== tab || t.status !== 'running') continue;
         t.status = 'cancelled';
@@ -3148,6 +3233,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 <form id="form">
   <div id="tokenBar" class="token-bar" role="status" aria-live="polite" hidden></div>
   <div id="slash" role="listbox" aria-label="Skills" hidden></div>
+  <div id="board" class="board" aria-label="Subtasks" hidden></div>
   <div id="todos" class="todos" aria-label="The agent's plan" hidden></div>
   <div id="queue" class="queue" aria-label="Queued messages" hidden></div>
   <div id="ctx" class="ctx" aria-label="Context sent with the message"></div>

@@ -1,6 +1,8 @@
 import path from 'node:path';
 import * as vscode from 'vscode';
+import { AgentsView } from './agentsView.js';
 import { BackgroundTasks } from './background.js';
+import { SymbolLens } from './codeLens.js';
 import { ChatViewProvider, ORIGINAL_SCHEME, OriginalContent, describeError } from './chatView.js';
 import { runBestOf } from './compareView.js';
 import { parseFindings } from './findings.js';
@@ -470,6 +472,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     status,
     chat,
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewId, chat, { webviewOptions: { retainContextWhenHidden: true } }),
+    new AgentsView(chat),
+    new SymbolLens((text, mode) => chat.submit(text, mode)),
     vscode.commands.registerCommand('task-x.openChat', () => vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`)),
     vscode.commands.registerCommand('task-x.selectProvider', selectProvider),
     vscode.window.registerWebviewViewProvider(LogView.viewId, logs),

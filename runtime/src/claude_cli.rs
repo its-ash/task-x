@@ -3,7 +3,9 @@
 //! comparing indexed contents before and after the run, then recorded in the edit log so they can
 //! be reviewed, kept, or undone like any other agent edit.
 
+use crate::agent::store::{self, Checkpoint, Status, Store, TaskRecord};
 use crate::context::Workspace;
+use crate::provider::{ContentPart, Message, Role};
 use crate::tools::{EditLog, FileChange, edit};
 use regex::Regex;
 use serde::Deserialize;
@@ -21,6 +23,8 @@ use tokio_util::sync::CancellationToken;
 const PERMISSION_MODES: &[&str] = &["default", "acceptEdits", "plan"];
 const TASK_TOOL_PREFIX: &str = "mcp__task-x__";
 const MAX_TOOL_OUTPUT: usize = 120_000;
+/// Tool result text kept per call in the task record (the export cuts it further).
+const MAX_RECORD_OUTPUT: usize = 20_000;
 /// How often waiting steering messages are sent to Claude Code.
 const STEER_POLL: Duration = Duration::from_millis(250);
 /// After a result, stdin closes when Claude Code stays silent this long (it merged the queued messages).
@@ -519,9 +523,37 @@ pub struct Mapper {
     pub results: u32,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// The lead's side of the run (replies, tool calls, tool results) for the task record.
+    pub transcript: Vec<Message>,
 }
 
 impl Mapper {
+    /// Adds a part to the transcript, joining the last message when it has the same role.
+    fn note(&mut self, role: Role, part: ContentPart) {
+        match self.transcript.last_mut() {
+            Some(m) if m.role == role => m.content.push(part),
+            _ => self.transcript.push(Message { role, content: vec![part] }),
+        }
+    }
+
+    fn note_call(&mut self, block: &Value) {
+        let raw = block["name"].as_str().unwrap_or("tool");
+        let name = raw.strip_prefix(TASK_TOOL_PREFIX).unwrap_or(raw).to_owned();
+        let id = block["id"].as_str().unwrap_or_default().to_owned();
+        self.note(Role::Assistant, ContentPart::ToolUse { id, name, input: block["input"].clone() });
+    }
+
+    fn note_result(&mut self, block: &Value) {
+        let id = block["tool_use_id"].as_str().unwrap_or_default().to_owned();
+        let part = ContentPart::ToolResult {
+            tool_name: self.tool_names.get(&id).cloned(),
+            tool_use_id: id,
+            content: clip(&text_of(&block["content"]), MAX_RECORD_OUTPUT),
+            is_error: block["is_error"].as_bool().unwrap_or(false),
+        };
+        self.note(Role::User, part);
+    }
+
     fn tool_started(&mut self, block: &Value) -> Value {
         let id = block["id"].as_str().unwrap_or_default().to_owned();
         // task-x tools show under their own names (read_file, replace_text, …).
@@ -638,6 +670,9 @@ impl Mapper {
                     match block["type"].as_str() {
                         Some("text") => {
                             let Some(t) = block["text"].as_str() else { continue };
+                            if !t.trim().is_empty() {
+                                self.note(Role::Assistant, ContentPart::Text { text: t.to_owned() });
+                            }
                             // Streamed text is not sent twice; what the stream missed is sent now.
                             let rest = match t.strip_prefix(self.streamed.as_str()) {
                                 Some(rest) => {
@@ -658,15 +693,20 @@ impl Mapper {
                             }
                         }
                         Some("tool_use") if block["name"].as_str().is_some_and(|n| SUBAGENT_TOOLS.contains(&n)) => {
+                            self.note_call(block);
                             out.push(self.subagent_started(block));
                         }
-                        Some("tool_use") => out.push(self.tool_started(block)),
+                        Some("tool_use") => {
+                            self.note_call(block);
+                            out.push(self.tool_started(block));
+                        }
                         _ => {}
                     }
                 }
             }
             Some("user") => {
                 for block in v["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
+                    self.note_result(block);
                     let id = block["tool_use_id"].as_str().unwrap_or_default();
                     let Some(bg) = self.subagents.get(id).map(|s| s.background) else {
                         out.push(self.tool_finished(block));
@@ -696,7 +736,8 @@ impl Mapper {
                 self.output_tokens = add(self.output_tokens, usage["output_tokens"].as_u64());
                 self.results += 1;
                 if !self.text_since_result {
-                    if let Some(t) = v["result"].as_str().filter(|t| !t.trim().is_empty()) {
+                    if let Some(t) = v["result"].as_str().filter(|t| !t.trim().is_empty()).map(str::to_owned) {
+                        self.note(Role::Assistant, ContentPart::Text { text: t.clone() });
                         out.push(json!({ "type": "textDelta", "text": t }));
                     }
                 }
@@ -724,6 +765,8 @@ fn snapshot(ws: &RwLock<Option<Workspace>>) -> BTreeMap<String, Arc<str>> {
 
 pub struct Host {
     pub workspace: Arc<RwLock<Option<Workspace>>>,
+    /// Where the run is saved as a task record, for `agent/turns`, `agent/export`, and the history.
+    pub store: Store,
     pub edits: Arc<Mutex<EditLog>>,
     pub seen: Arc<Mutex<HashMap<String, u64>>>,
     pub emit: crate::agent::EmitFn,
@@ -1144,6 +1187,7 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
     let before = snapshot(&host.workspace);
     snap(&root, &p.task_id, format!("Before: {}", p.prompt.trim()), &host).await;
     let started = Instant::now();
+    let started_ms = store::now_ms();
     let exe = std::env::current_exe().ok();
     // Wake-ups of this run: while some are pending, stdin stays open, and each one that fires is
     // sent to Claude Code as a message.
@@ -1417,8 +1461,70 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
         "error": error,
         "sessionId": mapper.session_id,
     });
+    if let Err(e) = save_record(&host.store, &p, started_ms, std::mem::take(&mut mapper.transcript), &summary) {
+        (host.emit)(&p.task_id, json!({ "type": "warning", "message": format!("The chat could not be saved: {e}") }));
+    }
     (host.emit)(&p.task_id, json!({ "type": "done", "summary": summary }));
     Ok(summary)
+}
+
+/// Saves the run in the task's record (made on the first run): the prompt as a new turn with its
+/// checkpoint, then the transcript, and the summary's totals. Claude Code keeps the conversation
+/// itself; the record is what `agent/turns`, `agent/export`, and the history read.
+fn save_record(store: &Store, p: &Params, started_ms: u64, transcript: Vec<Message>, s: &Value) -> std::io::Result<()> {
+    let prompt = p.prompt.trim();
+    let mut r = store.load(&p.task_id).unwrap_or_else(|| TaskRecord {
+        version: store::RECORD_VERSION,
+        id: p.task_id.clone(),
+        title: prompt.lines().next().unwrap_or_default().chars().take(80).collect(),
+        created_ms: started_ms,
+        updated_ms: started_ms,
+        status: Status::Running,
+        chat_mode: Default::default(),
+        provider_kind: "claudeCode".into(),
+        model: String::new(),
+        system: String::new(),
+        messages: Vec::new(),
+        usage: Default::default(),
+        iterations: 0,
+        tool_calls: 0,
+        changed_files: Default::default(),
+        operations: Vec::new(),
+        validations: Vec::new(),
+        final_text: String::new(),
+        error: None,
+        enrichment: None,
+        metrics: Default::default(),
+        skipped_checks: Vec::new(),
+        checkpoints: Vec::new(),
+        forked_from: None,
+    });
+    r.checkpoints.push(Checkpoint { messages: r.messages.len(), operations: r.operations.len(), prompt: prompt.chars().take(200).collect(), created_ms: started_ms });
+    r.messages.push(Message { role: Role::User, content: vec![ContentPart::Text { text: format!("<user_request>\n{prompt}\n</user_request>") }] });
+    r.messages.extend(transcript);
+    r.updated_ms = store::now_ms();
+    r.status = match s["status"].as_str() {
+        Some("completed") => Status::Completed,
+        Some("cancelled") => Status::Cancelled,
+        Some("maxIterations") => Status::MaxIterations,
+        _ => Status::Failed,
+    };
+    r.chat_mode = serde_json::from_value(s["chatMode"].clone()).unwrap_or_default();
+    if let Some(m) = s["model"].as_str() {
+        r.model = m.to_owned();
+    }
+    let add = |sum: Option<u64>, n: Option<u64>| n.map(|n| sum.unwrap_or(0) + n).or(sum);
+    r.usage.input_tokens = add(r.usage.input_tokens, s["usage"]["inputTokens"].as_u64());
+    r.usage.output_tokens = add(r.usage.output_tokens, s["usage"]["outputTokens"].as_u64());
+    r.iterations += s["iterations"].as_u64().unwrap_or(0) as u32;
+    r.tool_calls += s["toolCalls"].as_u64().unwrap_or(0) as u32;
+    r.metrics.model_ms += s["metrics"]["modelMs"].as_u64().unwrap_or(0);
+    r.metrics.cost_usd += s["metrics"]["costUsd"].as_f64().unwrap_or(0.0);
+    r.changed_files.extend(s["changedFiles"].as_array().into_iter().flatten().filter_map(|f| f.as_str().map(str::to_owned)));
+    r.operations.extend(s["operations"].as_array().into_iter().flatten().filter_map(|o| o.as_u64().map(|o| o as usize)));
+    r.final_text = s["text"].as_str().unwrap_or_default().to_owned();
+    r.error = s["error"].as_str().map(str::to_owned);
+    store.save(&r)
 }
 
 #[cfg(test)]
@@ -1451,6 +1557,43 @@ mod tests {
         let late = m.map(r#"{"type":"result","subtype":"success","result":"Also done.","usage":{"input_tokens":30,"output_tokens":7}}"#, "agent");
         assert_eq!(late[0]["text"], "Also done.");
         assert_eq!((m.results, m.input_tokens, m.output_tokens), (2, Some(150), Some(12)), "a steered message adds a result");
+    }
+
+    #[test]
+    fn saves_each_run_as_a_turn_of_the_task_record() {
+        let dir = std::env::temp_dir().join(format!("task-x-claude-record-{}", std::process::id()));
+        let store = Store::new(Some(&dir));
+        let run = |prompt: &str, lines: &[&str], summary: Value| {
+            let mut m = Mapper::default();
+            for l in lines {
+                m.map(l, "agent");
+            }
+            let p: Params = serde_json::from_value(json!({ "prompt": prompt, "taskId": "c1", "cliPath": "/bin/claude" })).unwrap();
+            save_record(&store, &p, 1_000, std::mem::take(&mut m.transcript), &summary).unwrap();
+        };
+        run(
+            "List the files",
+            &[
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Looking"},{"type":"tool_use","id":"t1","name":"mcp__task-x__find_files","input":{}}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"a.txt"}]}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"There is a.txt."}]}}"#,
+                r#"{"type":"result","subtype":"success","result":"There is a.txt."}"#,
+            ],
+            json!({ "status": "completed", "chatMode": "agent", "model": "claude-opus-5-5", "text": "There is a.txt.", "toolCalls": 1, "usage": { "inputTokens": 10, "outputTokens": 2 }, "metrics": { "costUsd": 0.5 } }),
+        );
+        run("Thanks", &[r#"{"type":"result","subtype":"success","result":"You're welcome."}"#], json!({ "status": "completed", "chatMode": "ask", "text": "You're welcome.", "usage": { "inputTokens": 5 }, "metrics": { "costUsd": 0.25 } }));
+        let r = store.load("c1").expect("the run is saved");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((r.title.as_str(), r.provider_kind.as_str(), r.model.as_str()), ("List the files", "claudeCode", "claude-opus-5-5"));
+        let turns = crate::agent::export::turns(&r);
+        assert_eq!(turns.iter().map(|t| t.prompt.as_str()).collect::<Vec<_>>(), ["List the files", "Thanks"]);
+        // Turn 1: prompt, reply with the call, its result, the final text; turn 2: prompt and reply.
+        assert_eq!(r.messages.len(), 6);
+        assert!(matches!(&r.messages[1].content[1], ContentPart::ToolUse { name, .. } if name == "find_files"));
+        assert!(matches!(&r.messages[2].content[0], ContentPart::ToolResult { content, tool_name: Some(n), .. } if content == "a.txt" && n == "find_files"));
+        assert_eq!(r.messages[5].text(), "You're welcome.");
+        assert_eq!((r.usage.input_tokens, r.usage.output_tokens, r.tool_calls, r.metrics.cost_usd), (Some(15), Some(2), 1, 0.75));
+        assert_eq!((r.status, r.chat_mode, r.final_text.as_str()), (Status::Completed, crate::agent::ChatMode::Ask, "You're welcome."));
     }
 
     #[test]

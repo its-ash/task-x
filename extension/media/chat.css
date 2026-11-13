@@ -307,7 +307,11 @@ body[data-view="history"] #log, body[data-view="history"] #changes, body[data-vi
 .term-head .codicon { color: #a3a3a3; }
 .term-head .action { color: #a3a3a3; }
 .term-head .action:hover:not(:disabled) { color: #fafafa; background: rgb(255 255 255 / .08); }
-.term-body { margin: 0; padding: 10px 12px; min-height: 40px; max-height: 260px; overflow: auto; resize: vertical; font-family: var(--mono); font-size: 12px; line-height: 1.5; white-space: pre; color: #e5e5e5; background: #111; }
+/* Long lines wrap, so it only scrolls up and down. Ten lines show; Expand shows up to most of the view. */
+.term-body { --lines: 10; margin: 0; padding: 10px 12px; min-height: 40px; max-height: calc(var(--lines) * 1.5em + 20px); overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; font-family: var(--mono); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; color: #e5e5e5; background: #111; }
+.term.full .term-body { max-height: 70vh; }
+.term-head .term-expand { display: none; }
+.term.long .term-head .term-expand { display: inline-flex; }
 .term-body::selection { color: #fff; background: rgb(96 165 250 / .45); }
 .term-body:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .term.running .term-body { color: #8a8a8a; font-style: italic; }
@@ -840,6 +844,56 @@ textarea::placeholder { color: var(--on-surface-variant); }
 .todos-bar { height: 4px; margin: 2px 4px 4px; border-radius: 999px; background: linear-gradient(to right, var(--ok) var(--done, 0%), color-mix(in srgb, var(--fg) 10%, transparent) var(--done, 0%)); }
 .todos-list { display: grid; gap: 2px; max-height: 30vh; margin: 0; padding: 0 4px; overflow-y: auto; list-style: none; }
 .todos-list[hidden] { display: none; }
+
+/* Subtasks board, docked above the input: one row per subtask of this chat. */
+.board { margin: 0 4px 8px; padding: 4px 6px 6px; border-radius: 14px; background: var(--surface-high); }
+.board[hidden] { display: none; }
+.board-head { display: flex; align-items: center; gap: 4px; }
+.board-toggle { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; padding: 4px; border: 0; border-radius: 10px; font-size: 12px; text-align: left; color: var(--on-surface); background: none; cursor: pointer; }
+.board-toggle:hover { background: color-mix(in srgb, var(--fg) var(--md-state-hover), transparent); }
+.board-icon { color: var(--accent); }
+.board-title { font-weight: 600; }
+.board-count { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--on-surface-variant); }
+.board-list { display: grid; gap: 2px; max-height: 30vh; margin: 0; padding: 0 2px; overflow-y: auto; overscroll-behavior: contain; list-style: none; }
+.board-list[hidden] { display: none; }
+.board-row { --role: var(--accent); position: relative; padding: 3px 4px 4px; border-radius: 8px; font-size: 12px; overflow: hidden; }
+.board-row[data-role=research] { --role: var(--role-research); }
+.board-row[data-role=implementation] { --role: var(--role-implementation); }
+.board-row[data-role=testing] { --role: var(--role-testing); }
+.board-row[data-role=review] { --role: var(--role-review); }
+.board-row[data-role=documentation] { --role: var(--role-documentation); }
+.board-row:hover { background: color-mix(in srgb, var(--fg) var(--md-state-hover), transparent); }
+.board-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.board-line .spacer { flex: 1; }
+.board-main { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0; border: 0; font: inherit; text-align: left; color: var(--on-surface); background: none; cursor: pointer; }
+.board-state { flex: none; }
+.board-row[data-state=run] .board-state { color: var(--role); }
+.board-row[data-state=ok] .board-state { color: var(--ok); }
+.board-row[data-state=fail] .board-state { color: var(--bad); }
+.board-row[data-state=stop] .board-state { color: var(--warn); }
+.board-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.board-model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 10.5px; color: var(--on-surface-variant); }
+.board-meta, .board-time { flex: none; font-size: 11px; color: var(--on-surface-variant); font-variant-numeric: tabular-nums; }
+.board-acts { display: inline-flex; flex: none; gap: 0; }
+.board-acts .action { width: 22px; height: 22px; }
+.board-detail { margin: 1px 0 0 20px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11px; color: var(--on-surface-variant); }
+.board-row[data-state=fail] .board-detail { font-family: inherit; color: var(--bad); }
+.board-detail.starting { font-family: inherit; font-style: italic; }
+.board-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--role) 40%, var(--role) 60%, transparent); background-size: 50% 100%; background-repeat: no-repeat; animation: board-progress 1.4s var(--md-motion-standard) infinite; }
+@keyframes board-progress { from { background-position: -50% 0; } to { background-position: 150% 0; } }
+.board-bar { margin: 2px 4px 4px; }
+.board-acts .action.on { color: var(--accent); background: var(--accent-soft); }
+.board-compose { display: flex; align-items: center; gap: 6px; margin: 6px 2px 0; padding: 2px 2px 2px 8px; border: 1px solid var(--accent); border-radius: 10px; background: var(--surface); }
+.board-compose[hidden] { display: none; }
+.board-to { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; color: var(--accent); }
+.board-input { flex: 1; min-width: 0; padding: 4px 0; border: 0; outline: none; font: inherit; font-size: 12px; color: var(--on-surface); background: transparent; }
+/* Inline card: the live line under the goal, and a flash when the board jumps to it. */
+.lane-now { display: flex; align-items: center; gap: 6px; min-width: 0; margin-top: 4px; font-family: var(--mono); font-size: 11px; color: var(--on-surface-variant); }
+.lane-now > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lane-now .codicon { flex: none; color: var(--role); }
+.lane.flash { animation: lane-flash 1.2s ease-out; }
+@keyframes lane-flash { 0%, 30% { box-shadow: 0 0 0 2px var(--role); } 100% { box-shadow: 0 0 0 2px transparent; } }
+@media (prefers-reduced-motion: reduce) { .board-progress, .lane.flash { animation: none; } }
 .todo { display: flex; align-items: flex-start; gap: 8px; padding: 3px 4px; font-size: 12px; line-height: 1.45; color: var(--on-surface); }
 .todo .codicon { flex: none; margin-top: 2px; font-size: 13px; color: var(--on-surface-variant); }
 .todo.in_progress { font-weight: 600; }

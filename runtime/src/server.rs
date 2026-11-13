@@ -53,6 +53,9 @@ struct TimelineParams {
     against: Option<String>,
 }
 
+/// The error of `agent/turns` and `agent/export` for a task with no saved record.
+const NOT_SAVED: &str = "unknown task: this chat has no saved conversation yet. Send a message in it, then try again.";
+
 /// `agent/export`: the task, where to write the page (default `.task-x/exports/…`), and which
 /// turns (1-based, inclusive; default all). `agent/turns` takes only `taskId`.
 #[derive(Deserialize)]
@@ -1164,7 +1167,7 @@ impl Server {
     /// `{ taskId, path, bytes, from, to, turns }`.
     async fn export(&self, p: Value) -> Result<Value, RpcError> {
         let p: ExportParams = params(p)?;
-        let rec = self.store.read().expect("store lock").load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "unknown task"))?;
+        let rec = self.store.read().expect("store lock").load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, NOT_SAVED))?;
         let (root, edits) = (self.root(), self.edits.clone());
         let range = agent::export::Range { from: p.from, to: p.to };
         let (path, bytes, span) = tokio::task::spawn_blocking(move || {
@@ -1189,7 +1192,7 @@ impl Server {
     /// `agent/turns { taskId }`: the turns an export can start and end at → `{ taskId, turns: Turn[] }`.
     fn turns(&self, p: Value) -> Result<Value, RpcError> {
         let p: ExportParams = params(p)?;
-        let rec = self.store.read().expect("store lock").load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "unknown task"))?;
+        let rec = self.store.read().expect("store lock").load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, NOT_SAVED))?;
         Ok(json!({ "taskId": p.task_id, "turns": agent::export::turns(&rec) }))
     }
 
@@ -1317,6 +1320,7 @@ impl Server {
         let agent_host = self.host();
         let host = crate::claude_cli::Host {
             workspace: self.workspace.clone(),
+            store: self.store.read().expect("store lock").clone(),
             edits: self.edits.clone(),
             seen: self.seen.clone(),
             emit: Arc::new(move |task, event| out.send(rpc::notification("agent/event", json!({ "taskId": task, "event": event })))),

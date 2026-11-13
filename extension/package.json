@@ -43,6 +43,13 @@
           "type": "webview",
           "id": "task-x.chat",
           "name": "Chat"
+        },
+        {
+          "type": "tree",
+          "id": "task-x.agents",
+          "name": "Agents",
+          "icon": "$(organization)",
+          "visibility": "collapsed"
         }
       ],
       "task-x-logs": [
@@ -53,7 +60,67 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "task-x.agents",
+        "contents": "No subtasks yet. When the agent splits work into subtasks (Team mode, or a run_subagent call), every chat's subtasks show here, live."
+      }
+    ],
     "commands": [
+      {
+        "command": "task-x.agents.refresh",
+        "title": "Refresh",
+        "category": "task-x Agents",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "task-x.agents.stopAll",
+        "title": "Stop All Subtasks",
+        "category": "task-x Agents",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "task-x.agents.show",
+        "title": "Show in Chat",
+        "category": "task-x Agents",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "task-x.agents.open",
+        "title": "Open Activity",
+        "category": "task-x Agents",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "task-x.agents.message",
+        "title": "Send a Message…",
+        "category": "task-x Agents",
+        "icon": "$(comment)"
+      },
+      {
+        "command": "task-x.agents.stop",
+        "title": "Stop",
+        "category": "task-x Agents",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "task-x.agents.retry",
+        "title": "Retry",
+        "category": "task-x Agents",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "task-x.agents.apply",
+        "title": "Apply Worktree",
+        "category": "task-x Agents",
+        "icon": "$(check)"
+      },
+      {
+        "command": "task-x.agents.discard",
+        "title": "Discard Worktree",
+        "category": "task-x Agents",
+        "icon": "$(trash)"
+      },
       {
         "command": "task-x.openChat",
         "title": "Open Chat",
@@ -480,6 +547,83 @@
           "command": "task-x.showGraph",
           "when": "view == task-x.chat",
           "group": "navigation@5"
+        },
+        {
+          "command": "task-x.agents.stopAll",
+          "when": "view == task-x.agents && task-x.agentsRunning",
+          "group": "navigation@1"
+        },
+        {
+          "command": "task-x.agents.refresh",
+          "when": "view == task-x.agents",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "task-x.agents.message",
+          "when": "view == task-x.agents && viewItem =~ /:msg/",
+          "group": "inline@1"
+        },
+        {
+          "command": "task-x.agents.stop",
+          "when": "view == task-x.agents && viewItem =~ /:stop/",
+          "group": "inline@2"
+        },
+        {
+          "command": "task-x.agents.retry",
+          "when": "view == task-x.agents && viewItem =~ /:retry/",
+          "group": "inline@3"
+        },
+        {
+          "command": "task-x.agents.apply",
+          "when": "view == task-x.agents && viewItem =~ /:merge/",
+          "group": "inline@4"
+        },
+        {
+          "command": "task-x.agents.discard",
+          "when": "view == task-x.agents && viewItem =~ /:merge/",
+          "group": "inline@5"
+        },
+        {
+          "command": "task-x.agents.open",
+          "when": "view == task-x.agents && viewItem =~ /^lane/",
+          "group": "inline@6"
+        },
+        {
+          "command": "task-x.agents.show",
+          "when": "view == task-x.agents && viewItem =~ /^lane/",
+          "group": "1_open@1"
+        },
+        {
+          "command": "task-x.agents.open",
+          "when": "view == task-x.agents && viewItem =~ /^lane/",
+          "group": "1_open@2"
+        },
+        {
+          "command": "task-x.agents.message",
+          "when": "view == task-x.agents && viewItem =~ /:msg/",
+          "group": "2_act@1"
+        },
+        {
+          "command": "task-x.agents.stop",
+          "when": "view == task-x.agents && viewItem =~ /:stop/",
+          "group": "2_act@2"
+        },
+        {
+          "command": "task-x.agents.retry",
+          "when": "view == task-x.agents && viewItem =~ /:retry/",
+          "group": "2_act@3"
+        },
+        {
+          "command": "task-x.agents.apply",
+          "when": "view == task-x.agents && viewItem =~ /:merge/",
+          "group": "3_merge@1"
+        },
+        {
+          "command": "task-x.agents.discard",
+          "when": "view == task-x.agents && viewItem =~ /:merge/",
+          "group": "3_merge@2"
         }
       ],
       "webview/context": [
@@ -492,6 +636,34 @@
       "commandPalette": [
         {
           "command": "task-x.copySelection",
+          "when": "false"
+        },
+        {
+          "command": "task-x.agents.show",
+          "when": "false"
+        },
+        {
+          "command": "task-x.agents.open",
+          "when": "false"
+        },
+        {
+          "command": "task-x.agents.message",
+          "when": "false"
+        },
+        {
+          "command": "task-x.agents.stop",
+          "when": "false"
+        },
+        {
+          "command": "task-x.agents.retry",
+          "when": "false"
+        },
+        {
+          "command": "task-x.agents.apply",
+          "when": "false"
+        },
+        {
+          "command": "task-x.agents.discard",
           "when": "false"
         },
         {
@@ -1074,6 +1246,11 @@
             ]
           },
           "markdownDescription": "Prices in US dollars per million tokens, matched by model id prefix, for example `[{ \"model\": \"gpt-5\", \"inputPerMtok\": 1.25, \"outputPerMtok\": 10 }]`. They override the built-in Anthropic prices. Local models cost nothing. Without a price, the summary shows the tokens as unpriced."
+        },
+        "task-x.codeLens.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show **Explain**, **Write tests**, and **Fix N problems** links above functions, methods, and classes in workspace files. Each sends a request about that symbol to the chat."
         },
         "task-x.notifications": {
           "type": "string",

@@ -4301,6 +4301,34 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// A message for a running subagent (`agent/steer` with its task id) joins its own conversation.
+    #[tokio::test]
+    async fn a_running_subagent_takes_steering_messages() {
+        let root = git_repo(&[("a.txt", "x\n")]);
+        let (base, seen) = mock(vec![
+            sse_tool("s1", "run_subagent", json!({ "role": "research", "objective": "read a.txt", "name": "look" })),
+            sse_tool("r1", "read_file", json!({ "path": "a.txt" })),
+            sse_text("a.txt holds x."),
+            sse_text("Done."),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut h = host(&root, ApprovalDecision::Allow, events.clone());
+        let (steers, inner) = (h.steers.clone(), h.emit.clone());
+        h.emit = Arc::new(move |task, ev| {
+            if ev["type"] == "subagent" && ev["event"]["type"] == "toolStarted" {
+                let child = ev["taskId"].as_str().unwrap_or_default().to_owned();
+                assert!(steer(&steers, &child, "also count the lines").unwrap(), "the running subagent takes the message");
+            }
+            inner(task, ev);
+        });
+        let r = run(h, params(&base, ChatMode::Agent, Mode::AskBeforeEdit), CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        assert!(seen.lock().unwrap()[2].to_string().contains("also count the lines"), "the subagent's next model call has it");
+        assert!(!seen.lock().unwrap()[3].to_string().contains("also count the lines"), "the lead never sees it");
+        assert!(events.lock().unwrap().iter().any(|e| e["type"] == "subagent" && e["event"]["type"] == "steered"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
     /// A model that writes "Research" (or "docs", "qa") must still get a subagent, not a failed call.
     #[tokio::test]
     async fn a_subagent_role_is_read_however_the_model_spells_it() {
