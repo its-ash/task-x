@@ -53,13 +53,30 @@ struct TimelineParams {
     against: Option<String>,
 }
 
-/// `agent/export`: the task, and where to write the page (default `.task-x/exports/…`).
+/// `agent/export`: the task, where to write the page (default `.task-x/exports/…`), and which
+/// turns (1-based, inclusive; default all). `agent/turns` takes only `taskId`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ExportParams {
     task_id: String,
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    from: Option<usize>,
+    #[serde(default)]
+    to: Option<usize>,
+}
+
+/// `tools/approvals { policy }` and `tools/setApproval { policy, tool, choice }`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApprovalParams {
+    #[serde(default)]
+    policy: agent::policy::PolicyConfig,
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
+    choice: Option<agent::approvals::Choice>,
 }
 
 /// `plugins/install`, `plugins/uninstall`, `plugins/update`, and the marketplace methods.
@@ -522,6 +539,13 @@ impl Server {
             }
             "provider/capabilities" => self.reply(&id, Ok(provider::capability_table())),
             "tools/list" => self.reply(&id, Ok(json!(tools::infos()))),
+            "tools/setApproval" => self.reply(
+                &id,
+                params::<ApprovalParams>(msg.params).and_then(|p| {
+                    let (tool, choice) = p.tool.zip(p.choice).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "give tool and choice (allow, ask, or deny)"))?;
+                    agent::approvals::set(&p.policy, &tool, choice).map(|e| json!(e)).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))
+                }),
+            ),
             "agent/tasks" => self.reply(&id, Ok(json!(self.store.read().expect("store lock").list(100)))),
             "agent/task" => self.reply(&id, self.get_task(msg.params)),
             "agent/checkpoints" => self.reply(&id, self.with_record(msg.params, |r| Ok(agent::session::checkpoints(&r)))),
@@ -630,6 +654,8 @@ impl Server {
             | "timeline/diff"
             | "timeline/restore"
             | "agent/export"
+            | "agent/turns"
+            | "tools/approvals"
             | "mcp/status" => self.spawn(id, key, method, msg.params),
             _ => self.reply(&id, Err(RpcError::new(rpc::METHOD_NOT_FOUND, format!("unknown method: {method}")))),
         }
@@ -740,6 +766,7 @@ impl Server {
                 "agent/compact" => this.compact_task(p).await,
                 m if m.starts_with("timeline/") => this.timeline(m, p).await,
                 "agent/export" => this.export(p).await,
+                "agent/turns" => this.turns(p),
                 m if m.starts_with("plugins/") => this.plugin_op(m, p, &token).await,
                 "worktrees/apply" | "worktrees/discard" => this.worktree(method == "worktrees/apply", p).await,
                 "edits/undo" => this.undo(p).await,
@@ -747,6 +774,7 @@ impl Server {
                 "mcp/configure" => this.configure_mcp(p).await,
                 "claude/run" => this.run_claude(p, &token).await,
                 "mcp/status" => Ok(this.mcp.read().await.status()),
+                "tools/approvals" => this.approvals(p).await,
                 "mcp/authorize" => this.mcp_authorize(p, &token).await,
                 "mcp/catalog" => Ok(this.mcp.read().await.catalog()),
                 "docs/add" => this.docs_add(p, &token).await,
@@ -1106,19 +1134,37 @@ impl Server {
         }
     }
 
-    /// `agent/export { taskId, path? }`: the task as one HTML file → `{ taskId, path, bytes }`.
+    /// `agent/export { taskId, path?, from?, to? }`: those turns of the task as one HTML file →
+    /// `{ taskId, path, bytes, from, to, turns }`.
     async fn export(&self, p: Value) -> Result<Value, RpcError> {
         let p: ExportParams = params(p)?;
         let rec = self.store.read().expect("store lock").load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "unknown task"))?;
         let (root, edits) = (self.root(), self.edits.clone());
-        let (path, bytes) = tokio::task::spawn_blocking(move || {
+        let range = agent::export::Range { from: p.from, to: p.to };
+        let (path, bytes, span) = tokio::task::spawn_blocking(move || {
             let log = edits.lock().expect("edit log lock");
-            agent::export::export_task(&rec, &log, root.as_deref(), p.path.as_deref())
+            agent::export::export_task(&rec, &log, root.as_deref(), p.path.as_deref(), range)
         })
         .await
         .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e.to_string()))?
         .map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?;
-        Ok(json!({ "taskId": p.task_id, "path": path, "bytes": bytes }))
+        Ok(json!({ "taskId": p.task_id, "path": path, "bytes": bytes, "from": span.from, "to": span.to, "turns": span.total }))
+    }
+
+    /// `tools/approvals { policy }`: every tool (task-x's own and each running MCP server's) with
+    /// what that policy and this session's approvals decide → `{ tools, servers }`.
+    async fn approvals(&self, p: Value) -> Result<Value, RpcError> {
+        let p: ApprovalParams = params(p)?;
+        let mcp = self.mcp.read().await.tools();
+        let grants = self.grants.lock().expect("grants lock").clone();
+        Ok(json!(agent::approvals::list(&p.policy, &grants, &mcp)))
+    }
+
+    /// `agent/turns { taskId }`: the turns an export can start and end at → `{ taskId, turns: Turn[] }`.
+    fn turns(&self, p: Value) -> Result<Value, RpcError> {
+        let p: ExportParams = params(p)?;
+        let rec = self.store.read().expect("store lock").load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "unknown task"))?;
+        Ok(json!({ "taskId": p.task_id, "turns": agent::export::turns(&rec) }))
     }
 
     /// `memory/search { query, limit? }` and `memory/forget { id }` on the workspace memory.

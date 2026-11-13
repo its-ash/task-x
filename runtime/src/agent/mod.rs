@@ -2,6 +2,7 @@
 //! results back to the model → … until the model finishes or a limit stops it.
 
 pub mod agents;
+pub mod approvals;
 pub mod session;
 pub mod compact;
 pub mod cost;
@@ -3659,12 +3660,12 @@ mod tests {
         assert_eq!(r2["backup"], snaps[1].id.as_str(), "nothing changed since the last snapshot: it is the way back");
 
         let log = h.edits.lock().unwrap();
-        let (path, bytes) = export::export_task(&r, &log, Some(&root), None).unwrap();
+        let (path, bytes, _) = export::export_task(&r, &log, Some(&root), None, export::Range::default()).unwrap();
         assert!(path.starts_with(root.join(export::EXPORT_DIR)) && bytes > 0, "{}", path.display());
         let html = std::fs::read_to_string(&path).unwrap();
         assert!(html.contains("Changed the greeting to <strong>hello</strong>."));
-        assert!(html.contains("<b>replace_text</b> greet.txt") && html.contains("Changed files (1)"));
-        let tail = &html[html.find("<h2>Timeline").unwrap_or(0)..];
+        assert!(html.contains("<span class=\"tool-name\">replace_text</span><span class=\"hint\">greet.txt</span>") && html.contains("Changed files <span class=\"count\">1</span>"));
+        let tail = &html[html.find("<h2 id=\"timeline\">").unwrap_or(0)..];
         assert!(html.contains("<b>Step 1</b> · After: replace_text") && html.contains("greet.txt (modified)"), "the timeline is in the page: {tail}");
         std::fs::remove_dir_all(root).ok();
     }

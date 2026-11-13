@@ -48,7 +48,7 @@ Options:
   --quiet                   Print only the final answer
   --watch                   Index file changes while the session runs (chat)
 
-In chat: /exit, /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], /timeline, /restore <step>, /export [file.html], and every skill and command (/init, /review, ...).";
+In chat: /exit, /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], /timeline, /restore <step>, /export [turns] [file.html] (asks for the start and end turn; or give 2-5), /approvals, /allow|/ask|/deny <tool or server>, and every skill and command (/init, /review, ...).";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
@@ -270,6 +270,60 @@ impl SleepLine {
     }
 }
 
+/// Longest `<kbd>…` held back while waiting for its `</kbd>`; past it the text goes out as it is.
+const KEY_HOLD: usize = 48;
+
+/// Shows `<kbd>Cmd</kbd>` in the streamed answer as a key (reverse video on a terminal, `[Cmd]`
+/// in a pipe) and `<br>` as a line break. A tag cut between two pieces of the stream waits for
+/// the next piece.
+#[derive(Default)]
+struct InlineKeys {
+    carry: String,
+}
+
+impl InlineKeys {
+    fn push(&mut self, piece: &str) -> String {
+        let mut text = std::mem::take(&mut self.carry);
+        text.push_str(piece);
+        self.carry = text.split_off(held_from(&text));
+        keys(&text, color_out())
+    }
+
+    fn flush(&mut self) -> String {
+        keys(&std::mem::take(&mut self.carry), color_out())
+    }
+}
+
+/// Where an unfinished tag at the end of `text` starts (`text.len()` when there is none).
+fn held_from(text: &str) -> usize {
+    let lower = text.to_ascii_lowercase();
+    if let Some(i) = lower.rfind("<kbd>").filter(|i| !lower[*i..].contains("</kbd>") && text.len() - i <= KEY_HOLD) {
+        return i;
+    }
+    match text.rfind('<') {
+        // `<`, `<k`, `</kb`: the start of a tag; `a < b` is just text.
+        Some(i) if text.len() - i <= 7 && text[i + 1..].chars().all(|c| c.is_ascii_alphabetic() || c == '/') => i,
+        _ => text.len(),
+    }
+}
+
+/// Colour on standard output (where the answer goes), unless `NO_COLOR` is set.
+fn color_out() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()));
+    *ON
+}
+
+fn keys(text: &str, color: bool) -> String {
+    static KBD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)<kbd>([^<\n]{1,40})</kbd>").expect("kbd regex"));
+    static BR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)<br\s*/?>").expect("br regex"));
+    if !text.contains('<') {
+        return text.to_owned();
+    }
+    let text = BR.replace_all(text, "\n");
+    KBD.replace_all(&text, |c: &regex::Captures| if color { format!("\x1b[7m {} \x1b[0m", &c[1]) } else { format!("[{}]", &c[1]) }).into_owned()
+}
+
 /// `30m` from now until `ms` (epoch milliseconds).
 fn until(ms: &Value) -> String {
     let left = ms.as_u64().unwrap_or(0).saturating_sub(agent::store::now_ms());
@@ -379,6 +433,57 @@ fn ask_terminal(req: &AskRequest) -> Option<Answers> {
     Some(a)
 }
 
+/// `/export [range] [file.html]`: a range is `3`, `2-5`, `2-` (to the end), or `-4` (from the
+/// start); `all` is every turn. Either part may come first.
+fn export_args(arg: &str) -> Result<(Option<agent::export::Range>, Option<String>), String> {
+    let (mut range, mut path) = (None, None);
+    for word in arg.split_whitespace() {
+        let num = |s: &str| if s.is_empty() { Ok(None) } else { s.parse::<usize>().map(Some).map_err(|_| format!("'{word}' is not a turn range (use 3, 2-5, 2-, or -4)")) };
+        if word.eq_ignore_ascii_case("all") {
+            range = Some(agent::export::Range::default());
+        } else if word.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '–') && word.chars().any(|c| c.is_ascii_digit()) {
+            let r = match word.split_once(['-', '–']) {
+                Some((a, b)) => agent::export::Range { from: num(a)?, to: num(b)? },
+                None => agent::export::Range { from: num(word)?, to: num(word)? },
+            };
+            range = Some(r);
+        } else if path.is_none() {
+            path = Some(word.to_owned());
+        } else {
+            return Err("use /export [range] [file.html]".into());
+        }
+    }
+    Ok((range, path))
+}
+
+/// Lists the turns and asks where the export starts and ends; Enter keeps the first and the last.
+fn pick_turns(turns: &[agent::export::Turn]) -> Result<agent::export::Range, String> {
+    let width = turns.iter().map(|t| t.prompt.chars().count()).max().unwrap_or(0).clamp(10, 60);
+    eprintln!("Turns in this task:");
+    for t in turns {
+        let p: String = if t.prompt.chars().count() > width { format!("{}…", t.prompt.chars().take(width - 1).collect::<String>()) } else { t.prompt.clone() };
+        eprintln!("  {:>3}  {p:<width$}  {}", t.n, paint(DIM, &agent::export::date(t.created_ms)));
+    }
+    let last = turns.len();
+    let ask = |q: &str, default: usize| -> Result<usize, String> {
+        eprint!("{q} [{default}]: ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(default);
+        }
+        line.parse::<usize>().ok().filter(|n| (1..=last).contains(n)).ok_or_else(|| format!("give a turn from 1 to {last}"))
+    };
+    let from = ask("Start at turn", 1)?;
+    let to = ask("End at turn", last)?;
+    if from > to {
+        return Err(format!("the end ({to}) comes before the start ({from})"));
+    }
+    Ok(agent::export::Range { from: Some(from), to: Some(to) })
+}
+
 struct Session {
     host: Host,
     options: Options,
@@ -422,6 +527,7 @@ impl Session {
         // The sleeping line animates on a real terminal only; logs and pipes get one static line.
         let animate = !quiet && std::io::stderr().is_terminal() && std::env::var("TERM").map_or(true, |t| t != "dumb");
         let sleep_line = Arc::new(SleepLine::default());
+        let keys = Mutex::new(InlineKeys::default());
         let host = Host {
             providers: Providers::new().map_err(|e| e.message)?,
             workspace: Arc::new(RwLock::new(Some(ws))),
@@ -437,11 +543,21 @@ impl Session {
                 if ev["type"] == "done" {
                     sleep_line.stop();
                 }
+                let delta = ev["type"] == "textDelta";
+                if !delta {
+                    // Any other event ends the answer text: what waited for a closing tag goes out first.
+                    let rest = keys.lock().expect("keys lock").flush();
+                    if !rest.is_empty() {
+                        print!("{rest}");
+                        let _ = std::io::stdout().flush();
+                    }
+                }
                 if let Some((err, text)) = render(&ev, emit_quiet) {
                     sleep_line.stop();
                     if err {
                         eprint!("{text}");
                     } else {
+                        let text = if delta { keys.lock().expect("keys lock").push(&text) } else { text };
                         print!("{text}");
                         let _ = std::io::stdout().flush();
                     }
@@ -478,14 +594,7 @@ impl Session {
             images: Vec::new(),
             provider: self.provider.clone(),
             chat_mode: o.mode,
-            policy: PolicyConfig {
-                mode: if o.read_only { Mode::ReadOnly } else { Mode::Autonomous },
-                allow: o.allow.clone(),
-                deny: o.deny.clone(),
-                allow_all: false,
-                edit_mode: (!o.read_only).then_some(o.edit),
-                sandboxed: None,
-            },
+            policy: self.policy(),
             editor: Default::default(),
             limits: Limits { max_iterations: o.max_turns.unwrap_or(60).clamp(1, 500), lazy_tools: true, ..Default::default() },
             task_id: self.task_id.clone(),
@@ -501,6 +610,87 @@ impl Session {
         let rec = agent::run(self.host.clone(), p, CancellationToken::new()).await?;
         self.task_id = Some(rec.id.clone());
         Ok(rec)
+    }
+
+    fn policy(&self) -> PolicyConfig {
+        let o = &self.options;
+        PolicyConfig {
+            mode: if o.read_only { Mode::ReadOnly } else { Mode::Autonomous },
+            allow: o.allow.clone(),
+            deny: o.deny.clone(),
+            allow_all: false,
+            edit_mode: (!o.read_only).then_some(o.edit),
+            sandboxed: None,
+        }
+    }
+
+    /// `/approvals`: the MCP servers with each tool's decision, and task-x's tools that ask or are refused.
+    async fn approvals(&self) -> String {
+        use agent::approvals::Why;
+        use agent::policy::Decision;
+        let mcp = self.host.mcp.read().await.tools();
+        let grants = self.host.grants.lock().expect("grants lock").clone();
+        let a = agent::approvals::list(&self.policy(), &grants, &mcp);
+        let word = |d: Decision| match d {
+            Decision::Allow => paint("32", "allow"),
+            Decision::Ask => paint("33", "ask  "),
+            Decision::Deny => paint("31", "deny "),
+        };
+        let line = |t: &agent::approvals::ToolApproval| {
+            let why = match (t.why, &t.rule) {
+                (Why::Denied, Some(r)) => format!("  (deny list: {r})"),
+                (Why::Allowed, Some(r)) => format!("  (allow list: {r})"),
+                (Why::Session, _) => "  (allowed for this session)".into(),
+                _ => String::new(),
+            };
+            format!("    {} {}{}", word(t.decision), t.tool, paint(DIM, &why))
+        };
+        let own: Vec<_> = a.tools.iter().filter(|t| t.server.is_none()).collect();
+        let notable: Vec<_> = own.iter().filter(|t| t.decision != Decision::Allow || t.why != Why::Mode).collect();
+        let mut out = format!("task-x tools: {} of {} run without asking.\n", own.iter().filter(|t| t.decision == Decision::Allow).count(), own.len());
+        out.extend(notable.iter().map(|t| line(t) + "\n"));
+        if a.servers.is_empty() {
+            out.push_str("No MCP server is running.\n");
+        }
+        for s in &a.servers {
+            out.push_str(&format!(
+                "\n{} ({}): {} allowed, {} ask, {} refused\n",
+                s.name,
+                s.pattern,
+                s.allowed,
+                s.asks,
+                s.denied
+            ));
+            out.extend(a.tools.iter().filter(|t| t.server.as_deref() == Some(s.name.as_str())).map(|t| line(t) + "\n"));
+        }
+        out + "\n/allow, /ask, or /deny <tool or server> changes it for this session (use --allow and --deny to start with them)."
+    }
+
+    /// `/allow`, `/ask`, `/deny <name>`: a server name stands for all its tools, and a tool's short
+    /// name for its full one when only one server has it.
+    async fn set_approval(&mut self, choice: agent::approvals::Choice, arg: &str) -> Result<String, String> {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            return Err("give a tool or a server name (see /approvals)".into());
+        }
+        let mcp = self.host.mcp.read().await.tools();
+        let short: Vec<_> = mcp.iter().filter(|t| t.name == arg).collect();
+        let name = if mcp.iter().any(|t| t.server == arg) {
+            agent::approvals::server_pattern(arg)
+        } else if let [one] = short.as_slice() {
+            one.qualified.clone()
+        } else {
+            arg.to_owned()
+        };
+        let e = agent::approvals::set(&self.policy(), &name, choice)?;
+        (self.options.allow, self.options.deny) = (e.allow, e.deny);
+        let did = match choice {
+            agent::approvals::Choice::Allow => "runs without asking",
+            agent::approvals::Choice::Ask => "follows the edit mode again",
+            agent::approvals::Choice::Deny => "is refused",
+        };
+        let note = e.covered_by.map(|c| format!("\nNote: '{c}' still decides for it; change that entry too.")).unwrap_or_default();
+        Ok(format!("{name} {did} for the rest of this session.{note}"))
     }
 
     fn root(&self) -> Result<PathBuf, String> {
@@ -546,11 +736,24 @@ impl Session {
             }
             "/export" => need(&self.task_id).and_then(|id| {
                 let r = store.load(&id).ok_or("unknown task")?;
+                let (range, path) = export_args(arg)?;
+                let turns = agent::export::turns(&r);
+                // No range given: on a terminal, ask where to start and where to end.
+                let range = match range {
+                    Some(range) => range,
+                    None if turns.len() > 1 && std::io::stdin().is_terminal() => pick_turns(&turns)?,
+                    None => agent::export::Range::default(),
+                };
                 let root = self.root().ok();
                 let log = self.host.edits.lock().expect("edit log lock");
-                let (path, bytes) = agent::export::export_task(&r, &log, root.as_deref(), Some(arg).filter(|a| !a.is_empty()))?;
-                Ok(format!("Exported to {} ({} KB).", path.display(), bytes.div_ceil(1024)))
+                let (path, bytes, span) = agent::export::export_task(&r, &log, root.as_deref(), path.as_deref(), range)?;
+                let what = if span.is_partial() { format!("turns {}–{} of {}", span.from, span.to, span.total) } else { format!("all {} turns", span.total) };
+                Ok(format!("Exported {what} to {} ({} KB).", path.display(), bytes.div_ceil(1024)))
             }),
+            "/approvals" => Ok(self.approvals().await),
+            "/allow" => self.set_approval(agent::approvals::Choice::Allow, arg).await,
+            "/ask" => self.set_approval(agent::approvals::Choice::Ask, arg).await,
+            "/deny" => self.set_approval(agent::approvals::Choice::Deny, arg).await,
             "/new" => {
                 self.task_id = None;
                 Ok("Started a new conversation.".into())
@@ -695,6 +898,35 @@ mod tests {
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn keys_show_as_keys_even_when_the_stream_cuts_them() {
+        assert_eq!(keys("Press <kbd>Cmd</kbd>+<KBD>P</KBD><br>then", false), "Press [Cmd]+[P]\nthen");
+        assert_eq!(keys("<kbd>Cmd</kbd>", true), "\x1b[7m Cmd \x1b[0m");
+        assert_eq!(keys("a < b and <b>x</b>", false), "a < b and <b>x</b>", "other text and tags are left alone");
+        let mut k = InlineKeys::default();
+        let out: String = ["Press <k", "bd>Cm", "d</kb", "d>+<", "kbd>P</kbd> now"].iter().map(|p| k.push(p)).collect::<String>() + &k.flush();
+        assert_eq!(out.replace("\x1b[7m ", "[").replace(" \x1b[0m", "]"), "Press [Cmd]+[P] now");
+        let mut k = InlineKeys::default();
+        assert_eq!(k.push("x < y"), "x < y", "a lone < with text after it is not held");
+        assert_eq!(k.push("open <kbd>"), "open ");
+        assert_eq!(k.flush(), "<kbd>", "an unclosed tag comes out as it is in the end");
+    }
+
+    #[test]
+    fn reads_export_ranges_and_paths() {
+        use agent::export::Range;
+        let r = |from, to| Some(Range { from, to });
+        assert_eq!(export_args("").unwrap(), (None, None));
+        assert_eq!(export_args("2-5").unwrap(), (r(Some(2), Some(5)), None));
+        assert_eq!(export_args("3 out.html").unwrap(), (r(Some(3), Some(3)), Some("out.html".into())));
+        assert_eq!(export_args("out.html 2-").unwrap(), (r(Some(2), None), Some("out.html".into())));
+        assert_eq!(export_args("-4").unwrap(), (r(None, Some(4)), None));
+        assert_eq!(export_args("all").unwrap(), (r(None, None), None));
+        assert_eq!(export_args("2024-report.html").unwrap(), (None, Some("2024-report.html".into())));
+        assert!(export_args("2-3-4").is_err());
+        assert!(export_args("a.html b.html").is_err());
     }
 
     #[test]

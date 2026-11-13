@@ -50,9 +50,11 @@ pub struct PolicyConfig {
     pub mode: Mode,
     /// Tool names that never need approval (cannot override `deny` or read-only mode).
     /// Destructive tools (deletes, installs) run only when named here: this is their explicit opt-in.
+    /// An entry ending in `*` covers every tool it starts, such as `mcp__chrome-devtools__*` for
+    /// all of one MCP server's tools (see `tool_matches`).
     #[serde(default)]
     pub allow: Vec<String>,
-    /// Tool names that are always refused.
+    /// Tool names that are always refused; `*` patterns as in `allow`.
     #[serde(default)]
     pub deny: Vec<String>,
     /// Allow every call with no prompt, destructive tools included; only `deny` still refuses.
@@ -65,6 +67,16 @@ pub struct PolicyConfig {
     /// Whether commands run in the OS sandbox; None asks the platform (tests set it).
     #[serde(skip)]
     pub sandboxed: Option<bool>,
+}
+
+/// Whether an allow or deny entry names `tool`: the exact name, or a prefix ending in `*`
+/// (`mcp__chrome-devtools__*`, `git_*`). A bare `*` names nothing: the edit modes and
+/// `allowAll` are the way to let every tool run.
+pub fn tool_matches(pattern: &str, tool: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => !prefix.is_empty() && tool.starts_with(prefix),
+        None => pattern == tool,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,8 +110,8 @@ impl Policy {
     }
 
     pub fn decide(&self, tool: &str, p: Permission) -> Decision {
-        let listed = self.config.allow.iter().any(|a| a == tool);
-        if self.config.deny.iter().any(|d| d == tool) {
+        let listed = self.config.allow.iter().any(|a| tool_matches(a, tool));
+        if self.config.deny.iter().any(|d| tool_matches(d, tool)) {
             return Decision::Deny;
         }
         if let Some(em) = self.config.edit_mode.filter(|_| self.config.mode != Mode::ReadOnly) {
@@ -241,6 +253,23 @@ mod tests {
         assert_eq!(p.decide("replace_text", Permission::Write), Decision::Allow);
         let ro = Policy::new(PolicyConfig { mode: Mode::ReadOnly, allow: vec!["replace_text".into()], ..Default::default() });
         assert_eq!(ro.decide("replace_text", Permission::Write), Decision::Deny, "allow list cannot lift read-only");
+    }
+
+    #[test]
+    fn patterns_cover_a_whole_server() {
+        use Permission as P;
+        let p = Policy::new(PolicyConfig {
+            mode: Mode::Autonomous,
+            edit_mode: Some(EditMode::Safe),
+            allow: vec!["mcp__chrome-devtools__*".into(), "*".into()],
+            deny: vec!["mcp__chrome-devtools__evaluate_*".into()],
+            ..Default::default()
+        });
+        assert_eq!(p.decide("mcp__chrome-devtools__new_page", P::Network), Decision::Allow);
+        assert_eq!(p.decide("mcp__chrome-devtools__emulate", P::Network), Decision::Allow);
+        assert_eq!(p.decide("mcp__chrome-devtools__evaluate_script", P::Network), Decision::Deny, "a deny pattern still wins");
+        assert_eq!(p.decide("mcp__figma__get", P::Network), Decision::Ask, "other servers still ask; a bare * names nothing");
+        assert!(tool_matches("run_tests", "run_tests") && !tool_matches("run_tests", "run_tests_all"), "no * means the exact name");
     }
 
     #[test]

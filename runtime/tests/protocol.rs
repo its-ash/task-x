@@ -266,6 +266,28 @@ async fn protocol_errors_and_lifecycle() {
     assert!(status.success());
 }
 
+/// `tools/approvals` lists every tool with its decision for a policy; `tools/setApproval` returns
+/// the lists the client saves.
+#[tokio::test]
+async fn approvals_list_and_set() {
+    let mut rt = Runtime::init().await;
+    let policy = json!({ "mode": "autonomous", "editMode": "safe", "allow": ["git_*"], "deny": ["web_fetch"] });
+    rt.send(json!({"jsonrpc":"2.0","id":10,"method":"tools/approvals","params":{ "policy": policy }})).await;
+    let (r, _) = rt.until_response(10).await;
+    let tools = r["result"]["tools"].as_array().unwrap();
+    let get = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap().clone();
+    assert_eq!((get("read_file")["decision"].clone(), get("read_file")["why"].clone()), (json!("allow"), json!("mode")));
+    assert_eq!((get("web_fetch")["decision"].clone(), get("web_fetch")["rule"].clone()), (json!("deny"), json!("web_fetch")));
+    assert_eq!(r["result"]["servers"], json!([]), "no MCP server is configured");
+
+    rt.send(json!({"jsonrpc":"2.0","id":11,"method":"tools/setApproval","params":{ "policy": policy, "tool": "web_fetch", "choice": "allow" }})).await;
+    let (r, _) = rt.until_response(11).await;
+    assert_eq!(r["result"], json!({ "allow": ["git_*", "web_fetch"], "deny": [] }));
+    rt.send(json!({"jsonrpc":"2.0","id":12,"method":"tools/setApproval","params":{ "policy": policy, "tool": "*", "choice": "allow" }})).await;
+    let (r, _) = rt.until_response(12).await;
+    assert_eq!(r["error"]["code"], -32602);
+}
+
 /// `plugins/configure` adds a plugin folder; `plugins/list`, `agents/list`, and `skills/list` then
 /// show its agents, skills, and commands, named `<plugin>:<name>`. A disabled plugin adds nothing.
 #[tokio::test]
