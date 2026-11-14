@@ -1267,8 +1267,12 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
     // User messages sent without a result yet, and when the last result came while some still wait.
     let mut pending = 1u32;
     let mut idle_since: Option<Instant> = None;
-    // Idle with wake-ups pending (a `sleeping` event was sent).
-    let mut sleeping = false;
+    // Idle with wake-ups pending since then (a `sleeping` event was sent).
+    let mut sleeping: Option<Instant> = None;
+    // Claude Code can wake up later (task-x's wake-up tools), and whether it was reminded to
+    // schedule a come-back it promised (`wakeup::Promise`) since its last tool call.
+    let can_wake = p.use_task_tools && approval.is_some();
+    let mut reminded = false;
     let mut tick = tokio::time::interval(STEER_POLL);
     // Running `Bash` calls: their stop token and the shells that ran before each one started.
     let pid = child.id();
@@ -1301,16 +1305,16 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
                 if !fired.is_empty() && write_user(&mut stdin, json!(fired.join("\n\n"))).await {
                     pending += 1;
                     idle_since = None;
-                    if std::mem::take(&mut sleeping) {
-                        (host.emit)(&p.task_id, json!({ "type": "awake", "by": "wakeup", "pending": wakeups.pending() }));
+                    if let Some(since) = sleeping.take() {
+                        (host.emit)(&p.task_id, json!({ "type": "awake", "by": "wakeup", "sleptMs": since.elapsed().as_millis() as u64, "pending": wakeups.list()["pending"] }));
                     }
                 }
                 let texts = inbox.take();
                 if !texts.is_empty() {
                     pending += send_steers(&mut stdin, &texts, &host, &p.task_id).await;
                     idle_since = None;
-                    if std::mem::take(&mut sleeping) {
-                        (host.emit)(&p.task_id, json!({ "type": "awake", "by": "message", "pending": wakeups.pending() }));
+                    if let Some(since) = sleeping.take() {
+                        (host.emit)(&p.task_id, json!({ "type": "awake", "by": "message", "sleptMs": since.elapsed().as_millis() as u64, "pending": wakeups.list()["pending"] }));
                     }
                 } else if wakeups.pending() > 0 || wakeups.has_fired() {
                     // Not idle for good: a wake-up will send the next message.
@@ -1337,6 +1341,9 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
                                 running.remove(&id);
                             }
                         }
+                        if ev["type"] == "toolStarted" {
+                            reminded = false;
+                        }
                         (host.emit)(&p.task_id, ev);
                     }
                     if mapper.results == results {
@@ -1345,10 +1352,32 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
                     }
                     pending = pending.saturating_sub(1);
                     idle_since = Some(Instant::now());
+                    // The reply promises to come back later, but nothing is scheduled: a named time is
+                    // scheduled here (Claude Code then sleeps below); without one, Claude is reminded once.
+                    if can_wake && pending == 0 && stdin.is_some() && wakeups.pending() == 0 && !wakeups.has_fired() {
+                        let said = mapper.result.as_ref().and_then(|r| r["result"].as_str()).and_then(crate::agent::wakeup::promise);
+                        match said {
+                            Some(crate::agent::wakeup::Promise::After { delay, said }) => {
+                                let _ = wakeups.schedule_promised(delay, &said);
+                            }
+                            Some(crate::agent::wakeup::Promise::Unscheduled { said }) if !reminded => {
+                                reminded = true;
+                                (host.emit)(&p.task_id, json!({ "type": "warning", "message": "Claude said it would come back later but scheduled nothing; task-x asks it to schedule the wait." }));
+                                let prefix = format!("mcp__{}__", crate::mcp_server::SERVER_NAME);
+                                let nudge = crate::agent::wakeup::unscheduled_nudge(&said, &prefix);
+                                if write_user(&mut stdin, json!(nudge)).await {
+                                    pending += 1;
+                                    idle_since = None;
+                                    continue;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     if pending == 0 && stdin.is_some() && (wakeups.pending() > 0 || wakeups.has_fired()) {
                         // Claude Code answered everything; it sleeps until a wake-up is due.
-                        if !sleeping && !wakeups.has_fired() {
-                            sleeping = true;
+                        if sleeping.is_none() && !wakeups.has_fired() {
+                            sleeping = Some(Instant::now());
                             (host.emit)(&p.task_id, wakeups.sleeping_event());
                         }
                     } else if pending == 0 && stdin.is_some() {

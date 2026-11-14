@@ -975,26 +975,12 @@
           "maximum": 5,
           "description": "How many times a task continues on its own when it reaches the turn limit. 0 pauses at the limit."
         },
-        "task-x.session.freshAfterIdleMinutes": {
-          "type": "number",
-          "default": 60,
-          "minimum": 0,
-          "maximum": 10080,
-          "description": "A chat idle for this many minutes starts a new conversation with the next request, so the old history is not sent again with every turn. The old conversation stays in History. 0 keeps the conversation. Type /clear to start fresh at any time."
-        },
         "task-x.session.stallMinutes": {
           "type": "number",
           "default": 30,
           "minimum": 0,
           "maximum": 1440,
-          "description": "Stop a request that makes no progress for this many minutes (waiting for your answer does not count). 0 never stops it."
-        },
-        "task-x.session.maxRunMinutes": {
-          "type": "number",
-          "default": 120,
-          "minimum": 0,
-          "maximum": 1440,
-          "description": "Stop a request after this many minutes, so no session runs for hours unseen. Continue goes on from where it stopped. 0 has no limit. Loop Mode uses task-x.session.loopMaxHours."
+          "description": "Stop a request that makes no progress for this many minutes (waiting for your answer, or sleeping until a wake-up or wait_until check, does not count). 0 never stops it."
         },
         "task-x.session.loopMaxHours": {
           "type": "number",

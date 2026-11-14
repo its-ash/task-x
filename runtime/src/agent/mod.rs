@@ -112,8 +112,10 @@ pub struct Limits {
     /// The only budget: the task stops when its tokens reach it. Unset: no token budget. Tool calls are not limited.
     #[serde(default)]
     pub max_total_tokens: Option<u64>,
-    #[serde(default = "d_deadline")]
-    pub deadline_secs: u64,
+    /// Unset (the default): no time limit, a task runs until it is done or stopped. Subagents get
+    /// `SUBAGENT_DEADLINE_SECS` from their lead.
+    #[serde(default)]
+    pub deadline_secs: Option<u64>,
     #[serde(default = "d_ctx")]
     pub context_budget_tokens: usize,
     #[serde(default)]
@@ -159,9 +161,6 @@ const MIN_WINDOW: usize = 4_000;
 fn d_iter() -> u32 {
     60
 }
-fn d_deadline() -> u64 {
-    1_800
-}
 fn d_ctx() -> usize {
     8_000
 }
@@ -170,7 +169,7 @@ impl Default for Limits {
         Self {
             max_iterations: d_iter(),
             max_total_tokens: None,
-            deadline_secs: d_deadline(),
+            deadline_secs: None,
             context_budget_tokens: d_ctx(),
             max_output_tokens: None,
             context_window_tokens: None,
@@ -1754,7 +1753,7 @@ impl Run {
             editor: EditorContext::default(),
             limits: Limits {
                 max_iterations: agent.and_then(|a| a.max_iterations).unwrap_or(SUBAGENT_ITERATIONS),
-                deadline_secs: SUBAGENT_DEADLINE_SECS,
+                deadline_secs: Some(SUBAGENT_DEADLINE_SECS),
                 // A subagent may spend only what is left of the lead's budget, not a budget of its own.
                 max_total_tokens: self.limits.max_total_tokens.map(|m| m.saturating_sub(self.total_tokens()).max(1)),
                 ..self.limits.clone()
@@ -2564,7 +2563,7 @@ impl Run {
             "message"
         };
         self.rec.status = Status::Running;
-        self.emit(json!({ "type": "awake", "by": by, "sleptMs": since.elapsed().as_millis() as u64, "pending": self.wakeups.pending() }));
+        self.emit(json!({ "type": "awake", "by": by, "sleptMs": since.elapsed().as_millis() as u64, "pending": self.wakeups.list()["pending"] }));
         self.save();
         woke && self.take_steers()
     }
@@ -2592,12 +2591,14 @@ impl Run {
     }
 
     async fn run(mut self) -> TaskRecord {
-        let deadline = Duration::from_secs(self.limits.deadline_secs.clamp(10, 24 * 3600));
+        let deadline = self.limits.deadline_secs.map(|s| Duration::from_secs(s.clamp(10, 24 * 3600)));
         let mut failed_rounds = 0;
         // Final replies with no text and no tool call (a model that put the whole answer in its thinking).
         let mut empty_answers = 0;
         // Times a stop hook sent the agent back to work.
         let mut stop_blocks = 0;
+        // Whether the model was reminded to schedule the come-back it promised (`wakeup::Promise`).
+        let mut reminded = false;
         // Replies cut off at the output limit: tool calls that could not be read, and text that
         // stopped mid-way (kept in `cut_text` so the answer is whole once the model continues).
         let (mut bad_calls, mut cut_offs, mut cut_text) = (0, 0, String::new());
@@ -2612,7 +2613,7 @@ impl Run {
             if self.rec.iterations >= self.limits.max_iterations {
                 break Status::MaxIterations;
             }
-            if self.started.elapsed().saturating_sub(self.slept) > deadline {
+            if deadline.is_some_and(|d| self.started.elapsed().saturating_sub(self.slept) > d) {
                 break Status::DeadlineExceeded;
             }
             if self.over_budget() {
@@ -2663,6 +2664,7 @@ impl Run {
             }
             if !out.tool_calls.is_empty() {
                 cut_text.clear();
+                reminded = false;
             }
             content.extend(out.tool_calls.iter().map(|c| ContentPart::ToolUse {
                 id: c.id.clone(),
@@ -2708,12 +2710,35 @@ impl Run {
                 }
                 // Pending wake-ups: the task sleeps until one fires (or a message arrives), then goes on.
                 // With the budget spent there is nothing to wake up for.
-                if self.wakeups.pending() > 0 && !self.over_budget() {
+                let had_wakeups = self.wakeups.pending() > 0;
+                if had_wakeups && !self.over_budget() {
                     if self.sleep_until_wakeup().await {
                         continue;
                     }
                     if self.cancel.is_cancelled() {
                         break Status::Cancelled;
+                    }
+                }
+                // The reply promises to come back later, but nothing is scheduled: a named time is
+                // scheduled here and the task sleeps; without one, the model is reminded once.
+                if !had_wakeups && !self.over_budget() && self.tool_specs.iter().any(|t| t.name == wakeup::SCHEDULE) {
+                    match wakeup::promise(&out.text) {
+                        Some(wakeup::Promise::After { delay, said }) => {
+                            if self.wakeups.schedule_promised(delay, &said).is_ok() && self.sleep_until_wakeup().await {
+                                continue;
+                            }
+                            if self.cancel.is_cancelled() {
+                                break Status::Cancelled;
+                            }
+                        }
+                        Some(wakeup::Promise::Unscheduled { said }) if !reminded => {
+                            reminded = true;
+                            self.emit(json!({ "type": "warning", "message": "The model said it would come back later but scheduled nothing; task-x asks it to schedule the wait." }));
+                            let text = wakeup::unscheduled_nudge(&said, "");
+                            self.rec.messages.push(Message { role: Role::User, content: vec![ContentPart::Text { text }] });
+                            continue;
+                        }
+                        _ => {}
                     }
                 }
                 // A stop hook can send the agent back to work (for example "run the tests first").
@@ -3972,6 +3997,50 @@ mod tests {
         assert_eq!((sleeping["pending"][0]["id"].as_str(), sleeping["pending"][0]["reason"].as_str()), (Some("w1"), Some("deploy check")));
         assert!(events.iter().any(|e| e["type"] == "awake" && e["by"] == "message"));
         assert!(events.iter().any(|e| e["type"] == "wakeupCancelled" && e["by"] == "model"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A reply that promises "in 30 minutes" with nothing scheduled gets that wake-up and sleeps.
+    #[tokio::test]
+    async fn a_promised_time_is_scheduled_and_the_task_sleeps() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        // The message wakes it early; the model then cancels the wake-up that is still pending.
+        let (base, seen) = mock(vec![
+            sse_text("The job runs. I'll check again in 30 minutes."),
+            sse_tool("c1", "cancel_wakeup", json!({ "id": "all" })),
+            sse_text("Checked: the job is done."),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut h = host(&root, ApprovalDecision::Allow, Arc::default());
+        let (log, steers) = (events.clone(), h.steers.clone());
+        h.emit = Arc::new(move |id, e| {
+            if e["type"] == "sleeping" {
+                assert!(steer(&steers, id, "look now").unwrap());
+            }
+            log.lock().unwrap().push(e);
+        });
+        let r = run(h, params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        let events = events.lock().unwrap();
+        let w = events.iter().find(|e| e["type"] == "wakeupScheduled").expect("scheduled by task-x");
+        assert_eq!(w["wakeup"]["dueMs"].as_u64().unwrap() - w["wakeup"]["createdMs"].as_u64().unwrap(), 1_800_000);
+        assert!(w["wakeup"]["reason"].as_str().unwrap().starts_with("you said: I'll check again in 30 minutes"));
+        assert!(events.iter().any(|e| e["type"] == "sleeping"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A promise with no time gets one reminder to schedule the wait; it is not repeated.
+    #[tokio::test]
+    async fn a_promise_without_a_time_gets_one_reminder() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        let (base, seen) = mock(vec![sse_text("I'll report when the build finishes."), sse_text("I'll report when the build finishes.")]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let r = run(host(&root, ApprovalDecision::Allow, events.clone()), params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one reminder, then the task ends");
+        assert!(seen[1]["messages"].to_string().contains("nothing is scheduled to wake you"));
         std::fs::remove_dir_all(root).ok();
     }
 

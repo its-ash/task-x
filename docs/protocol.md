@@ -342,7 +342,9 @@ Five tools let the model wait without spending a turn on every check:
 
 A task has at most 10 wake-ups and checks pending. They live in memory only: they end with the task (cancel, limit, or finish) and when the runtime stops. At startup, a record left `sleeping` is marked `failed` like one left `running`.
 
-When the model ends its turn (no tool calls) while wake-ups are pending and no background command runs, the task does not end: its record gets the status **`sleeping`** and the runtime sends `sleeping`. The task wakes when a wake-up fires or an `agent/steer` message arrives (both join the conversation), sends `awake`, goes back to `running`, and takes another step. When the last pending one is cancelled, the task wakes and ends as usual. Time spent sleeping does not count towards `limits.deadlineSecs`, so a task can wait 30 minutes or more under the default 30-minute deadline.
+When the model ends its turn (no tool calls) while wake-ups are pending and no background command runs, the task does not end: its record gets the status **`sleeping`** and the runtime sends `sleeping`. The task wakes when a wake-up fires or an `agent/steer` message arrives (both join the conversation), sends `awake`, goes back to `running`, and takes another step. When the last pending one is cancelled, the task wakes and ends as usual. A top-level task has no time limit unless the client sets `limits.deadlineSecs`; subagents stop after 15 minutes. Time spent sleeping does not count towards a deadline.
+
+A top-level task whose final reply promises to come back later while nothing is pending is not left to end: when the promise names a time ("I'll check again in 30 minutes", "after an hour", "in half an hour"), the runtime schedules that wake-up itself (as `schedule_wakeup`, clamped to 10 s..24 h, `reason` `you said: …`) and the task sleeps; when it names none ("I'll report when the build finishes"), the model gets one reminder (a user message) to call `wait_until` or `schedule_wakeup`, and a `warning` event is sent. The reminder is sent again only after another tool call. Offers to the user ("if you want, I'll check later") and questions do not count. The Claude Code engine does the same with the run's `result` text, naming the tools `mcp__task-x__wait_until` and `mcp__task-x__schedule_wakeup`.
 
 | Event | Fields |
 |---|---|
@@ -350,7 +352,7 @@ When the model ends its turn (no tool calls) while wake-ups are pending and no b
 | `wakeupFired` | `id`, `kind`, `reason`; `met` (bool) for a `wait_until` check |
 | `wakeupCancelled` | `id`, `by`: `model` (`cancel_wakeup`) or `taskEnded` |
 | `sleeping` | `untilMs` (the next one due), `pending` (as in `list_wakeups`) |
-| `awake` | `by`: `wakeup`, `message`, `nothingPending`, or `cancelled`; `sleptMs`, `pending` |
+| `awake` | `by`: `wakeup`, `message`, `nothingPending`, or `cancelled`; `sleptMs`, `pending` (as in `list_wakeups`) |
 
 Clients show a sleeping task with its own status. The terminal client (`task-x-runtime chat`/`exec`) shows a sleeping task as one magenta line redrawn in place every second: the moon goes through its phases (🌑🌒🌓🌔🌕🌖🌗🌘) and the countdown ticks down, as in `🌒 Sleeping · next wake-up in 29m 58s: <reason> (1 pending)`. Any other output clears the line first. On a stream that is not a terminal (logs, pipes, `TERM=dumb`) it prints one static line, `☾ Sleeping · next wake-up in 30m: …`, instead. The wake-up lines use ⏰ in yellow. There is no colour when `NO_COLOR` is set.
 

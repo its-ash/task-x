@@ -95,8 +95,8 @@ const NIGHT_RETRY_BASE_MS = 15_000;
 const NIGHT_RETRY_MAX_MS = 5 * 60_000;
 
 /**
- * Session guards (`task-x.session.*`), in minutes or hours; 0 turns one off. A chat idle this long
- * starts a fresh conversation, a run stops without progress or past its time, and Loop Mode ends.
+ * Session guards (`task-x.session.*`), in minutes or hours; 0 turns one off. A run stops without
+ * progress or past its time, and Loop Mode ends.
  */
 function sessionLimits() {
   const c = vscode.workspace.getConfiguration(SECTION);
@@ -105,13 +105,10 @@ function sessionLimits() {
     return typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(0, v)) : def;
   };
   return {
-    freshMin: n('session.freshAfterIdleMinutes', 60, 7 * 24 * 60),
     stallMin: n('session.stallMinutes', 30, 24 * 60),
-    maxRunMin: n('session.maxRunMinutes', 120, 24 * 60),
     loopHours: n('session.loopMaxHours', 4, 72),
   };
 }
-const fmtIdle = (ms: number) => (ms >= 3_600_000 ? `${Math.round(ms / 3_600_000)} h` : `${Math.round(ms / 60_000)} min`);
 /** Night mode with a Think model: it splits the request into todo.md, and the Loop model works on one item per run. */
 const NIGHT_TODO_KEY = 'task-x.nightTodo';
 const NIGHT_ITEM_KEY = 'task-x.nightItem';
@@ -366,6 +363,8 @@ interface Run {
   /** True when Loop Mode stopped a stalled run, so the stop is not taken as the user's. */
   stalled: boolean;
   lastActivity: number;
+  /** Pending wake-ups and `wait_until` checks: the run waits for them, so it is not stalled. */
+  wakeups: Set<string>;
 }
 
 /** Chat tabs that run a task at the same time; a request beyond this waits for a free slot. */
@@ -1133,15 +1132,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /**
    * Loop Mode restarts its run after NIGHT_STALL_MS without progress. Any other run stops after
-   * `session.stallMinutes` without progress or after `session.maxRunMinutes`, so no session runs for
-   * hours unseen. Waiting for the user is not a stall.
+   * `session.stallMinutes` without progress. Waiting for the user, or for a wake-up or `wait_until`
+   * check, is not a stall; a run that makes progress runs as long as it needs.
    */
   private watchRuns(): void {
     const now = Date.now();
-    const { stallMin, maxRunMin } = sessionLimits();
+    const { stallMin } = sessionLimits();
     for (const [tab, r] of this.runs) {
       if (r.abort.signal.aborted) continue;
-      if (r.approvals.size || r.questions.size) {
+      if (r.approvals.size || r.questions.size || r.wakeups.size) {
         r.lastActivity = now;
         continue;
       }
@@ -1154,12 +1153,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         r.abort.abort();
         continue;
       }
-      const why =
-        stallMin && idle >= stallMin * 60_000
-          ? `no progress for ${stallMin} minutes (task-x.session.stallMinutes)`
-          : maxRunMin && now - r.started >= maxRunMin * 60_000
-            ? `it ran for ${maxRunMin} minutes (task-x.session.maxRunMinutes)`
-            : undefined;
+      const why = stallMin && idle >= stallMin * 60_000 ? `no progress for ${stallMin} minutes (task-x.session.stallMinutes)` : undefined;
       if (!why) continue;
       this.inTab(tab, () => this.add({ kind: 'context', text: `Stopped the request: ${why}. Long sessions use many tokens. Send Continue to go on, or /clear to start fresh.` }));
       r.abort.abort();
@@ -2478,21 +2472,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (e.blocked) this.add({ kind: 'context', text: `Hook blocked ${e.event}: ${e.message}` });
         break;
       case 'wakeupScheduled':
+        run?.wakeups.add(e.wakeup.id);
         state.assistant = undefined;
         this.add({ kind: 'context', text: `${e.wakeup.kind === 'watch' ? 'Watching' : 'Wake-up'} at ${new Date(e.wakeup.dueMs).toLocaleTimeString()}${e.wakeup.reason ? `: ${e.wakeup.reason}` : ''}` });
         break;
+      case 'wakeupFired':
+        run?.wakeups.delete(e.id);
+        break;
       case 'wakeupCancelled':
+        run?.wakeups.delete(e.id);
         if (e.by === 'model') this.add({ kind: 'context', text: `Cancelled wake-up ${e.id}` });
         break;
       case 'sleeping': {
+        if (run) run.wakeups = new Set(e.pending.map((w) => w.id));
         state.assistant = undefined;
         const next = e.pending[0];
         this.add({ kind: 'context', text: `🌙 Sleeping until ${new Date(e.untilMs).toLocaleTimeString()}${next?.reason ? `: ${next.reason}` : ''} (${e.pending.length} pending). Send a message to wake it now; Stop ends it.` });
         break;
       }
       case 'awake':
+        if (run) run.wakeups = new Set(e.pending.map((w) => w.id));
         state.assistant = undefined;
-        if (e.by !== 'cancelled') this.add({ kind: 'context', text: `☀️ Awake after ${fmtDuration(e.sleptMs)} (${e.by === 'wakeup' ? 'a wake-up fired' : e.by === 'message' ? 'your message' : 'nothing left to wait for'})` });
+        if (e.by !== 'cancelled') this.add({ kind: 'context', text: `☀️ Awake after ${fmtDuration(e.sleptMs ?? 0)} (${e.by === 'wakeup' ? 'a wake-up fired' : e.by === 'message' ? 'your message' : 'nothing left to wait for'})` });
         break;
     }
   }
@@ -2609,22 +2610,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // `/clear` (or `/new`): a fresh conversation in this chat, for either engine.
     if (!images.length && /^\/(clear|new)\s*$/i.test(text)) return this.clear();
     if (!images.length && engine() !== 'claudeCode' && (await this.sessionCommand(text))) return;
-    // A chat idle for `session.freshAfterIdleMinutes` starts a new conversation: an old history is
-    // sent again with every turn, and a new topic seldom needs it. The old one stays in History.
-    const freshMin = sessionLimits().freshMin;
-    const cur = this.chat;
-    if (!retry && !this.night && freshMin && cur.taskId && cur.lastUsed && Date.now() - cur.lastUsed >= freshMin * 60_000 && !this.runs.has(tab)) {
-      const idle = Date.now() - cur.lastUsed;
-      const old = { ...cur, items: [...cur.items] };
-      Object.assign(cur, { items: [], taskId: undefined, usage: undefined, tokens: undefined, todos: [], lastUsed: undefined });
-      this.add({ kind: 'context', text: `New conversation: this chat was idle for ${fmtIdle(idle)}, so task-x started fresh to send fewer tokens (task-x.session.freshAfterIdleMinutes). The earlier conversation is in History.` });
-      if (cur.id === this.activeTab) this.renderTab();
-      await this.archive(old);
-      if (this.runs.has(tab)) return this.sendIn(raw, modeOverride, retry, images);
-    }
     // The run is registered before anything waits, so a second request to this tab queues behind it.
     const abort = new AbortController();
-    const run: Run = { abort, started: Date.now(), cards: new Map(), approvals: new Map(), questions: new Map(), steering: [], stalled: false, lastActivity: Date.now() };
+    const run: Run = { abort, started: Date.now(), cards: new Map(), approvals: new Map(), questions: new Map(), steering: [], stalled: false, lastActivity: Date.now(), wakeups: new Set() };
     this.runs.set(tab, run);
     if (this.night) this.nightTab = tab;
     this.runsChanged();
