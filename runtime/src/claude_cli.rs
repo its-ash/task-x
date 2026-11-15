@@ -544,6 +544,10 @@ pub struct Mapper {
     pub output_tokens: Option<u64>,
     /// The lead's side of the run (replies, tool calls, tool results) for the task record.
     pub transcript: Vec<Message>,
+    /// Claude Code's own tasks that still run (shells, subagents, monitors), by task id: their
+    /// description and whether they run in the background. Claude Code does not exit while a
+    /// background one runs.
+    tasks: BTreeMap<String, (String, bool)>,
 }
 
 impl Mapper {
@@ -647,11 +651,46 @@ impl Mapper {
         inner.into_iter().map(|e| json!({ "type": "subagent", "name": name, "taskId": parent, "event": e })).collect()
     }
 
+    /// Follows Claude Code's tasks: `task_started`, status changes in `task_updated`, and
+    /// `task_notification` once one ends.
+    fn track_task(&mut self, v: &Value) {
+        let Some(id) = v["task_id"].as_str() else { return };
+        match v["subtype"].as_str() {
+            Some("task_started") => {
+                let what = v["description"].as_str().map(str::trim).filter(|d| !d.is_empty()).unwrap_or("background task");
+                // Unset means a background kind (a monitor, a background shell); a foreground call
+                // says `false` and ends before its turn does.
+                self.tasks.insert(id.to_owned(), (clip(what, 120), v["is_backgrounded"] != false));
+            }
+            Some("task_notification") => {
+                self.tasks.remove(id);
+            }
+            Some("task_updated") => {
+                let patch = &v["patch"];
+                if patch["status"].as_str().is_some_and(|s| s != "running" && s != "pending") {
+                    self.tasks.remove(id);
+                } else if let Some(bg) = patch["is_backgrounded"].as_bool() {
+                    // A slow foreground command moved to the background (or back).
+                    self.tasks.entry(id.to_owned()).or_insert_with(|| ("background task".into(), bg)).1 = bg;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The descriptions of Claude Code's background tasks that still run.
+    pub fn background_work(&self) -> Vec<&str> {
+        self.tasks.values().filter(|(_, bg)| *bg).map(|(d, _)| d.as_str()).collect()
+    }
+
     pub fn map(&mut self, line: &str, chat_mode: &str) -> Vec<Value> {
         let Ok(v) = serde_json::from_str::<Value>(line) else { return Vec::new() };
         let mut out = Vec::new();
         if let Some(s) = v["session_id"].as_str() {
             self.session_id = Some(s.to_owned());
+        }
+        if v["type"] == "system" {
+            self.track_task(&v);
         }
         // A subagent's lines go to its lane; its streamed text never mixes with the lead's reply.
         if let Some(parent) = v["parent_tool_use_id"].as_str().filter(|p| !p.is_empty()) {
@@ -1297,6 +1336,8 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
     // schedule a come-back it promised (`wakeup::Promise`) since its last tool call.
     let can_wake = p.use_task_tools && approval.is_some();
     let mut reminded = false;
+    // Whether the user was told that Claude Code's background work keeps the run open.
+    let mut told_background = false;
     let mut tick = tokio::time::interval(STEER_POLL);
     // Running `Bash` calls: their stop token and the shells that ran before each one started.
     let pid = child.id();
@@ -1340,8 +1381,8 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
                     if let Some(since) = sleeping.take() {
                         (host.emit)(&p.task_id, json!({ "type": "awake", "by": "message", "sleptMs": since.elapsed().as_millis() as u64, "pending": wakeups.list()["pending"] }));
                     }
-                } else if wakeups.pending() > 0 || wakeups.has_fired() {
-                    // Not idle for good: a wake-up will send the next message.
+                } else if wakeups.pending() > 0 || wakeups.has_fired() || !mapper.background_work().is_empty() {
+                    // Not idle for good: a wake-up or a background task's report brings the next turn.
                 } else if idle_since.is_some_and(|t| t.elapsed() > IDLE_CLOSE) {
                     let texts = inbox.close_or_take();
                     pending += send_steers(&mut stdin, &texts, &host, &p.task_id).await;
@@ -1403,6 +1444,18 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
                         if sleeping.is_none() && !wakeups.has_fired() {
                             sleeping = Some(Instant::now());
                             (host.emit)(&p.task_id, wakeups.sleeping_event());
+                        }
+                    } else if pending == 0 && stdin.is_some() && !mapper.background_work().is_empty() {
+                        // Claude Code does not exit while its background work runs (a dev server may
+                        // never end), so stdin stays open: user messages go to Claude at once instead
+                        // of waiting for a run that cannot end.
+                        if !told_background {
+                            told_background = true;
+                            let what: Vec<&str> = mapper.background_work().into_iter().take(3).collect();
+                            (host.emit)(&p.task_id, json!({
+                                "type": "warning",
+                                "message": format!("Claude Code still runs background work ({}). Messages you send go to Claude now; the task ends when the work ends, or press Stop.", what.join(", ")),
+                            }));
                         }
                     } else if pending == 0 && stdin.is_some() {
                         // Closing stdin ends the run once Claude Code has answered every message.
@@ -1610,6 +1663,27 @@ mod tests {
         let late = m.map(r#"{"type":"result","subtype":"success","result":"Also done.","usage":{"input_tokens":30,"output_tokens":7}}"#, "agent");
         assert_eq!(late[0]["text"], "Also done.");
         assert_eq!((m.results, m.input_tokens, m.output_tokens), (2, Some(150), Some(12)), "a steered message adds a result");
+    }
+
+    /// Claude Code's background tasks keep the run open for messages; foreground ones do not.
+    #[test]
+    fn follows_claude_codes_background_tasks() {
+        let mut m = Mapper::default();
+        let feed = |m: &mut Mapper, l: &str| {
+            m.map(l, "agent");
+        };
+        feed(&mut m, r#"{"type":"system","subtype":"task_started","task_id":"b1","description":"npm run dev","is_backgrounded":true}"#);
+        feed(&mut m, r#"{"type":"system","subtype":"task_started","task_id":"a1","description":"Explore","is_backgrounded":false}"#);
+        feed(&mut m, r#"{"type":"system","subtype":"task_started","task_id":"m1","description":"watch logs"}"#);
+        assert_eq!(m.background_work(), ["npm run dev", "watch logs"], "a foreground subagent is not background work");
+        feed(&mut m, r#"{"type":"system","subtype":"task_updated","task_id":"a1","patch":{"is_backgrounded":true}}"#);
+        assert_eq!(m.background_work().len(), 3, "moved to the background");
+        feed(&mut m, r#"{"type":"system","subtype":"task_notification","task_id":"a1","status":"completed"}"#);
+        feed(&mut m, r#"{"type":"system","subtype":"task_updated","task_id":"m1","patch":{"status":"killed"}}"#);
+        feed(&mut m, r#"{"type":"system","subtype":"task_updated","task_id":"b1","patch":{"status":"running"}}"#);
+        assert_eq!(m.background_work(), ["npm run dev"]);
+        feed(&mut m, r#"{"type":"system","subtype":"task_notification","task_id":"b1","status":"failed"}"#);
+        assert!(m.background_work().is_empty());
     }
 
     #[test]
