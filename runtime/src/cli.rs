@@ -54,7 +54,7 @@ Options:
   --no-mcp-import           Start only .task-x/mcp.json servers, not the ones set up for Claude, VS Code, Copilot CLI, or Cursor
   --trust                   Trust this folder: its hooks, MCP servers, skills, and agents may run (asked once otherwise)
 
-In chat: /exit, /continue (an interrupted task; Enter on an empty line does it too), /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], /timeline, /restore <step>, /export [turns] [file.html] (asks for the start and end turn; or give 2-5), /agents, /mcp, /approvals, /allow|/ask|/deny <tool or server>, and every skill and command (/init, /review, ...).";
+In chat: /exit, /continue (an interrupted task; Enter on an empty line does it too), /new, /cost, /compact, /checkpoints, /rewind <n>, /fork [n], /timeline, /restore <step>, /export [turns] [file.html] (asks for the start and end turn; or give 2-5), /agents, /mcp, /ports [stop <port>], /approvals, /allow|/ask|/deny <tool or server>, and every skill and command (/init, /review, ...).";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
@@ -285,6 +285,36 @@ impl SleepLine {
             let _ = std::io::stderr().flush();
         }
     }
+}
+
+/// `/ports` lists the ports in use by what task-x started (or what runs in the workspace);
+/// `/ports stop <port or pid>` ends that process.
+fn ports_command(arg: &str, root: Option<&std::path::Path>) -> Result<String, String> {
+    let ports = crate::ports::current(root).ok_or("listing ports needs lsof or ss, and neither runs here")?;
+    if let Some(which) = arg.strip_prefix("stop").map(str::trim) {
+        let n: u32 = which.parse().map_err(|_| "give the port (or the pid) to stop, as in /ports stop 5173")?;
+        let p = ports.iter().find(|p| u32::from(p.port) == n).or_else(|| ports.iter().find(|p| p.pid == n)).ok_or("no listed port or process has that number (see /ports)")?;
+        let r = crate::ports::stop(p.pid, root)?;
+        return Ok(if r["stopped"] == true {
+            format!("Stopped {} (pid {}); port {} is free.", p.name, p.pid, p.port)
+        } else {
+            format!("{} (pid {}) did not stop; port {} is still taken.", p.name, p.pid, p.port)
+        });
+    }
+    if !arg.is_empty() {
+        return Err("use /ports, or /ports stop <port>".into());
+    }
+    if ports.is_empty() {
+        return Ok("No ports are in use by processes task-x started or that run in this workspace.".into());
+    }
+    let rows: Vec<String> = ports
+        .iter()
+        .map(|p| {
+            let by = if p.origin == crate::ports::Origin::TaskX { "task-x" } else { "workspace" };
+            format!("{:>6}  {}  (pid {}, {by}, on {})", p.port, p.command, p.pid, p.addresses.join(", "))
+        })
+        .collect();
+    Ok(format!("Ports in use:\n{}\n/ports stop <port> ends that process.", rows.join("\n")))
 }
 
 /// Every agent of this session as an indented board: what each one does now. Shown when a
@@ -977,6 +1007,10 @@ impl Session {
                 Ok(format!("Exported {what} to {} ({} KB).", path.display(), bytes.div_ceil(1024)))
             }),
             "/approvals" => Ok(self.approvals().await),
+            "/ports" => {
+                let (root, arg) = (self.root().ok(), arg.to_owned());
+                tokio::task::spawn_blocking(move || ports_command(&arg, root.as_deref())).await.unwrap_or_else(|e| Err(e.to_string()))
+            }
             "/mcp" => Ok(self.mcp_list().await),
             "/agents" => Ok(agents_board()),
             "/allow" => self.set_approval(agent::approvals::Choice::Allow, arg).await,

@@ -2152,14 +2152,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /**
    * Screens shared with the command palette, for either engine and while a task runs: `/approvals`,
-   * `/timeline`, `/restore <step>`, `/export` (HTML), and `/agents-active`. Returns false for other text.
+   * `/timeline`, `/restore <step>`, `/export` (HTML), `/agents-active`, and `/ports`. Returns false for other text.
    */
   private screenCommand(text: string): boolean {
-    const s = /^\/(approvals|timeline|restore|export|agents-active)(?:\s+(\d+))?\s*$/.exec(text);
+    const s = /^\/(approvals|timeline|restore|export|agents-active|ports)(?:\s+(\d+))?\s*$/.exec(text);
     if (!s) return false;
     const [, cmd, arg] = s;
     const client = () => this.getClient();
-    if (cmd === 'approvals') void manageApprovals(client);
+    if (cmd === 'ports') void vscode.commands.executeCommand('task-x.showPorts');
+    else if (cmd === 'approvals') void manageApprovals(client);
     else if (cmd === 'agents-active') void showActiveAgents(client, (id) => this.openTask(id));
     else if (!this.taskId && cmd !== 'timeline') this.add({ kind: 'context', text: `/${cmd}: there is no conversation yet in this chat.` });
     else if (cmd === 'export') void exportHtml(client, this.taskId!);

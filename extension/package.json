@@ -454,6 +454,12 @@
         "icon": "$(tasklist)"
       },
       {
+        "command": "task-x.showPorts",
+        "title": "Show Ports in Use",
+        "category": "task-x",
+        "icon": "$(radio-tower)"
+      },
+      {
         "command": "task-x.bestOf",
         "title": "Best of N: Compare Models on a Task…",
         "category": "task-x",
@@ -540,6 +546,11 @@
         },
         {
           "command": "task-x.showTasks",
+          "when": "view == task-x.chat",
+          "group": "overflow@6"
+        },
+        {
+          "command": "task-x.showPorts",
           "when": "view == task-x.chat",
           "group": "overflow@6"
         },

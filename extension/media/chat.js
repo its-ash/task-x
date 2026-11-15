@@ -33,6 +33,12 @@
   let state = { busy: false, autoCommit: false, modelGroups: [], active: null };
   let turn = null; // { response: Element|null }
   let current = null; // streaming assistant body
+  // Where new turns go: the log, or a fragment while earlier turns of a long chat are drawn.
+  let sink = log;
+  let older = []; // rows of a long chat not drawn yet, earliest first (see drawOlder)
+  let drawingOlder = false;
+  // Above this many files, lists of changed files show only the count.
+  const MAX_LISTED_FILES = 30;
   let renderQueued = false;
 
   // ---------- DOM helpers ----------
@@ -988,7 +994,7 @@
     log.append(w);
   }
   function response() {
-    if (!turn) { turn = { el: el('div', 'turn'), response: null }; log.append(turn.el); }
+    if (!turn) { turn = { el: el('div', 'turn'), response: null }; sink.append(turn.el); }
     if (!turn.response) {
       turn.response = el('div', 'response');
       turn.el.append(turn.response);
@@ -1070,6 +1076,11 @@
     const totalStat = el('span', 'stat');
     totalStat.append(el('span', 'add', `+${total.added}`), el('span', 'del', `-${total.removed}`));
     head.append(icon('files'), el('span', 'files-title', `${files.size} file${files.size === 1 ? '' : 's'} written`), el('span', 'spacer'), totalStat);
+    // Many files: the count only (the Changes panel keeps Keep all and Undo all).
+    if (files.size > MAX_LISTED_FILES) {
+      body.replaceChildren(head, el('div', 'files-many', 'Too many files to list. Keep all or Undo all in the Changes panel, or review them in Source Control.'));
+      return void scroll();
+    }
     const list = el('ul', 'files-list');
     for (const [path, v] of files) {
       const slash = path.lastIndexOf('/');
@@ -1124,7 +1135,7 @@
           req.append(n);
         }
         turn.el.append(req);
-        log.append(turn.el);
+        sink.append(turn.el);
         current = null;
         break;
       }
@@ -1228,10 +1239,13 @@
         break;
       }
       case 'lane': {
-        response().append(enter(laneCard(it)));
+        // An earlier turn drawn late shows its subtask as it is now, and leaves the board alone.
+        response().append(enter(laneCard(drawingOlder ? lanes.get(it.taskId) ?? it : it)));
         current = null;
-        lanes.set(it.taskId, it);
-        renderBoard();
+        if (!drawingOlder) {
+          lanes.set(it.taskId, it);
+          renderBoard();
+        }
         break;
       }
       case 'questions': {
@@ -1700,6 +1714,11 @@
     const added = files.reduce((n, f) => n + f.added, 0), removed = files.reduce((n, f) => n + f.removed, 0);
     $('changesTitle').textContent = `${files.length} file${files.length > 1 ? 's' : ''} changed`;
     $('changesStat').replaceChildren(el('span', 'add', `+${added}`), el('span', 'del', `-${removed}`));
+    // Many files: the count only. Keep all and Undo all still act on every one of them.
+    if (files.length > MAX_LISTED_FILES) {
+      changesList.replaceChildren(el('li', 'change-many', `Too many files to list here (${files.length}). Keep all or Undo all, or review them in Source Control.`));
+      return void applyCollapsed();
+    }
     changesList.replaceChildren(...files.map((f) => {
       const li = el('li', `change ${f.status}${seen.has(f.path) ? '' : ' new'}`);
       const slash = f.path.lastIndexOf('/');
@@ -1870,7 +1889,13 @@
   const pendingMerge = (it) => it.worktree && it.files && it.status !== 'running' && (!it.merge || it.merge === 'conflict');
   const MERGE_TEXT = { merged: 'merged', conflict: 'merge conflict', discarded: 'discarded' };
   function jumpToLane(taskId) {
-    const card = log.querySelector(`.lane[data-task-id="${CSS.escape(taskId)}"]`);
+    const find = () => log.querySelector(`.lane[data-task-id="${CSS.escape(taskId)}"]`);
+    let card = find();
+    // A subtask of an earlier turn not drawn yet: draw back to it.
+    while (!card && older.some((it) => it.kind === 'lane' && it.taskId === taskId)) {
+      drawOlder();
+      card = find();
+    }
     if (!card) return vscode.postMessage({ type: 'openSubagent', taskId });
     card.scrollIntoView({ block: 'center', behavior: 'smooth' });
     card.classList.remove('flash');
@@ -2469,6 +2494,7 @@
     { name: 'restore', description: 'Put the workspace back to a timeline step (the current state is saved first)', hint: '<step>', source: 'session' },
     { name: 'approvals', description: 'Every tool and MCP server: set it to allow, ask, or deny', source: 'session' },
     { name: 'agents-active', description: 'The agents and subagents at work, with what each is doing', source: 'session' },
+    { name: 'ports', description: 'Ports in use by what task-x started: open one in the browser or stop it', source: 'session' },
   ];
   function closeSlash() {
     slashOpen = false;
@@ -2745,23 +2771,80 @@
     insert('``', 1);
   });
 
+  // ---------- Long chats: the newest rows first, earlier ones as the user scrolls up ----------
+  // A saved chat can hold thousands of rows; drawing them all at once (markdown, diffs, cards)
+  // stalls the view. About PAGE_ITEMS of the newest rows are drawn, from the start of a turn when
+  // one is near, and earlier pages are drawn when the top of the log comes close.
+  const PAGE_ITEMS = 150;
+  const olderBar = el('div', 'load-older');
+  const olderBtn = button('link', 'Show earlier messages', () => drawOlder(), 'Show earlier messages');
+  olderBar.append(olderBtn);
+  const olderObserver = new IntersectionObserver((entries) => {
+    if (entries.some((e) => e.isIntersecting)) drawOlder();
+  }, { root: log, rootMargin: '600px 0px 0px 0px' });
+  // Scrolling near the top draws the next page too (an observer can be held back, for example in a hidden view).
+  log.addEventListener('scroll', () => { if (older.length && log.scrollTop < 600) drawOlder(); }, { passive: true });
+  /** Where the last page of `items` starts: a turn's first row within twice PAGE_ITEMS rows, else mid-turn. */
+  function pageStart(items) {
+    if (items.length <= PAGE_ITEMS) return 0;
+    const floor = items.length - PAGE_ITEMS;
+    for (let i = floor; i >= Math.max(0, items.length - 2 * PAGE_ITEMS); i--) if (items[i].kind === 'user') return i;
+    return floor;
+  }
+  /** Puts the bar at the top while earlier rows wait; observing it again draws the next page if it is still near. */
+  function showOlderBar() {
+    olderObserver.unobserve(olderBar);
+    if (!older.length) return void olderBar.remove();
+    const turns = older.filter((it) => it.kind === 'user').length;
+    olderBtn.textContent = `Show earlier messages (${turns ? `${turns} more turn${turns > 1 ? 's' : ''}` : `${older.length} more rows`})`;
+    if (log.firstChild !== olderBar) log.prepend(olderBar);
+    olderObserver.observe(olderBar);
+  }
+  /** Draws the next page of earlier rows above the ones on screen, keeping the view where it is. */
+  function drawOlder() {
+    if (!older.length) return;
+    const start = pageStart(older);
+    const page = older.slice(start);
+    older = older.slice(0, start);
+    const saved = { turn, current, turnFiles };
+    const frag = document.createDocumentFragment();
+    turn = null; current = null; turnFiles = null;
+    sink = frag; replaying = true; drawingOlder = true;
+    try {
+      page.forEach(renderItem);
+    } finally {
+      sink = log; replaying = false; drawingOlder = false;
+      ({ turn, current, turnFiles } = saved);
+    }
+    const height = log.scrollHeight, top = log.scrollTop;
+    olderBar.after(frag);
+    if (!stick) log.scrollTop = top + (log.scrollHeight - height);
+    showOlderBar();
+  }
+
   // ---------- Messages from the extension ----------
   window.addEventListener('message', ({ data: m }) => {
     switch (m.type) {
-      case 'history':
+      case 'history': {
         log.replaceChildren();
         turn = null; current = null; turnFiles = null;
         lanes.clear();
         dismissed.clear();
+        // Every subtask counts on the board, also those of turns not drawn yet.
+        for (const it of m.items) if (it.kind === 'lane') lanes.set(it.taskId, it);
+        const start = pageStart(m.items);
+        older = m.items.slice(0, start);
         replaying = true;
-        m.items.forEach(renderItem);
+        m.items.slice(start).forEach(renderItem);
         replaying = false;
         renderBoard();
         // A tab drawn while its answer streams keeps the last message open for the text still to come.
         if (!m.streaming) current = null;
         welcome();
+        showOlderBar();
         scroll(true);
         break;
+      }
       case 'status':
         state = { ...state, busy: m.busy, sleeping: m.sleeping ?? null, chrome: m.chrome ?? state.chrome, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker, refineModel: 'refineModel' in m ? m.refineModel : state.refineModel, helperModel: 'helperModel' in m ? m.helperModel : state.helperModel, agent: 'agent' in m ? m.agent : state.agent, effort: 'effort' in m ? m.effort : state.effort, sandbox: m.sandbox ?? state.sandbox, chatMode: 'chatMode' in m ? m.chatMode : state.chatMode };
         renderToolbar();

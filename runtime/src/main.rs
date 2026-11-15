@@ -9,6 +9,7 @@ mod mcp;
 mod mcp_import;
 mod mcp_server;
 mod oauth;
+mod ports;
 mod provider;
 mod rpc;
 mod server;

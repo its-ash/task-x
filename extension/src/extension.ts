@@ -18,6 +18,7 @@ import { registerVscodeFeatures } from './vscodeFeatures.js';
 import { addDocs, removeDocs } from './docs.js';
 import { registerEditorCommands } from './editorCommands.js';
 import { exportHtml, manageApprovals, showActiveAgents, showTimeline } from './sessionTools.js';
+import { PortsView } from './ports.js';
 import { SECTION, type ProviderRef, activeRef, deleteApiKey, hasApiKey, initChoice, isProviderRef, migrateSettings, modelFor, providerConfig, providerRefs, refLabel, refNeedsKey, sandboxOn, setProvider, settings, storeApiKey } from './config.js';
 import { ProviderDialog } from './providerDialog.js';
 import type { PluginInfo, TestReport } from './protocol.js';
@@ -172,6 +173,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const originals = new OriginalContent();
   const chat = new ChatViewProvider(ctx, client, () => ProviderDialog.show(ctx, client), originals, (level, msg) => logs.add(level, 'agent', msg));
   const bg = new BackgroundTasks(ctx.secrets, client, chat, (level, msg) => logs.add(level, 'agent', msg));
+  // Ports taken by what task-x started: polled from a runtime that runs, never starting one.
+  const portsView = new PortsView(() => (runtime?.running ? runtime.client : undefined), client, (m) => out.info(m));
   chat.foreignApproval = (req) => bg.approve(req);
   chat.onBusyChange = (busy) => {
     lastUse = Date.now();
@@ -517,6 +520,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     findings,
     vscode.commands.registerCommand('task-x.runInBackground', () => bg.start()),
     vscode.commands.registerCommand('task-x.showTasks', () => bg.show()),
+    portsView,
+    vscode.commands.registerCommand('task-x.showPorts', () => portsView.show()),
     vscode.commands.registerCommand('task-x.bestOf', () => runBestOf(ctx, client, chat, bg)),
     vscode.commands.registerCommand('task-x.clearFindings', () => findings.clear()),
     indexItem,

@@ -6,7 +6,7 @@ import { type Server, createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
-import type { ChatEventParams, ChatOutcome, ContextResult, ProviderConfig, TestReport, WorkspaceSummary } from '../protocol.js';
+import type { ChatEventParams, ChatOutcome, ContextResult, PortList, ProviderConfig, TestReport, WorkspaceSummary } from '../protocol.js';
 import { RpcError } from '../rpc.js';
 import { RuntimeProcess, findRuntime } from '../runtime.js';
 
@@ -119,4 +119,15 @@ test('indexes a workspace and retrieves relevant snippets with instructions', { 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('ports/list leaves out the client, and ports/stop refuses a process it does not list', { skip: !binary && 'runtime not built' }, async () => {
+  const list = await rt.client.request<PortList>('ports/list');
+  assert.equal(typeof list.supported, 'boolean');
+  assert.ok(Array.isArray(list.ports));
+  // The mock provider listens in this process, which started the runtime (as VS Code does): never listed.
+  const mockPort = (server.address() as AddressInfo).port;
+  assert.ok(!list.ports.some((p) => p.port === mockPort || p.pid === process.pid), JSON.stringify(list.ports));
+  await assert.rejects(rt.client.request('ports/stop', { pid: process.pid }), (e: unknown) => e instanceof RpcError && e.code === -32602);
+  await assert.rejects(rt.client.request('ports/stop', {}), (e: unknown) => e instanceof RpcError && e.code === -32602);
 });

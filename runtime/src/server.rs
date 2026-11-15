@@ -36,6 +36,12 @@ struct InitializeParams {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortStopParams {
+    pid: u32,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TaskIdParams {
     task_id: String,
@@ -687,6 +693,8 @@ impl Server {
             | "agent/export"
             | "agent/turns"
             | "tools/approvals"
+            | "ports/list"
+            | "ports/stop"
             | "mcp/status" => self.spawn(id, key, method, msg.params),
             _ => self.reply(&id, Err(RpcError::new(rpc::METHOD_NOT_FOUND, format!("unknown method: {method}")))),
         }
@@ -808,6 +816,7 @@ impl Server {
                 "edits/keep" | "edits/revert" => this.settle(method == "edits/keep", p).await,
                 "mcp/configure" => this.configure_mcp(p).await,
                 "chrome/status" => Ok(crate::chrome::status().await),
+                "ports/list" | "ports/stop" => this.ports(&method, p).await,
                 "claude/run" => this.run_claude(p, &token).await,
                 "mcp/status" => Ok(this.mcp.read().await.status()),
                 "tools/approvals" => this.approvals(p).await,
@@ -1298,6 +1307,17 @@ impl Server {
 
     fn root(&self) -> Option<PathBuf> {
         self.workspace.read().expect("workspace lock").as_ref().map(|w| w.index.root().to_path_buf())
+    }
+
+    /// `ports/list` and `ports/stop` (`{ pid }`): they run `lsof`/`ps`, and a stop waits for the process.
+    async fn ports(&self, method: &str, p: Value) -> Result<Value, RpcError> {
+        let root = self.root();
+        let pid = if method == "ports/stop" { Some(params::<PortStopParams>(p)?.pid) } else { None };
+        let job = tokio::task::spawn_blocking(move || match pid {
+            Some(pid) => crate::ports::stop(pid, root.as_deref()).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e)),
+            None => Ok(crate::ports::list(root.as_deref())),
+        });
+        job.await.map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e.to_string()))?
     }
 
     /// User hooks always apply; workspace hooks (`.anvil/hooks.json`) only in a trusted workspace.

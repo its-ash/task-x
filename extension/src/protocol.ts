@@ -303,6 +303,35 @@ export interface ChromeStatus {
   error?: string;
 }
 
+/**
+ * One port in use (`ports/list`): a process task-x started (`origin: 'taskX'`: the agent's commands,
+ * Claude Code's shells, MCP servers) or one running in the workspace folder (`'workspace'`).
+ * `addresses` are the local addresses it listens on (`*`, `0.0.0.0`, and `::` mean every interface).
+ */
+export interface PortInfo {
+  port: number;
+  addresses: string[];
+  pid: number;
+  name: string;
+  command: string;
+  origin: 'taskX' | 'workspace';
+  cwd?: string;
+}
+
+/** `ports/list` result. `supported: false` when the machine has neither `lsof` nor `ss`. */
+export interface PortList {
+  supported: boolean;
+  ports: PortInfo[];
+}
+
+/** `ports/stop` (`{ pid }`) result: `forced` when SIGTERM was not enough and SIGKILL followed. */
+export interface PortStopResult {
+  stopped: boolean;
+  forced: boolean;
+  port: number;
+  name: string;
+}
+
 /** `agent/run` `policy`. */
 export interface PolicyConfig {
   mode: 'readOnly' | 'askBeforeEdit' | 'askBeforeExecution' | 'autonomous';
