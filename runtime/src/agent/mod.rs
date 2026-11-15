@@ -221,6 +221,18 @@ pub struct RunParams {
     /// An embedding model for `semantic_search` and docs search (Ollama or OpenAI-compatible).
     #[serde(default)]
     pub embeddings: Option<ProviderConfig>,
+    /// A fresh session that knows nothing of other tasks: no `recall` of earlier tasks, and the
+    /// finished task is not added to the recall store. Project memory (`.task-x/memory.md`,
+    /// `remember`) stays: it holds facts about the project, not other conversations. Its subagents
+    /// inherit it (they still get the lead's context).
+    #[serde(default)]
+    pub isolated: bool,
+    /// Chrome mode: web work goes to the user's Chrome through the task-x extension. `browser` is
+    /// offered from the start and uses only that Chrome, other browser tools (chrome-devtools,
+    /// Playwright, Puppeteer MCP servers) are left out, and every `browser` call asks the user
+    /// (no mode or allow list approves it). Its subagents inherit it.
+    #[serde(default)]
+    pub chrome: bool,
     /// Nesting level; subagents run at depth 1 and cannot start more subagents.
     #[serde(default, skip_deserializing)]
     pub depth: u32,
@@ -515,6 +527,8 @@ pub type Steers = Arc<Mutex<HashMap<String, Vec<String>>>>;
 /// Steering messages waiting for one task, and their size.
 const MAX_STEERS: usize = 10;
 const MAX_STEER_CHARS: usize = 100_000;
+/// How often a task waiting for background work looks for a user message.
+const STEER_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct Host {
@@ -727,6 +741,10 @@ struct Run {
     timeline_root: Option<std::path::PathBuf>,
     /// A failed snapshot was reported; later failures stay quiet.
     timeline_warned: bool,
+    /// `RunParams::isolated`: no recall, and nothing added to the recall store.
+    isolated: bool,
+    /// `RunParams::chrome`: `browser` uses only the user's Chrome and asks before every call.
+    chrome: bool,
 }
 
 /// Whether a call may change files, so the timeline takes a snapshot after its step. Unknown and
@@ -738,6 +756,13 @@ fn changes_files(name: &str) -> bool {
             !([READ_SKILL, ASK_USER, FIND_TOOL, SUMMARIZE, SEMANTIC, DOCS_SEARCH, "recall"].contains(&name) || wakeup::name(name).is_some())
         }
     }
+}
+
+/// An MCP tool that drives a browser other than the user's Chrome through the task-x extension
+/// (chrome-devtools, Playwright, Puppeteer, VS Code's copies of them): left out in Chrome mode.
+fn other_browser_tool(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("mcp__") && ["chrome-devtools", "chrome_devtoo", "playwright", "puppeteer", "browser"].iter().any(|w| n.contains(w))
 }
 
 /// Tools offered from the start when the tool list is lazy: what nearly every coding task uses.
@@ -1568,6 +1593,8 @@ impl Run {
         let deletes = (call.name == "run_command").then(|| tools::validate::command_deletes(&call.input)).flatten();
         let (name, permission, decision) = match &deletes {
             Some(_) => (policy::COMMAND_DELETE.to_owned(), Permission::Delete, self.policy.decide_command_delete()),
+            // Chrome mode: the user approves every browser call in VS Code.
+            None if self.chrome && call.name == "browser" => (call.name.clone(), permission, self.policy.decide_supervised(&call.name, permission)),
             None => (call.name.clone(), permission, self.policy.decide(&call.name, permission)),
         };
         self.decide(call, &name, permission, decision, before.approve).await?;
@@ -1765,6 +1792,8 @@ impl Run {
             role_providers: Vec::new(),
             helper: self.helper.clone(),
             embeddings: self.embeddings.clone(),
+            isolated: self.isolated,
+            chrome: self.chrome,
             depth: self.depth + 1,
             agent: agent.cloned(),
             budget: self.budget.clone(),
@@ -2507,12 +2536,15 @@ impl Run {
         }
     }
 
-    /// Waits until a background command ends (or the task is cancelled). False when none run.
+    /// Waits until a background command ends or the user sends a message (true), or the task is
+    /// cancelled (false). False when none run. A message must not wait for a long-running job
+    /// (a dev server, a watcher): the user answered the reply, so the model takes the next step.
     async fn wait_background(&self) -> bool {
         let bg = &self.background;
+        let steered = || self.host.steers.lock().expect("steers lock").get(&self.rec.id).is_some_and(|q| !q.is_empty());
         loop {
             let changed = bg.changed.notified();
-            if !bg.done.lock().expect("background lock").is_empty() {
+            if !bg.done.lock().expect("background lock").is_empty() || steered() {
                 return true;
             }
             if bg.running.load(std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -2521,6 +2553,7 @@ impl Run {
             tokio::select! {
                 _ = changed => {}
                 _ = self.cancel.cancelled() => return false,
+                _ = tokio::time::sleep(STEER_POLL) => {}
             }
         }
     }
@@ -2604,6 +2637,10 @@ impl Run {
         let (mut bad_calls, mut cut_offs, mut cut_text) = (0, 0, String::new());
         self.rec.status = Status::Running;
         self.save();
+        // Chrome mode: this task's browser calls (and its subagents') go to the user's Chrome only.
+        if self.chrome {
+            tools::browser::set_chrome_mode(&self.rec.id, true);
+        }
         let prompt = self.rec.checkpoints.last().map(|c| c.prompt.clone()).unwrap_or_default();
         self.snap(format!("Before: {prompt}")).await;
         let status = loop {
@@ -2791,12 +2828,15 @@ impl Run {
         }
         // Wake-ups end with the task.
         self.wakeups.cancel_all();
+        if self.chrome {
+            tools::browser::set_chrome_mode(&self.rec.id, false);
+        }
         let end = serde_json::to_value(status).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default();
         self.snap(format!("End: {end}")).await;
         self.rec.skipped_checks = self.skipped_checks();
         self.save();
         // What this task did joins the workspace memory that `recall` searches in later tasks.
-        if self.depth == 0 && matches!(self.rec.status, Status::Completed) {
+        if self.depth == 0 && !self.isolated && matches!(self.rec.status, Status::Completed) {
             if let Some(d) = self.host.store.data_dir() {
                 let files: Vec<String> = self.rec.changed_files.iter().cloned().collect();
                 let title = self.rec.checkpoints.last().map_or(self.rec.title.clone(), |c| c.prompt.clone());
@@ -3007,6 +3047,8 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     for t in host.mcp.read().await.tools() {
         if policy.decide(&t.qualified, Permission::Network) == Decision::Deny
             || (!skill_tools.is_empty() && !skill_tools.contains(t.qualified.as_str()))
+            // Chrome mode: the user's Chrome is the only browser.
+            || (p.chrome && other_browser_tool(&t.qualified))
         {
             continue;
         }
@@ -3062,7 +3104,9 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     }
     if has_ws {
         tool_specs.push(summarize_spec());
-        tool_specs.push(recall::spec());
+        if !p.isolated {
+            tool_specs.push(recall::spec());
+        }
     }
     // A ranked map of the project at the start of a top-level task, leaning towards the request's files.
     if p.depth == 0 && p.limits.repo_map_tokens > 0 {
@@ -3086,6 +3130,7 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     if p.limits.lazy_tools {
         let keep = |t: &crate::provider::ToolSpec| {
             CORE_TOOLS.contains(&t.name.as_str())
+                || (p.chrome && t.name == "browser")
                 || (tools::find(&t.name).is_none() && !t.name.starts_with("mcp__"))
                 || skill_tools.contains(t.name.as_str())
         };
@@ -3095,6 +3140,10 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         if !deferred.is_empty() {
             tool_specs.push(find_tool_spec(&deferred));
         }
+    }
+    if p.chrome && tool_specs.iter().chain(&deferred).any(|t| t.name == "browser") {
+        system.push_str("\n\n");
+        system.push_str(tools::browser::CHROME_MODE_NOTE);
     }
     if let Some(r) = root.as_deref() {
         let memory = tools::memory::prompt_block(r);
@@ -3266,6 +3315,8 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         slept: Duration::ZERO,
         timeline_root: root.clone().filter(|_| p.depth == 0),
         timeline_warned: false,
+        isolated: p.isolated,
+        chrome: p.chrome,
     })
 }
 
@@ -3312,6 +3363,8 @@ pub async fn best_of(host: Host, p: BestOfParams, cancel: CancellationToken) -> 
         role_providers: Vec::new(),
         helper: None,
         embeddings: None,
+        isolated: false,
+        chrome: false,
         depth: 0,
         agent: None,
         budget: None,
@@ -3469,6 +3522,8 @@ mod tests {
             fallbacks: Vec::new(),
             prices: Vec::new(),
             role_providers: Vec::new(),
+            isolated: false,
+            chrome: false,
             depth: 0,
             agent: None,
             budget: None,
@@ -3938,6 +3993,36 @@ mod tests {
         assert!(first.contains("continues in the background"), "the call returned at once");
         assert!(!first.contains("exitCode"), "the command had not finished, so no output is in the step");
         assert!(seen[2]["messages"].to_string().contains("bg-done"), "the output came as a message");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A reply that asks the user something while a background command still runs: the user's
+    /// answer goes to the model at once instead of waiting for the command to end.
+    #[tokio::test]
+    async fn a_message_does_not_wait_for_background_work() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        let cmd = json!({ "command": ["sh", "-c", "perl -e 'select(undef, undef, undef, 2)'; echo bg-done"], "background": true });
+        let (base, seen) = mock(vec![
+            sse_tool("c1", "run_command", cmd),
+            sse_text("The server is starting. What next?"),
+            sse_text("Adding the test now."),
+            sse_text("The server stopped."),
+        ]);
+        let mut h = host(&root, ApprovalDecision::Allow, Arc::default());
+        let (steers, sent) = (h.steers.clone(), std::sync::atomic::AtomicBool::new(false));
+        h.emit = Arc::new(move |id, e| {
+            if e["type"] == "warning" && e["message"] == "Waiting for background work to finish." && !sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                assert!(steer(&steers, id, "add a test").unwrap());
+            }
+        });
+        let r = run(h, params(&base, ChatMode::Agent, Mode::AskBeforeEdit), CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4, "the answer, then the command's report");
+        let answered = seen[2]["messages"].to_string();
+        assert!(answered.contains("add a test"), "the message reached the model");
+        assert!(!answered.contains("exitCode"), "before the background command ended");
+        assert!(seen[3]["messages"].to_string().contains("exitCode"), "the command's report came after");
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -4992,6 +5077,55 @@ mod tests {
         assert_eq!(r.status, Status::Completed, "{:?}", r.error);
         let system = seen.lock().unwrap()[0]["messages"][0]["content"].as_str().unwrap().to_owned();
         assert!(system.contains("<project_memory>") && system.contains("cargo test --workspace"), "{system}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// An isolated run (a chat tab the user opened) gets no `recall` of other tasks, and its result
+    /// does not join the recall store; it keeps the project memory and `remember`.
+    #[tokio::test]
+    async fn an_isolated_run_knows_nothing_of_other_tasks() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        std::fs::create_dir_all(root.join(".task-x")).unwrap();
+        std::fs::write(root.join(".task-x/memory.md"), "# Project memory\n\n- Tests: cargo test --workspace\n").unwrap();
+        let names = |req: &Value| -> Vec<String> {
+            req["tools"].as_array().map(|a| a.iter().filter_map(|t| t["function"]["name"].as_str().map(str::to_owned)).collect()).unwrap_or_default()
+        };
+        for isolated in [false, true] {
+            let (base, seen) = mock(vec![sse_text("Done.")]);
+            let mut p = params(&base, ChatMode::Agent, Mode::AskBeforeEdit);
+            p.isolated = isolated;
+            let r = run(host(&root, ApprovalDecision::Allow, Arc::default()), p, CancellationToken::new()).await.unwrap();
+            assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+            let req = seen.lock().unwrap()[0].clone();
+            let system = req["messages"][0]["content"].as_str().unwrap().to_owned();
+            let tools = names(&req);
+            assert!(system.contains("<project_memory>") && system.contains("cargo test --workspace"), "{system}");
+            assert!(tools.iter().any(|t| t == "remember"), "{tools:?}");
+            assert_eq!(tools.iter().any(|t| t == "recall"), !isolated, "{tools:?}");
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Chrome mode: `browser` is offered from the start (lazy tool list too) with the note, and a
+    /// browser call asks the user even when the mode and the allow list would approve it.
+    #[tokio::test]
+    async fn chrome_mode_offers_the_browser_and_asks_before_every_call() {
+        let root = temp_repo(&[("a.txt", "x\n")]);
+        let (base, seen) = mock(vec![sse_tool("b1", "browser", json!({ "action": "tabs" })), sse_text("The user said no.")]);
+        let mut p = params(&base, ChatMode::Agent, Mode::Autonomous);
+        p.chrome = true;
+        p.limits.lazy_tools = true;
+        p.policy.allow = vec!["browser".into()];
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let r = run(host(&root, ApprovalDecision::Deny, events.clone()), p, CancellationToken::new()).await.unwrap();
+        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
+        let req = seen.lock().unwrap()[0].clone();
+        assert!(req["messages"][0]["content"].as_str().unwrap().contains("<chrome_mode>"));
+        assert!(req["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "browser"), "offered, not behind find_tool");
+        let asked = events.lock().unwrap().iter().any(|e| e["type"] == "approvalRequested" && e["tool"] == "browser");
+        assert!(asked, "the allow list does not approve the browser in Chrome mode");
+        assert!(!other_browser_tool("browser") && other_browser_tool("mcp__chrome-devtools__click") && other_browser_tool("mcp__vscode__mcp_chrome_devtoo_click"));
+        assert!(!other_browser_tool("mcp__figma__get"));
         std::fs::remove_dir_all(root).ok();
     }
 

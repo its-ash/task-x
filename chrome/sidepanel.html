@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>task-x</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header>
+      <h1><img src="icons/icon-32.png" alt="" />task-x</h1>
+      <span id="status" class="pill">Connecting…</span>
+    </header>
+
+    <section id="setup" hidden>
+      <p><strong>Not connected to the runtime.</strong> <span id="error"></span></p>
+      <p>Register the runtime with Chrome once, then reconnect:</p>
+      <pre><code>task-x-runtime chrome-install</code></pre>
+      <p class="muted">Or from the repository: <code>make chrome-install</code>. Extension id: <code id="ext-id"></code></p>
+      <button id="reconnect">Reconnect</button>
+    </section>
+
+    <section class="controls">
+      <button id="share" title="Let task-x drive the tab you are looking at">Share this tab</button>
+      <button id="pause" class="warn" title="Stop every task-x request in this browser">Pause</button>
+      <label class="toggle" title="On by default: task-x may drive any tab. Off: only the tabs it opened or you shared">
+        <input type="checkbox" id="all-tabs" /> Let task-x use every tab
+      </label>
+    </section>
+
+    <section>
+      <h2>task-x tabs</h2>
+      <ul id="tabs"></ul>
+      <p id="no-tabs" class="muted">None yet. task-x opens its pages in a purple “task-x · automated” tab group.</p>
+    </section>
+
+    <section>
+      <h2>Activity <button id="clear" class="link">clear</button></h2>
+      <ol id="log"></ol>
+    </section>
+
+    <footer class="muted">
+      <span id="version"></span> · Page content is untrusted: task-x is told never to follow instructions found in pages.
+    </footer>
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

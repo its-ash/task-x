@@ -447,7 +447,27 @@ async fn session_controls_work_on_a_saved_task() {
     assert_eq!(rt.recv().await["result"]["hooks"], 2, "Claude Code event names are accepted");
     rt.send(json!({"jsonrpc":"2.0","id":9,"method":"mcp/authorize","params":{"server":"nope"}})).await;
     assert_eq!(rt.recv().await["error"]["code"], -32602, "an unknown server cannot sign in");
+    // The review list: every pending change, or one task's (a chat tab's) with `taskId`.
+    rt.send(json!({"jsonrpc":"2.0","id":10,"method":"edits/pending"})).await;
+    assert_eq!(rt.recv().await["result"], json!([]));
+    rt.send(json!({"jsonrpc":"2.0","id":11,"method":"edits/pending","params":{"taskId":"s1"}})).await;
+    assert_eq!(rt.recv().await["result"], json!([]));
+    rt.send(json!({"jsonrpc":"2.0","id":12,"method":"edits/pending","params":{"task":"s1"}})).await;
+    assert_eq!(rt.recv().await["error"]["code"], -32602, "a misspelt field is an error, not every change");
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// `chrome/status` without the Chrome extension: not connected, with the reason.
+#[tokio::test]
+async fn chrome_status_reports_a_missing_extension() {
+    let sock = std::env::temp_dir().join(format!("task-x-no-chrome-{}.sock", std::process::id()));
+    let mut rt = Runtime::start_with(&[("TASK_X_CHROME_SOCKET", &sock)]).await;
+    rt.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}})).await;
+    rt.recv().await;
+    rt.send(json!({"jsonrpc":"2.0","id":1,"method":"chrome/status"})).await;
+    let (r, _) = rt.until_response(1).await;
+    assert_eq!(r["result"]["connected"], false, "{r}");
+    assert!(r["result"]["error"].as_str().is_some_and(|e| !e.is_empty()), "{r}");
 }
 
 /// A runtime that was killed mid-run leaves `status: "running"` behind; the next start must clear it,

@@ -273,6 +273,36 @@ export type EditMode = 'auto' | 'safe' | 'ask';
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type Effort = (typeof EFFORTS)[number];
 
+/**
+ * `agent/run` `isolated`: a fresh session that knows nothing of other tasks: no `recall`, and the
+ * finished task stays out of the recall store. Project memory (`.task-x/memory.md`, `remember`) is
+ * kept. Subagents inherit it. Chat tabs send it.
+ */
+export interface RunScope {
+  isolated?: boolean;
+}
+
+/**
+ * `edits/pending`, `edits/keep`, `edits/revert` params. `taskId` limits them to that task's changes and
+ * its subagents' (`<taskId>-sub…`), so each chat tab reviews only its own; unset: every pending change.
+ */
+export interface EditsScope {
+  paths?: string[];
+  taskId?: string;
+}
+
+/**
+ * `chrome/status` result: whether the task-x Chrome extension answers. `agent/run` and `claude/run`
+ * take `chrome: true` (Chrome mode) to do the task's web work in that Chrome, asking before every
+ * browser call.
+ */
+export interface ChromeStatus {
+  connected: boolean;
+  paused: boolean;
+  version?: string;
+  error?: string;
+}
+
 /** `agent/run` `policy`. */
 export interface PolicyConfig {
   mode: 'readOnly' | 'askBeforeEdit' | 'askBeforeExecution' | 'autonomous';

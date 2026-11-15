@@ -246,9 +246,23 @@ pub struct PendingFile {
     pub operations: Vec<usize>,
 }
 
+/// Every pending change, of every task (tests; the server calls `pending_for`).
+#[cfg(test)]
 pub fn pending(log: &EditLog) -> Vec<PendingFile> {
+    pending_for(log, None)
+}
+
+/// Whether an operation belongs to a task: made by the task itself or by one of its subagents
+/// (`<task>-sub<n>`, nested ones too). Operations of no task (the client's own tool calls) belong to none.
+fn owned_by(op: &Operation, task: &str) -> bool {
+    op.task_id.as_deref().is_some_and(|t| t == task || t.strip_prefix(task).is_some_and(|rest| rest.starts_with("-sub")))
+}
+
+/// `pending`, limited to the operations of one task and its subagents when `task` is set, so a
+/// chat tab reviews only what its own task changed.
+pub fn pending_for(log: &EditLog, task: Option<&str>) -> Vec<PendingFile> {
     let mut out: Vec<PendingFile> = Vec::new();
-    for op in log.operations.iter().filter(|o| !o.undone && !o.expired) {
+    for op in log.operations.iter().filter(|o| !o.undone && !o.expired && task.is_none_or(|t| owned_by(o, t))) {
         for ch in op.changes.iter().filter(|c| !c.settled) {
             match out.iter_mut().find(|p| p.path == ch.path) {
                 Some(p) => {
@@ -287,10 +301,11 @@ fn settle(log: &mut EditLog, path: &str, ops: &[usize]) {
 }
 
 /// Keeps the agent's changes to `paths` (all pending files when `None`): they leave the review list.
-pub fn keep(ctx: &ToolCtx, paths: Option<&[String]>) -> Vec<String> {
+/// With `task`, only that task's changes (see `pending_for`).
+pub fn keep(ctx: &ToolCtx, paths: Option<&[String]>, task: Option<&str>) -> Vec<String> {
     let mut log = ctx.edits.lock().expect("edit log lock");
     let mut kept = Vec::new();
-    for p in pending(&log) {
+    for p in pending_for(&log, task) {
         if paths.is_none_or(|ps| ps.contains(&p.path)) {
             settle(&mut log, &p.path, &p.operations);
             kept.push(p.path);
@@ -301,10 +316,11 @@ pub fn keep(ctx: &ToolCtx, paths: Option<&[String]>) -> Vec<String> {
 }
 
 /// Restores pending files to their content before the agent touched them. A file that changed
-/// on disk after the agent's last write is left alone and reported as a conflict.
-pub fn revert(ctx: &ToolCtx, paths: Option<&[String]>) -> ToolResult {
+/// on disk after the agent's last write is left alone and reported as a conflict. With `task`,
+/// only that task's changes (see `pending_for`).
+pub fn revert(ctx: &ToolCtx, paths: Option<&[String]>, task: Option<&str>) -> ToolResult {
     let targets: Vec<PendingFile> =
-        pending(&ctx.edits.lock().expect("edit log lock")).into_iter().filter(|p| paths.is_none_or(|ps| ps.contains(&p.path))).collect();
+        pending_for(&ctx.edits.lock().expect("edit log lock"), task).into_iter().filter(|p| paths.is_none_or(|ps| ps.contains(&p.path))).collect();
     let mut changes = Vec::new();
     let mut reverted = Vec::new();
     let mut conflicts = Vec::new();
@@ -1270,16 +1286,37 @@ pub(crate) mod tests {
         let p = pending(&c.edits.lock().unwrap());
         assert_eq!(p.len(), 2);
         assert_eq!((p[0].path.as_str(), p[0].added, p[0].removed, p[0].original.as_deref()), ("a.txt", 2, 1, Some("1\n2\n")));
-        assert_eq!(keep(&c, Some(&["b.txt".into()])), ["b.txt"]);
-        let r = revert(&c, None).unwrap();
+        assert_eq!(keep(&c, Some(&["b.txt".into()]), None), ["b.txt"]);
+        let r = revert(&c, None, None).unwrap();
         assert_eq!(r["reverted"], json!(["a.txt"]));
         assert_eq!(std::fs::read_to_string(c.root.join("a.txt")).unwrap(), "1\n2\n");
         assert_eq!(std::fs::read_to_string(c.root.join("b.txt")).unwrap(), "y\n");
         assert!(pending(&c.edits.lock().unwrap()).is_empty());
         run(&c, "replace_text", json!({ "path": "b.txt", "oldText": "y", "newText": "z" })).unwrap();
         std::fs::write(c.root.join("b.txt"), "user\n").unwrap();
-        assert_eq!(revert(&c, None).unwrap()["conflicts"][0]["path"], "b.txt");
+        assert_eq!(revert(&c, None, None).unwrap()["conflicts"][0]["path"], "b.txt");
         assert_eq!(std::fs::read_to_string(c.root.join("b.txt")).unwrap(), "user\n");
+    }
+
+    /// Each chat tab reviews only its own task's changes (and its subagents'): keeping or reverting
+    /// them leaves another task's changes pending.
+    #[test]
+    fn pending_keep_and_revert_can_be_limited_to_one_task() {
+        let c = ctx(&[("a.txt", "a\n"), ("b.txt", "b\n"), ("s.txt", "s\n")]);
+        let as_task = |id: &str| ToolCtx { root: c.root.clone(), workspace: c.workspace.clone(), cancel: c.cancel.clone(), seen: c.seen.clone(), edits: c.edits.clone(), task_id: Some(id.into()) };
+        let (one, sub, two, other) = (as_task("c1"), as_task("c1-sub1"), as_task("c2"), as_task("c1x"));
+        run(&one, "replace_text", json!({ "path": "a.txt", "oldText": "a", "newText": "A" })).unwrap();
+        run(&sub, "replace_text", json!({ "path": "s.txt", "oldText": "s", "newText": "S" })).unwrap();
+        run(&two, "replace_text", json!({ "path": "b.txt", "oldText": "b", "newText": "B" })).unwrap();
+        run(&other, "create_file", json!({ "path": "x.txt", "content": "x" })).unwrap();
+        let paths = |task: Option<&str>| pending_for(&c.edits.lock().unwrap(), task).into_iter().map(|p| p.path).collect::<Vec<_>>();
+        assert_eq!(paths(Some("c1")), ["a.txt", "s.txt"], "the task and its subagent, not a task whose id only starts the same");
+        assert_eq!(paths(Some("c2")), ["b.txt"]);
+        assert_eq!(paths(None).len(), 4);
+        assert_eq!(revert(&c, None, Some("c1")).unwrap()["reverted"], json!(["a.txt", "s.txt"]));
+        assert_eq!(std::fs::read_to_string(c.root.join("b.txt")).unwrap(), "B\n", "the other tab's change stays");
+        assert_eq!(keep(&c, None, Some("c2")), ["b.txt"]);
+        assert_eq!(paths(None), ["x.txt"]);
     }
 
     #[test]

@@ -3,7 +3,7 @@
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
   const log = $('log'), input = $('input'), send = $('send'), progress = $('progress');
-  const modelBtn = $('modelBtn'), agentBtn = $('agentBtn'), settingsBtn = $('settingsBtn'), effortBtn = $('effortBtn'), mcpBtn = $('mcpBtn');
+  const modelBtn = $('modelBtn'), agentBtn = $('agentBtn'), settingsBtn = $('settingsBtn'), effortBtn = $('effortBtn'), mcpBtn = $('mcpBtn'), chromeBtn = $('chromeBtn');
   const nightPlanBtn = $('nightPlanBtn'), nightLoopBtn = $('nightLoopBtn');
   const refineBtn = $('refineBtn');
 
@@ -397,6 +397,22 @@
     row.append(head, range, ticks, desc);
     menu.append(row);
     return range;
+  }
+  // ---------- Chrome chip: this tab's web work goes to the user's own Chrome ----------
+  // Green when Chrome mode is on and the task-x Chrome extension answers; grey otherwise.
+  chromeBtn.addEventListener('click', () => vscode.postMessage({ type: 'toggleChrome' }));
+  function renderChrome() {
+    const c = state.chrome || { on: false, connected: false, paused: false };
+    const look = !c.on ? 'off' : c.connected && !c.paused ? 'on' : 'offline';
+    chromeBtn.dataset.state = look;
+    chromeBtn.setAttribute('aria-pressed', String(!!c.on));
+    chromeBtn.replaceChildren(icon('globe'), el('span', 'text', 'Chrome'));
+    chromeBtn.title = look === 'on'
+      ? 'Chrome mode is on: this chat does web work in your Chrome. Every browser action asks you first. Click to turn it off.'
+      : look === 'offline'
+        ? `Chrome mode is on, but ${c.paused ? 'task-x is paused in Chrome (resume it from the task-x side panel)' : 'the task-x Chrome extension is not connected'}. Click to turn it off.`
+        : 'Chrome mode is off. Click to do this chat\'s web work in your own Chrome.';
+    chromeBtn.setAttribute('aria-label', chromeBtn.title);
   }
   effortBtn.setAttribute('aria-haspopup', 'dialog');
   effortBtn.addEventListener('click', () => {
@@ -1745,22 +1761,30 @@
     effortBtn.title = `Effort: ${ef[1]}. ${ef[2]}`;
     effortBtn.setAttribute('aria-label', effortBtn.title);
     modelBtn.disabled = state.busy;
-    if (send.dataset.busy !== String(state.busy)) {
-      send.dataset.busy = String(state.busy);
+    renderChrome();
+    // A sleeping task (waiting for a wake-up): the button is a green Send, and a message wakes it.
+    const asleep = state.busy && !!state.sleeping;
+    const working = state.busy && !asleep;
+    const look = working ? 'busy' : asleep ? 'sleeping' : 'idle';
+    if (send.dataset.look !== look) {
+      send.dataset.look = look;
       send.classList.remove('morph');
       void send.offsetWidth; // restart the icon transition
       send.classList.add('morph');
     }
-    send.replaceChildren(state.busy ? icon('robot', 'busy-robot') : icon('send'));
-    send.title = state.busy ? 'Stop' : 'Send (Enter)';
+    send.replaceChildren(working ? icon('robot', 'busy-robot') : icon('send'));
+    send.title = asleep ? `Sleeping until ${new Date(state.sleeping).toLocaleTimeString()}. Send a message to wake it (Enter)` : working ? 'Stop' : 'Send (Enter)';
     send.setAttribute('aria-label', send.title);
-    send.classList.toggle('primary', !state.busy);
-    progress.classList.toggle('busy', state.busy);
+    send.classList.toggle('primary', !working && !asleep);
+    send.classList.toggle('sleeping', asleep);
+    progress.classList.toggle('busy', working);
     // While working, the input box gets the animated border (the top bar is no longer drawn).
     const form = $('form');
-    form.classList.toggle('busy', state.busy);
-    form.setAttribute('aria-busy', String(state.busy));
-    input.placeholder = state.busy ? 'Enter steers the running task. Ctrl+Enter queues the next message. Stop ends the task.' : `${PLACEHOLDER} (Enter to send, Shift+Enter for a new line)`;
+    form.classList.toggle('busy', working);
+    form.setAttribute('aria-busy', String(working));
+    input.placeholder = asleep
+      ? 'The agent is sleeping. Enter wakes it with your message; Stop on the tab ends the task.'
+      : working ? 'Enter steers the running task. Ctrl+Enter queues the next message. Stop ends the task.' : `${PLACEHOLDER} (Enter to send, Shift+Enter for a new line)`;
   }
   for (const b of [modelBtn, agentBtn, nightPlanBtn, nightLoopBtn]) { b.setAttribute('aria-haspopup', 'menu'); b.setAttribute('aria-expanded', 'false'); }
 
@@ -2102,7 +2126,7 @@
       vscode.postMessage({ type: 'listTasks' });
     } else if (document.body.dataset.tabKind !== 'subagent') input.focus();
   }
-  const TAB_STATUS = { running: 'Running', completed: 'Done', failed: 'Failed', cancelled: 'Stopped' };
+  const TAB_STATUS = { running: 'Running', sleeping: 'Sleeping', completed: 'Done', failed: 'Failed', cancelled: 'Stopped' };
   function renderTabs() {
     const onChat = document.body.dataset.view !== 'history';
     const cur = tabs.find((t) => t.id === activeTab);
@@ -2119,8 +2143,11 @@
       tab.setAttribute('aria-controls', 'log');
       tab.tabIndex = on ? 0 : -1;
       const what = t.kind === 'subagent' ? `Subagent ${t.title} (${t.role || 'agent'})` : `Agent chat: ${t.title}`;
-      tab.title = t.status ? `${what} · ${TAB_STATUS[t.status] || t.status}` : what;
-      const mark = t.status === 'running' ? icon('loading', 'codicon-modifier-spin tab-icon') : icon(t.kind === 'subagent' ? ROLE_ICONS[t.role] || 'person' : 'comment-discussion', 'tab-icon');
+      const until = t.status === 'sleeping' && t.until ? ` until ${new Date(t.until).toLocaleTimeString()}` : '';
+      tab.title = t.status ? `${what} · ${TAB_STATUS[t.status] || t.status}${until}` : what;
+      const mark = t.status === 'running' ? icon('loading', 'codicon-modifier-spin tab-icon')
+        : t.status === 'sleeping' ? icon('clock', 'tab-icon tab-sleeping')
+        : icon(t.kind === 'subagent' ? ROLE_ICONS[t.role] || 'person' : 'comment-discussion', 'tab-icon');
       const close = button('tab-close', icon('close'), (e) => { e.stopPropagation(); closeTab(t.id); }, `Close ${t.title}`);
       close.tabIndex = -1;
       tab.append(mark, el('span', 'tab-title', t.title));
@@ -2146,8 +2173,29 @@
     sel?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     if (hadFocus) (sel || strip.querySelector('.chat-tab'))?.focus();
   }
+  // Each chat tab keeps its own unsent draft: the text typed and the images attached. The text is
+  // kept in the webview state too, so it survives a reload; images stay in memory only.
+  const drafts = new Map(Object.entries(vscode.getState()?.drafts ?? {}).map(([id, text]) => [id, { text, attachments: [] }]));
+  function saveDrafts() {
+    const text = Object.fromEntries([...drafts].filter(([, d]) => d.text).map(([id, d]) => [id, d.text]));
+    vscode.setState({ ...(vscode.getState() || {}), drafts: text });
+  }
+  function swapDraft(from, to) {
+    if (from === to) return;
+    if (from) {
+      if (input.value || attachments.length) drafts.set(from, { text: input.value, attachments });
+      else drafts.delete(from);
+    }
+    const d = drafts.get(to);
+    input.value = d?.text ?? '';
+    attachments = d?.attachments ?? [];
+    renderAttachments();
+    autosize();
+    saveDrafts();
+  }
   function selectTab(id) {
     if (id !== activeTab) {
+      swapDraft(activeTab, id);
       activeTab = id;
       vscode.postMessage({ type: 'selectTab', id });
     }
@@ -2326,7 +2374,8 @@
     e.preventDefault();
     attachFiles(files);
   });
-  send.addEventListener('click', () => (state.busy ? vscode.postMessage({ type: 'cancel' }) : $('form').requestSubmit()));
+  // Stop while working; while sleeping it sends, and the message wakes the task.
+  send.addEventListener('click', () => (state.busy && !state.sleeping ? vscode.postMessage({ type: 'cancel' }) : $('form').requestSubmit()));
   // Refine: the host rewrites the prompt with the routed model; the input stays locked until the answer comes.
   let refining = false;
   function setRefining(on) {
@@ -2714,7 +2763,7 @@
         scroll(true);
         break;
       case 'status':
-        state = { ...state, busy: m.busy, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker, refineModel: 'refineModel' in m ? m.refineModel : state.refineModel, helperModel: 'helperModel' in m ? m.helperModel : state.helperModel, agent: 'agent' in m ? m.agent : state.agent, effort: 'effort' in m ? m.effort : state.effort, sandbox: m.sandbox ?? state.sandbox, chatMode: 'chatMode' in m ? m.chatMode : state.chatMode };
+        state = { ...state, busy: m.busy, sleeping: m.sleeping ?? null, chrome: m.chrome ?? state.chrome, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker, refineModel: 'refineModel' in m ? m.refineModel : state.refineModel, helperModel: 'helperModel' in m ? m.helperModel : state.helperModel, agent: 'agent' in m ? m.agent : state.agent, effort: 'effort' in m ? m.effort : state.effort, sandbox: m.sandbox ?? state.sandbox, chatMode: 'chatMode' in m ? m.chatMode : state.chatMode };
         renderToolbar();
         fillSettings();
         break;
@@ -2845,6 +2894,9 @@
       case 'queue': renderQueue(m.items, m.steering); break;
       case 'tasks': renderTasks(m); break;
       case 'tabs':
+        swapDraft(activeTab, m.active);
+        // Closed tabs take their drafts with them.
+        for (const id of [...drafts.keys()]) if (!m.tabs.some((t) => t.id === id)) drafts.delete(id);
         tabs = m.tabs;
         activeTab = m.active;
         renderTabs();

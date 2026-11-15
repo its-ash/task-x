@@ -286,9 +286,13 @@ fn home_dir() -> Option<PathBuf> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct PathsParams {
     #[serde(default)]
     paths: Option<Vec<String>>,
+    /// Only this task's changes (its own and its subagents'); unset: every pending change.
+    #[serde(default)]
+    task_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -600,7 +604,12 @@ impl Server {
                     agent::team::list(&r, &CancellationToken::new()).map(|w| json!(w)).map_err(|e| RpcError::new(rpc::TOOL_ERROR, e))
                 }),
             ),
-            "edits/pending" => self.reply(&id, Ok(json!(tools::pending(&self.edits.lock().expect("edit log lock"))))),
+            "edits/pending" => self.reply(
+                &id,
+                // Params are optional: `{ taskId? }` limits the list to one task's changes.
+                (if msg.params.is_null() { Ok(PathsParams { paths: None, task_id: None }) } else { params::<PathsParams>(msg.params) })
+                    .map(|p| json!(tools::pending_for(&self.edits.lock().expect("edit log lock"), p.task_id.as_deref()))),
+            ),
             "agent/steer" => self.reply(
                 &id,
                 params::<SteerParams>(msg.params).and_then(|p| {
@@ -647,6 +656,7 @@ impl Server {
             | "edits/undo"
             | "edits/keep"
             | "edits/revert"
+            | "chrome/status"
             | "claude/run"
             | "mcp/configure"
             | "worktrees/apply"
@@ -797,6 +807,7 @@ impl Server {
                 "edits/undo" => this.undo(p).await,
                 "edits/keep" | "edits/revert" => this.settle(method == "edits/keep", p).await,
                 "mcp/configure" => this.configure_mcp(p).await,
+                "chrome/status" => Ok(crate::chrome::status().await),
                 "claude/run" => this.run_claude(p, &token).await,
                 "mcp/status" => Ok(this.mcp.read().await.status()),
                 "tools/approvals" => this.approvals(p).await,
@@ -1473,7 +1484,8 @@ impl Server {
         let p: PathsParams = params(p)?;
         let ctx = self.tool_ctx(CancellationToken::new())?;
         tokio::task::spawn_blocking(move || {
-            if keep { Ok(json!({ "kept": tools::keep(&ctx, p.paths.as_deref()) })) } else { tools::revert(&ctx, p.paths.as_deref()) }
+            let task = p.task_id.as_deref();
+            if keep { Ok(json!({ "kept": tools::keep(&ctx, p.paths.as_deref(), task) })) } else { tools::revert(&ctx, p.paths.as_deref(), task) }
         })
         .await
         .map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e.to_string()))?

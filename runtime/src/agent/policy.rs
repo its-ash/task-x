@@ -129,6 +129,16 @@ impl Policy {
         Decision::Ask
     }
 
+    /// A tool the user supervises (the browser in Chrome mode): never approved by a mode, `allow`,
+    /// or `allowAll`. It asks every time, unless the user picked "allow for this session" on one of
+    /// its prompts; `deny` and a read-only mode still refuse it.
+    pub fn decide_supervised(&self, tool: &str, p: Permission) -> Decision {
+        match self.decide(tool, p) {
+            Decision::Allow if !self.session_grants.contains(tool) => Decision::Ask,
+            d => d,
+        }
+    }
+
     pub fn decide(&self, tool: &str, p: Permission) -> Decision {
         let listed = self.config.allow.iter().any(|a| tool_matches(a, tool));
         if self.config.deny.iter().any(|d| tool_matches(d, tool)) {
@@ -179,6 +189,22 @@ mod tests {
 
     fn pol(mode: Mode) -> Policy {
         Policy::new(PolicyConfig { mode, ..Default::default() })
+    }
+
+    /// The browser in Chrome mode: no mode, allow entry, or allowAll approves it; only the user's
+    /// "allow for this session" on its prompt does, and deny or read-only still refuse it.
+    #[test]
+    fn a_supervised_tool_always_asks_the_user() {
+        let p = Permission::Network;
+        let auto = Policy::new(PolicyConfig { mode: Mode::Autonomous, edit_mode: Some(EditMode::Auto), allow_all: true, allow: vec!["browser".into()], ..Default::default() });
+        assert_eq!(auto.decide("browser", p), Decision::Allow);
+        assert_eq!(auto.decide_supervised("browser", p), Decision::Ask, "no mode or list approves it");
+        let mut granted = auto.clone();
+        granted.grant_session("browser");
+        assert_eq!(granted.decide_supervised("browser", p), Decision::Allow, "the user allowed it for the session");
+        assert_eq!(pol(Mode::ReadOnly).decide_supervised("browser", p), Decision::Deny);
+        let denied = Policy::new(PolicyConfig { mode: Mode::Autonomous, deny: vec!["browser".into()], ..Default::default() });
+        assert_eq!(denied.decide_supervised("browser", p), Decision::Deny);
     }
 
     #[test]

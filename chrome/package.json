@@ -1,0 +1,10 @@
+{
+  "name": "task-x-chrome",
+  "version": "0.1.0",
+  "private": true,
+  "description": "task-x Chrome extension, loaded unpacked from this folder",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

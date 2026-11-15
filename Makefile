@@ -17,7 +17,7 @@ CODE ?= code
 EXT_VERSION = $(shell node -p "require('./$(EXT)/package.json').version")
 VSIX = $(EXT)/task-x-$(EXT_VERSION).vsix
 
-.PHONY: run build deploy install add bump link-vscode ext ext-install install-vsix ext-run
+.PHONY: run build deploy install add bump link-vscode ext ext-install install-vsix ext-run chrome-install chrome-test
 
 # Debug build, then an interactive session in this folder.
 run:
@@ -44,6 +44,7 @@ install: ext
 		echo "$(CODE) is not on your PATH, so the extension was not installed. Install $(VSIX) from VS Code (Extensions: Install from VSIX), or run make install CODE=<path to code>."; \
 	fi
 	@$(MAKE) --no-print-directory link-vscode
+	@$(PREFIX)/bin/$(BIN) chrome-install --path $(PREFIX)/bin/$(BIN) || echo "Could not register the Chrome extension's host; run make chrome-install."
 
 # Installed task-x VS Code extensions run the runtime in their own bin/ folder, which no update
 # reaches. Each one's copy becomes a link to $(PREFIX)/bin/$(BIN), so every install (and its MCP
@@ -85,6 +86,19 @@ ext-run:
 	npm --prefix $(EXT) install --no-audit --no-fund
 	npm --prefix $(EXT) run build
 	$(CODE) --extensionDevelopmentPath="$(CURDIR)/$(EXT)"
+
+# Installs the release runtime as $(PREFIX)/bin/$(BIN) and registers it as the native messaging
+# host of the task-x Chrome extension in every installed Chromium browser. Then load chrome/ in
+# chrome://extensions (Developer mode, Load unpacked).
+chrome-install: build
+	mkdir -p $(PREFIX)/bin
+	rm -f $(PREFIX)/bin/$(BIN)
+	cp $(RUNTIME)/target/release/$(BIN) $(PREFIX)/bin/$(BIN)
+	$(PREFIX)/bin/$(BIN) chrome-install --path $(PREFIX)/bin/$(BIN)
+
+# Tests of the Chrome extension's logic and manifest (no browser needed).
+chrome-test:
+	npm --prefix chrome test
 
 # Raises the patch version in runtime/Cargo.toml until no release v<version> exists, so each
 # deploy is a new release. A deploy that failed before its release keeps its version.

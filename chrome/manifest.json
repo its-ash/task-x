@@ -1,0 +1,91 @@
+{
+  "manifest_version": 3,
+  "name": "task-x",
+  "short_name": "task-x",
+  "version": "0.1.0",
+  "description": "Lets the task-x coding agent drive this browser: open pages, read them, click, type, and capture, in your own signed-in profile.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2cKv9LbNcIchksOwmRFNVhYcHfyVHUJSV7O0uWvgMZcCrX9ihNv/qhQ+Th6A1wK7G6VeY1cfIHg76dZaI1lWHCmqWVZf804T2jIf76g1+o6uZnvdNITzJVDCYNLR7pzDAsxWpHYd9Onjg6dCc4UcAfVrLNwQKLOZg6tbQD3vdkQ2hJ7ruZdB0LiKO6yb6JwspJz6/FoJNNww4hsEHhxqjxBVg4ITjslErJnNSbBcnQn6yEOCKiS2jYf+dKawDjQbWOgovxK17kdvpkRzMfNBSMSw1gjiyp743BkQalCD60yKwZdcKvLhLk2LJh3oYMgYM9QX7qbF63W/srIGsZmNWQIDAQAB",
+  "minimum_chrome_version": "116",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "task-x",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "commands": {
+    "share-tab": {
+      "suggested_key": { "default": "Ctrl+Shift+Y", "mac": "Command+Shift+Y" },
+      "description": "Share the current tab with task-x, or stop sharing it"
+    },
+    "pause": {
+      "description": "Pause or resume task-x in this browser"
+    }
+  },
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "bookmarks",
+    "browsingData",
+    "clipboardRead",
+    "clipboardWrite",
+    "contentSettings",
+    "contextMenus",
+    "cookies",
+    "debugger",
+    "declarativeNetRequest",
+    "declarativeNetRequestFeedback",
+    "declarativeNetRequestWithHostAccess",
+    "desktopCapture",
+    "downloads",
+    "downloads.open",
+    "downloads.ui",
+    "favicon",
+    "fontSettings",
+    "geolocation",
+    "history",
+    "idle",
+    "management",
+    "nativeMessaging",
+    "notifications",
+    "offscreen",
+    "pageCapture",
+    "power",
+    "privacy",
+    "proxy",
+    "readingList",
+    "scripting",
+    "search",
+    "sessions",
+    "sidePanel",
+    "storage",
+    "system.cpu",
+    "system.display",
+    "system.memory",
+    "system.storage",
+    "tabCapture",
+    "tabGroups",
+    "tabs",
+    "topSites",
+    "tts",
+    "unlimitedStorage",
+    "userScripts",
+    "webNavigation",
+    "webRequest",
+    "windows"
+  ],
+  "host_permissions": ["<all_urls>"]
+}

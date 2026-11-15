@@ -1,4 +1,5 @@
 mod agent;
+mod chrome;
 mod claude_cli;
 mod cli;
 mod context;
@@ -40,6 +41,14 @@ async fn main() -> ExitCode {
     }
     // The terminal front end: `exec` (one task, for scripts and CI) and `chat` (interactive).
     let first = std::env::args().nth(1);
+    // Chrome starts the binary as the task-x extension's native messaging host.
+    if chrome::is_host_launch(first.as_deref()) {
+        return chrome::host_main().await;
+    }
+    if first.as_deref() == Some("chrome-install") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        return chrome::install(&args);
+    }
     if matches!(first.as_deref(), Some("exec" | "chat")) {
         let args: Vec<String> = std::env::args().skip(1).collect();
         return cli::main(&args).await;

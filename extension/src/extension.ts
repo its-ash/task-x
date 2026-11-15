@@ -192,7 +192,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // Review findings (an anvil-findings block in the answer) appear in the Problems panel.
   const findings = vscode.languages.createDiagnosticCollection('task-x-review');
   // #4: the pending edits inside the editor, with Keep / Undo per file and Undo per change.
-  const review = new InlineReview({ keep: (rel) => chat.settle('keep', [rel]), undoFile: (rel) => chat.settle('revert', [rel]), diff: (rel) => chat.diffFile(rel) });
+  const review = new InlineReview({ keep: (rel) => chat.settle('keep', [rel], null), undoFile: (rel) => chat.settle('revert', [rel], null), diff: (rel) => chat.diffFile(rel) });
   chat.onPending = (files) => review.update(files);
   ctx.subscriptions.push(review);
   // #5, #6, #8, #13, #16, #17: quick fixes, commit messages, terminal, tests, review comments, GitHub.

@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { editMode, effort, isProviderRef, providerConfig, providerConfigWith, settings, SECTION, toolModels, windowChoice } from './config.js';
-import { type ChatMode, type EditorContext, type ImageInput, type PolicyConfig, type PriceRule, type ProviderConfig, ROLES, type Role } from './protocol.js';
+import { type ChatMode, type EditorContext, type ImageInput, type PolicyConfig, type PriceRule, type ProviderConfig, ROLES, type Role, type RunScope } from './protocol.js';
 
 const TASK_KINDS = ['question', 'bugInvestigation', 'codeModification', 'newFeature', 'refactoring', 'testing', 'documentation', 'repositoryWide', 'architecture'];
 const MAX_PRICE_RULES = 100;
@@ -85,7 +85,7 @@ export async function routes(secrets: vscode.SecretStorage): Promise<{ kinds: st
 }
 
 /** Full `agent/run` params: the active provider plus routes, fallbacks, role models, prices, policy, and limits. */
-export async function runParams(secrets: vscode.SecretStorage, o: { prompt: string; mode: ChatMode; taskId: string; editor: EditorContext; provider?: ProviderConfig; images?: ImageInput[] }) {
+export async function runParams(secrets: vscode.SecretStorage, o: { prompt: string; mode: ChatMode; taskId: string; editor: EditorContext; provider?: ProviderConfig; images?: ImageInput[] } & RunScope) {
   const c = cfg();
   const active = c.get<string>('provider');
   const provider = o.provider ?? (await providerConfig(secrets));
@@ -113,6 +113,7 @@ export async function runParams(secrets: vscode.SecretStorage, o: { prompt: stri
     roleProviders,
     prices: prices(),
     limits: limits(),
+    ...(o.isolated ? { isolated: true } : {}),
   };
 }
 

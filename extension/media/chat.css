@@ -114,7 +114,9 @@ body {
 .tab-stop .codicon { font-size: 12px; }
 .tab-stop:hover { filter: brightness(1.1); }
 .tab-stop:active { transform: scale(.92); }
-.chat-tab[data-status=running] { max-width: 220px; }
+.chat-tab[data-status=running], .chat-tab[data-status=sleeping] { max-width: 220px; }
+/* A sleeping chat tab: a clock in the green of the sleeping Send button. */
+.chat-tab .tab-sleeping { color: var(--ok); }
 /* Tokens a tool result adds to the conversation; large ones stand out. */
 .row .tok { flex: none; margin-left: 6px; padding: 0 6px; border-radius: 999px; font-size: 10px; font-family: var(--mono); line-height: 16px; color: var(--muted); background: color-mix(in srgb, var(--fg) 6%, transparent); }
 .row .tok.big { color: var(--md-ext-on-amber-container); background: var(--md-ext-amber-container); }
@@ -550,8 +552,11 @@ textarea::placeholder { color: var(--on-surface-variant); }
 #send:active:not(:disabled) { transform: scale(.92); }
 #send.primary { color: var(--on-accent); background: var(--accent); box-shadow: 0 2px 6px -2px var(--shadow); }
 #send.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--on-accent) var(--md-state-hover), var(--accent)); }
-#send:not(.primary) { color: var(--on-stop); background: var(--stop); }
-#send:not(.primary):hover:not(:disabled) { background: color-mix(in srgb, #000 12%, var(--stop)); }
+#send:not(.primary):not(.sleeping) { color: var(--on-stop); background: var(--stop); }
+#send:not(.primary):not(.sleeping):hover:not(:disabled) { background: color-mix(in srgb, #000 12%, var(--stop)); }
+/* The tab's task sleeps until a wake-up: a green Send, whose message wakes it. */
+#send.sleeping { color: #fff; background: var(--ok); box-shadow: 0 2px 6px -2px var(--shadow); }
+#send.sleeping:hover:not(:disabled) { background: color-mix(in srgb, #000 12%, var(--ok)); }
 
 @media (prefers-reduced-motion: reduce) { .btn, #send, .action, .chev { transition: background-color 150ms ease, color 150ms ease; } .btn:active:not(:disabled), #send:active:not(:disabled), .action:active:not(:disabled) { transform: none; } }
 
@@ -609,6 +614,13 @@ textarea::placeholder { color: var(--on-surface-variant); }
 @media (forced-colors: active) { .setting-switch { border-color: ButtonText; } .setting-switch::after { background: ButtonText; } .setting-row[aria-checked=true] .setting-switch { border-color: Highlight; background: Highlight; } .setting-row[aria-checked=true] .setting-switch::after { background: HighlightText; } }
 /* Effort chip and its popover: a filled track up to the thumb, with an icon under each stop. */
 .pick.effort-pick { flex: none; gap: 5px; }
+/* Chrome mode: green when on and the task-x Chrome extension answers, grey when off or not reachable. */
+.pick.chrome-pick { flex: none; gap: 5px; }
+.pick.chrome-pick[data-state=on] { color: #fff; border-color: transparent; background: var(--ok); }
+.pick.chrome-pick[data-state=on]:hover:not(:disabled) { background: color-mix(in srgb, #000 12%, var(--ok)); }
+.pick.chrome-pick[data-state=offline] { border-style: dashed; }
+.pick.chrome-pick[data-state=offline] > .codicon:first-child { opacity: .6; }
+@media (forced-colors: active) { .pick.chrome-pick[data-state=on] { color: ButtonFace; background: Highlight; } }
 .pick.effort-pick > .codicon:first-child { color: var(--on-surface-variant); }
 .pick.effort-pick:not([data-level=default]) > .codicon:first-child { color: var(--accent); }
 .menu.effort-menu { width: 280px; }

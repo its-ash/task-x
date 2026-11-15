@@ -30,6 +30,9 @@ Usage:
   task-x-runtime exec [options] <prompt...>   Run one task and exit (0 when it completes). Use - to read the prompt from stdin.
                                               With --resume or --continue and no prompt, an interrupted task continues.
   task-x-runtime chat [options]               Start an interactive session.
+  task-x-runtime chrome-install [--path <binary>] [--extension-id <id>]
+                                              Register the runtime with Chrome, Edge, Brave, ... so the task-x
+                                              Chrome extension (chrome/) can drive the browser for the agent.
 
 Options:
   --provider <anthropic|openai|openaiCompatible|ollama>   Model provider (env TASK_X_PROVIDER)
@@ -788,6 +791,8 @@ impl Session {
             role_providers: Vec::new(),
             helper: None,
             embeddings: None,
+            isolated: false,
+            chrome: false,
             depth: 0,
             agent: None,
             budget: None,

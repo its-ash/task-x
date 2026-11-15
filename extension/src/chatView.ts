@@ -19,6 +19,8 @@ import {
   EFFORTS,
   type Effort,
   type EditorContext,
+  type EditsScope,
+  type ChromeStatus,
   type ImageInput,
   imagesFrom,
   type ModelInfo,
@@ -224,6 +226,7 @@ type Inbound =
   | { type: 'cancel'; tab?: unknown }
   | { type: 'clear' }
   | { type: 'newTab' }
+  | { type: 'toggleChrome' }
   | { type: 'selectTab'; id: string }
   | { type: 'closeTab'; id: string }
   | { type: 'openSubagent'; taskId: string }
@@ -346,6 +349,8 @@ interface ChatTab {
   tokens?: { input: number; output: number; cached: number };
   /** When the chat's last request ended, for the fresh start after idle time. */
   lastUsed?: number;
+  /** Chrome mode: this chat's web work goes to the user's Chrome through the task-x extension. */
+  chrome?: boolean;
 }
 
 /** One chat tab's running task: each tab runs its own, at the same time as the others. */
@@ -365,10 +370,14 @@ interface Run {
   lastActivity: number;
   /** Pending wake-ups and `wait_until` checks: the run waits for them, so it is not stalled. */
   wakeups: Set<string>;
+  /** Set while the task sleeps until a wake-up (`sleeping` → `awake`): when it wakes at the latest. */
+  sleepingUntil?: number;
 }
 
 /** Chat tabs that run a task at the same time; a request beyond this waits for a free slot. */
 const MAX_PARALLEL_RUNS = 4;
+/** How often the Chrome chip checks the task-x Chrome extension while a chat has Chrome mode on. */
+const CHROME_CHECK_MS = 15_000;
 
 const blankTab = (items: Item[] = [], taskId?: string): ChatTab => ({ id: `t${Date.now().toString(36)}${randomBytes(3).toString('hex')}`, kind: 'chat', items, taskId });
 
@@ -582,6 +591,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private nightFailures = 0;
   private nightTimer: NodeJS.Timeout | undefined;
   private nightWatch: NodeJS.Timeout | undefined;
+  /** Whether the task-x Chrome extension answers (`chrome/status`), for the Chrome chip. */
+  private chromeStatus: ChromeStatus = { connected: false, paused: false };
+  /** Checks the Chrome extension while a chat has Chrome mode on. */
+  private chromeWatch: NodeJS.Timeout | undefined;
   /** When Loop Mode started its current request, for `session.loopMaxHours`. */
   private nightSince: number | undefined;
   private readonly diffs = new Map<string, string>();
@@ -801,10 +814,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private showTab(id: string): void {
     const tab = this.tabs.find((t) => t.id === id);
     if (!tab) return;
+    const before = this.reviewTab()?.id;
     this.activeTab = id;
     if (tab.kind === 'chat') this.chatTabId = id;
     this.postTabs();
     this.renderTab();
+    // The changed-files panel shows the tab's own task's changes: the other tab's list goes at once.
+    if (this.reviewTab()?.id !== before) {
+      this.changes = new Map();
+      this.postChanges();
+      void this.refreshChanges();
+    }
     this.post({ type: 'view', view: 'chat' });
     this.refreshStatus();
     void this.saveTabs();
@@ -881,8 +901,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       title: tabTitle(t),
       role: t.role ?? null,
       preview: t.kind === 'subagent' && !t.pinned,
-      status: t.kind === 'subagent' ? t.status : this.runs.has(t.id) ? 'running' : null,
+      status: t.kind === 'subagent' ? t.status : this.runs.has(t.id) ? (this.runs.get(t.id)!.sleepingUntil ? 'sleeping' : 'running') : null,
       started: t.kind === 'chat' ? (this.runs.get(t.id)?.started ?? null) : null,
+      until: this.runs.get(t.id)?.sleepingUntil ?? null,
     }));
     this.post({ type: 'tabs', tabs, active: this.activeTab });
   }
@@ -923,12 +944,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   refreshStatus(): void {
     const ref = activeRef();
     const claude = engine() === 'claudeCode';
-    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.runs.has(this.activeTab), mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null, agent: windowChoice().agent ?? null });
+    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.runs.has(this.activeTab), sleeping: this.runs.get(this.activeTab)?.sleepingUntil ?? null, chrome: { on: !!this.reviewTab()?.chrome, ...this.chromeStatus }, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null, agent: windowChoice().agent ?? null });
     void this.postModels();
   }
 
   dispose(): void {
     clearInterval(this.nightWatch);
+    clearInterval(this.chromeWatch);
     this.cancelAll();
     this.lanesChanged.dispose();
   }
@@ -1102,7 +1124,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       } else {
         if (!isProviderRef(planner.kind)) throw new Error(`unknown provider ${planner.kind}`);
         const provider = await providerConfigWith(this.ctx.secrets, planner.kind, planner.model);
-        const params = await runParams(this.ctx.secrets, { prompt, mode: 'plan', taskId: planId, editor: this.editorContext(request), provider });
+        const params = await runParams(this.ctx.secrets, { prompt, mode: 'plan', taskId: planId, editor: this.editorContext(request), provider, isolated: true });
         summary = await client.request<AgentSummary>('agent/run', params, { signal });
       }
       if (summary.status !== 'completed') throw new Error(summary.error || `the Think model stopped (${summary.status})`);
@@ -1122,6 +1144,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   private lastSummary(): Extract<Item, { kind: 'summary' }> | undefined {
     return this.items.findLast((i): i is Extract<Item, { kind: 'summary' }> => i.kind === 'summary');
+  }
+
+  /** Asks the runtime whether the task-x Chrome extension answers, and updates the Chrome chip. */
+  private async checkChrome(): Promise<ChromeStatus> {
+    let next: ChromeStatus = { connected: false, paused: false };
+    try {
+      const client = await this.getClient();
+      const s = await client.request<ChromeStatus & { error?: string }>('chrome/status', {}, { timeoutMs: 10_000 });
+      next = { connected: !!s.connected, paused: !!s.paused };
+    } catch {
+      // No runtime yet, or an older one without chrome/status: not connected.
+    }
+    if (next.connected !== this.chromeStatus.connected || next.paused !== this.chromeStatus.paused) {
+      this.chromeStatus = next;
+      this.refreshStatus();
+    }
+    return next;
+  }
+
+  /** Checks the Chrome extension every CHROME_CHECK_MS while some chat has Chrome mode on. */
+  private watchChrome(): void {
+    const want = this.tabs.some((t) => t.kind === 'chat' && t.chrome);
+    if (want && !this.chromeWatch) this.chromeWatch = setInterval(() => void this.checkChrome(), CHROME_CHECK_MS);
+    if (!want && this.chromeWatch) {
+      clearInterval(this.chromeWatch);
+      this.chromeWatch = undefined;
+    }
   }
 
   /** Watches every run (see `watchRuns`). */
@@ -1227,7 +1276,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /** Saves the open chat tabs. Subagent tabs show live activity only and are not saved. */
   private async saveTabs(): Promise<void> {
-    const tabs = this.tabs.filter((t) => t.kind === 'chat').map(({ id, kind, items, taskId, tokens, lastUsed }) => ({ id, kind, items: items.slice(-MAX_ITEMS), taskId, tokens, lastUsed }));
+    const tabs = this.tabs.filter((t) => t.kind === 'chat').map(({ id, kind, items, taskId, tokens, lastUsed, chrome }) => ({ id, kind, items: items.slice(-MAX_ITEMS), taskId, tokens, lastUsed, chrome }));
     const active = this.tabs.find((t) => t.id === this.activeTab)?.kind === 'chat' ? this.activeTab : this.chatTabId;
     await this.ctx.workspaceState.update(TABS_KEY, { tabs, active });
   }
@@ -1409,6 +1458,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.post({ type: 'index', index: this.indexState });
         void this.refreshChanges();
         this.resumeNight();
+        this.watchChrome();
+        if (this.tabs.some((t) => t.chrome)) void this.checkChrome();
         break;
       case 'listFiles':
         if (typeof m.query === 'string') await this.postFiles(m.query.slice(0, 300));
@@ -1474,6 +1525,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const tab = typeof m.tab === 'string' && this.tabs.some((t) => t.id === m.tab) ? m.tab : undefined;
         this.cancel(tab);
         if (!tab || tab === this.nightTab) await this.setNightRequest(undefined);
+        break;
+      }
+      case 'toggleChrome': {
+        // Chrome mode belongs to the chat on screen (a subagent's tab: its chat). A running task
+        // keeps the mode it started with; the next request uses the new one.
+        const tab = this.reviewTab();
+        if (!tab) break;
+        tab.chrome = !tab.chrome;
+        await this.saveTabs();
+        this.refreshStatus();
+        this.watchChrome();
+        if (tab.chrome) await this.checkChrome();
         break;
       }
       case 'clear':
@@ -1800,7 +1863,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.diffs.set(diffKey, ev.diff);
         const { added, removed } = diffStats(ev.diff);
         push({ kind: 'file', path: ev.path, operation: tab.dir ? null : ev.operation, diffKey, added, removed, diff: ev.diff.slice(0, MAX_CARD_DIFF), diffCut: ev.diff.length > MAX_CARD_DIFF });
-        if (!tab.dir) this.liveChange(ev.path, ev.diff);
+        if (!tab.dir && tab.parent) this.liveChange(ev.path, ev.diff, tab.parent);
         break;
       }
       case 'error':
@@ -1848,11 +1911,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     let next = new Map<string, ChangeRow>();
     try {
       const client = await this.getClient();
-      const files = await client.request<PendingFile[]>('edits/pending');
+      // The editor's inline review covers every pending change; the panel only the tab's own task's.
+      const taskId = this.reviewTab()?.taskId;
+      const [all, mine] = await Promise.all([
+        client.request<PendingFile[]>('edits/pending'),
+        taskId ? client.request<PendingFile[]>('edits/pending', { taskId } satisfies EditsScope) : Promise.resolve([] as PendingFile[]),
+      ]);
       if (gen !== this.changesGen) return;
-      for (const f of files) this.originals.set(f.path, f.original);
-      this.onPending?.(files);
-      next = new Map(files.map((f) => [f.path, { path: f.path, added: f.added, removed: f.removed, status: f.original === null ? 'added' : f.current === null ? 'deleted' : 'modified', seq }]));
+      for (const f of all) this.originals.set(f.path, f.original);
+      this.onPending?.(all);
+      next = new Map(mine.map((f) => [f.path, { path: f.path, added: f.added, removed: f.removed, status: f.original === null ? 'added' : f.current === null ? 'deleted' : 'modified', seq }]));
       for (const [p, row] of this.changes) if (row.seq > seq && !next.has(p)) next.set(p, row);
     } catch {
       // No runtime or workspace yet: nothing to review.
@@ -1868,8 +1936,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.changesTimer = setTimeout(() => void this.refreshChanges(), CHANGES_REFRESH_MS);
   }
 
-  /** Shows an edit in the changed-files list at once; the next load from the edit log corrects the counts. */
-  private liveChange(rel: string, diff: string): void {
+  /**
+   * The chat tab whose changes the panel shows: the chat on screen, or the chat of the subagent on
+   * screen. Each tab reviews only what its own task (and its subagents) changed.
+   */
+  private reviewTab(): ChatTab | undefined {
+    const t = this.tabs.find((x) => x.id === this.activeTab);
+    return t?.kind === 'subagent' ? this.tabs.find((x) => x.id === t.parent) : t;
+  }
+
+  /**
+   * Shows an edit of chat tab `owner` in the changed-files list at once, when that tab is on screen;
+   * the next load from the edit log corrects the counts (and updates the editor's review for any tab).
+   */
+  private liveChange(rel: string, diff: string, owner: string): void {
+    if (this.reviewTab()?.id !== owner) return this.queueChanges();
     const { added, removed } = diffStats(diff);
     const prev = this.changes.get(rel);
     const status = nextStatus(diff, prev?.status);
@@ -1893,24 +1974,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const r = await commitPaths(root, paths, commitSubject(prompt));
       if (!r.committed) return void this.add({ kind: 'context', text: `Auto-commit skipped: ${r.reason}.` });
       this.add({ kind: 'context', text: `Committed ${paths.length} file${paths.length > 1 ? 's' : ''}: ${r.subject}` });
-      await this.settle('keep', paths);
+      await this.settle('keep', paths, this.taskId ?? null);
     } catch (e) {
       this.add({ kind: 'context', text: `Auto-commit failed: ${describeError(e)}` });
     }
   }
 
-  async settle(kind: 'keep' | 'revert', paths?: string[]): Promise<void> {
+  /**
+   * Keeps or reverts pending changes. `scope` is the task whose changes it settles: by default the
+   * chat tab on screen (the changed-files panel), `null` for every task (the editor's inline review).
+   */
+  async settle(kind: 'keep' | 'revert', paths?: string[], scope?: string | null): Promise<void> {
+    const review = scope === undefined ? this.reviewTab() : undefined;
+    const taskId = scope === undefined ? review?.taskId : (scope ?? undefined);
+    // A chat that has not run a task yet has nothing of its own to settle.
+    if (scope === undefined && !taskId) return this.refreshChanges();
+    // The transcripts that show these changes: the tab and its subagents, or every tab.
+    const owner = review ?? (taskId ? this.tabs.find((t) => t.kind === 'chat' && t.taskId === taskId) : undefined);
+    const items = owner ? this.tabs.filter((t) => t.id === owner.id || t.parent === owner.id).flatMap((t) => t.items) : this.allItems();
     try {
       const client = await this.getClient();
       if (kind === 'keep') {
-        await client.request('edits/keep', { paths });
-        for (const it of this.allItems()) if (it.kind === 'file' && !it.undone && !it.kept && (!paths || paths.includes(it.path))) it.kept = true;
+        await client.request('edits/keep', { paths, taskId } satisfies EditsScope);
+        for (const it of items) if (it.kind === 'file' && !it.undone && !it.kept && (!paths || paths.includes(it.path))) it.kept = true;
         await this.persist();
         this.renderTab();
       } else {
-        const r = await client.request<{ reverted: string[]; conflicts: { path: string }[] }>('edits/revert', { paths });
+        const r = await client.request<{ reverted: string[]; conflicts: { path: string }[] }>('edits/revert', { paths, taskId } satisfies EditsScope);
         if (r.conflicts.length) vscode.window.showWarningMessage(`task-x kept ${r.conflicts.map((c) => c.path).join(', ')} because it changed after the agent's edit.`);
-        for (const it of this.allItems()) if (it.kind === 'file' && !it.kept && r.reverted.includes(it.path)) it.undone = true;
+        for (const it of items) if (it.kind === 'file' && !it.kept && r.reverted.includes(it.path)) it.undone = true;
         await this.persist();
         this.renderTab();
       }
@@ -2370,7 +2462,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         break;
       }
       case 'fileChanged': {
-        this.liveChange(e.path, e.diff);
+        this.liveChange(e.path, e.diff, this.chat.id);
         const diffKey = `${Date.now()}-${this.diffs.size}`;
         this.diffs.set(diffKey, e.diff);
         const { added, removed } = diffStats(e.diff);
@@ -2484,14 +2576,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (e.by === 'model') this.add({ kind: 'context', text: `Cancelled wake-up ${e.id}` });
         break;
       case 'sleeping': {
-        if (run) run.wakeups = new Set(e.pending.map((w) => w.id));
+        if (run) {
+          run.wakeups = new Set(e.pending.map((w) => w.id));
+          // The tab shows a clock and the Send button turns green: a message wakes the task.
+          run.sleepingUntil = e.untilMs;
+          this.runsChanged();
+        }
         state.assistant = undefined;
         const next = e.pending[0];
         this.add({ kind: 'context', text: `🌙 Sleeping until ${new Date(e.untilMs).toLocaleTimeString()}${next?.reason ? `: ${next.reason}` : ''} (${e.pending.length} pending). Send a message to wake it now; Stop ends it.` });
         break;
       }
       case 'awake':
-        if (run) run.wakeups = new Set(e.pending.map((w) => w.id));
+        if (run) {
+          run.wakeups = new Set(e.pending.map((w) => w.id));
+          run.sleepingUntil = undefined;
+          this.runsChanged();
+        }
         state.assistant = undefined;
         if (e.by !== 'cancelled') this.add({ kind: 'context', text: `☀️ Awake after ${fmtDuration(e.sleptMs ?? 0)} (${e.by === 'wakeup' ? 'a wake-up fired' : e.by === 'message' ? 'your message' : 'nothing left to wait for'})` });
         break;
@@ -2610,6 +2711,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // `/clear` (or `/new`): a fresh conversation in this chat, for either engine.
     if (!images.length && /^\/(clear|new)\s*$/i.test(text)) return this.clear();
     if (!images.length && engine() !== 'claudeCode' && (await this.sessionCommand(text))) return;
+    // Chrome mode needs the task-x Chrome extension: without it the request would browse elsewhere.
+    if (this.chat.chrome) {
+      const c = await this.checkChrome();
+      if (!c.connected || c.paused) {
+        this.post({ type: 'setInput', text: raw });
+        const why = c.paused
+          ? 'task-x is paused in Chrome. Resume it from the task-x side panel in Chrome'
+          : 'the task-x Chrome extension is not connected. Run `make chrome-install`, load the chrome/ folder in chrome://extensions (Developer mode, Load unpacked), and click its toolbar button';
+        void vscode.window.showWarningMessage(`task-x: Chrome mode is on, but ${why}. Or turn Chrome mode off.`);
+        return;
+      }
+    }
     // The run is registered before anything waits, so a second request to this tab queues behind it.
     const abort = new AbortController();
     const run: Run = { abort, started: Date.now(), cards: new Map(), approvals: new Map(), questions: new Map(), steering: [], stalled: false, lastActivity: Date.now(), wakeups: new Set() };
@@ -2673,7 +2786,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const taskId = this.taskId;
       const prompt = this.night ? await this.nightTask(full, retry, abort.signal) : full;
       const provider = worker && isProviderRef(worker.kind) ? await providerConfigWith(this.ctx.secrets, worker.kind, worker.model) : undefined;
-      const params = await runParams(this.ctx.secrets, { prompt, mode, taskId, editor: this.editorContext(text), provider, images });
+      // A chat tab is its own session: it cannot recall other tabs' tasks (project memory stays).
+      const params = { ...(await runParams(this.ctx.secrets, { prompt, mode, taskId, editor: this.editorContext(text), provider, images, isolated: true })), ...(this.chat.chrome ? { chrome: true } : {}) };
       const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
       // Bound to this run's tab: the event arrives outside the run's async context.
       off = client.onNotification(
@@ -3167,6 +3281,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // MCP servers turned off, and task-x tools turned off in the Tools chip (`mcp__task-x__<tool>`).
         disabledMcp: [...claudeDisabledMcp(this.ctx), ...(windowChoice().offTools ?? []).map((t) => `task-x__${t}`)],
         effort: effort(),
+        // Chrome mode: web work in the user's Chrome, every browser call asks.
+        ...(this.chat.chrome ? { chrome: true } : {}),
         ...claudePermissions(mode),
       },
       { signal },
@@ -3236,6 +3352,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     <button type="button" id="settingsBtn" class="pick settings-pick"></button>
     <button type="button" id="effortBtn" class="pick effort-pick"></button>
     <button type="button" id="mcpBtn" class="pick mcp-pick"></button>
+    <button type="button" id="chromeBtn" class="pick chrome-pick" aria-pressed="false"></button>
     <span class="toolbar-end">
     <span id="ctxMeter" class="meter" role="meter" aria-valuemin="0" aria-valuemax="100" hidden></span>
     <button type="button" id="refineBtn" class="action" title="Refine: rewrite the prompt with the routed model (task-x.routing), else the active model. Ctrl+Z restores your text." aria-label="Refine prompt"><span class="codicon codicon-sparkle" aria-hidden="true"></span></button>
