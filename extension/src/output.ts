@@ -4,12 +4,15 @@ const quoteArg = (a: string) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(
 
 /** Turns a tool result (JSON text) into readable, terminal-like output. */
 export function formatOutput(raw: string): string {
-  let v: Record<string, unknown>;
+  let parsed: unknown;
   try {
-    v = JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch {
     return raw;
   }
+  // Output such as "65", "true", "null", or a quoted string is valid JSON but no object: show it as it came.
+  if (parsed === null || typeof parsed !== 'object') return raw;
+  const v = parsed as Record<string, unknown>;
   const r = (v.result && typeof v.result === 'object' && 'argv' in (v.result as object) ? v.result : 'argv' in v ? v : undefined) as
     | { argv: string[]; cwd?: string; stdout?: string; stderr?: string; exitCode?: number | null; timedOut?: boolean; durationMs?: number; sandboxed?: boolean; truncated?: boolean }
     | undefined;

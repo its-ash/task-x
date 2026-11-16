@@ -15,6 +15,11 @@ test('formats errors, diffs, plain text, and other JSON', () => {
   assert.match(formatOutput(JSON.stringify({ result: { argv: ['x'], timedOut: true, durationMs: 5 } })), /\[timed out, 5 ms\]$/);
 });
 
+test('shows JSON that is not an object as it came', () => {
+  for (const raw of ['65', 'true', 'null', '"done"']) assert.equal(formatOutput(raw), raw);
+  assert.equal(formatOutput('[1]'), '[\n  1\n]');
+});
+
 test('counts added and removed lines of a unified diff', () => {
   const diff = '--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,2 @@\n-old\n-older\n+new\n keep\n';
   assert.deepEqual(diffStats(diff), { added: 1, removed: 2 });
