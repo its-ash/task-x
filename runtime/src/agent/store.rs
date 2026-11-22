@@ -123,11 +123,18 @@ impl Store {
     }
 
     pub fn save(&self, r: &TaskRecord) -> std::io::Result<()> {
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let Some(p) = self.path(&r.id) else { return Ok(()) };
-        std::fs::create_dir_all(p.parent().expect("tasks dir"))?;
-        let tmp = p.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(r).map_err(std::io::Error::other)?)?;
-        std::fs::rename(tmp, p)
+        let dir = p.parent().expect("tasks dir");
+        std::fs::create_dir_all(dir)?;
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{}.{}.{seq}.json.tmp", r.id, std::process::id()));
+        let bytes = serde_json::to_vec(r).map_err(std::io::Error::other)?;
+        let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, &p));
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        res
     }
 
     pub fn load(&self, id: &str) -> Option<TaskRecord> {

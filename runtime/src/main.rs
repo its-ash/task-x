@@ -1,7 +1,9 @@
 mod agent;
+mod agy_cli;
 mod chrome;
 mod claude_cli;
 mod cli;
+mod cli_common;
 mod context;
 mod docs;
 mod errors;
@@ -10,6 +12,7 @@ mod mcp_import;
 mod mcp_server;
 mod oauth;
 mod ports;
+mod procs;
 mod provider;
 mod rpc;
 mod server;

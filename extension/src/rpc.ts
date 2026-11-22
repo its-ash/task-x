@@ -111,7 +111,9 @@ export class JsonRpcClient {
   /** Handles requests the runtime sends to the client (for example approval prompts). */
   onRequest(method: string, handler: RequestHandler): () => void {
     this.requestHandlers.set(method, handler);
-    return () => this.requestHandlers.delete(method);
+    return () => {
+      if (this.requestHandlers.get(method) === handler) this.requestHandlers.delete(method);
+    };
   }
 
   get isClosed(): boolean {
@@ -139,16 +141,28 @@ export class JsonRpcClient {
     else p.resolve(value);
   }
 
+  private discardingLine = false;
+
   private onData(chunk: string): void {
+    if (this.discardingLine) {
+      const nl = chunk.indexOf('\n');
+      if (nl < 0) return;
+      this.discardingLine = false;
+      chunk = chunk.slice(nl + 1);
+      if (!chunk) return;
+    }
     this.buf += chunk;
+    let start = 0;
     let nl: number;
-    while ((nl = this.buf.indexOf('\n')) >= 0) {
-      const line = this.buf.slice(0, nl).trim();
-      this.buf = this.buf.slice(nl + 1);
+    while ((nl = this.buf.indexOf('\n', start)) >= 0) {
+      const line = this.buf.slice(start, nl).trim();
+      start = nl + 1;
       if (line) this.onLine(line);
     }
+    if (start > 0) this.buf = this.buf.slice(start);
     if (this.buf.length > MAX_LINE_CHARS) {
       this.buf = '';
+      this.discardingLine = true;
       this.onProtocolError('incoming message exceeded size limit');
     }
   }

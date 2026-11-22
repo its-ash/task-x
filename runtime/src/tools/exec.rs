@@ -63,7 +63,7 @@ static SLEEP_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Why a `sleep` command is refused, for every engine and provider: the waiting tools do it
 /// without holding a shell (the Claude Code hook names them with their `mcp__task-x__` prefix).
-pub const SLEEP_BLOCKED: &str = "Blocked: do not run sleep as a command to wait. Use the waiting tools instead: sleep for a pause of up to 120 seconds; wait_until to wait until a command succeeds (a server is up, a job is done) instead of a sleep-and-poll loop; schedule_wakeup to come back later (then end your turn). For a slow command, start it in the background and keep working.";
+pub const SLEEP_BLOCKED: &str = "Blocked: do not run sleep as a command to wait. Use the waiting tools instead: sleep for a pause of up to 120 seconds; wait_until to wait until a command succeeds (a server is up, a job is done) instead of a sleep-and-poll loop. For a slow command, start it in the background and keep working.";
 
 /// Whether a command line (a shell string, or argv joined with spaces) runs `sleep` to wait.
 pub fn is_sleep_command(cmd: &str) -> bool {
@@ -89,6 +89,10 @@ pub struct Output {
 /// Reads and network stay allowed so builds and dependency downloads work.
 pub struct Sandbox<'a> {
     pub writable_root: &'a Path,
+    /// List the command with its live output for the client's terminals (`procs/*`).
+    pub terminal: bool,
+    /// The task that runs the command, shown with it in that list.
+    pub task_id: Option<&'a str>,
 }
 
 /// Whether the OS sandbox can actually be applied on this machine. `sandbox-exec` and `bwrap` exist
@@ -203,11 +207,12 @@ pub fn run_sandboxed(
     cancel: &CancellationToken,
     sb: &Sandbox,
 ) -> Result<Output, ToolError> {
+    let track = sb.terminal.then(|| Track { command: crate::procs::display(argv), task_id: sb.task_id });
     if !SANDBOX.load(std::sync::atomic::Ordering::Relaxed) {
-        return run(argv, cwd, cwd_label, timeout, cancel);
+        return spawn_and_wait(argv, cwd, cwd_label, timeout, cancel, None, track);
     }
     let (wrapped, applied) = sandboxed_argv(argv, sb);
-    let mut out = run(&wrapped, cwd, cwd_label, timeout, cancel)?;
+    let mut out = spawn_and_wait(&wrapped, cwd, cwd_label, timeout, cancel, None, track)?;
     out.argv = argv.to_vec();
     out.sandboxed = applied;
     Ok(out)
@@ -293,8 +298,9 @@ impl Sink {
     }
 }
 
-/// Keeps the head and tail of a stream; errors usually appear at the end.
-fn capture(mut r: impl Read + Send + 'static) -> Arc<Sink> {
+/// Keeps the head and tail of a stream; errors usually appear at the end. Every chunk also goes to
+/// the command's terminal (`tee`), when it has one.
+fn capture(mut r: impl Read + Send + 'static, tee: Option<Arc<crate::procs::Proc>>) -> Arc<Sink> {
     let sink = Arc::new(Sink { state: Mutex::new(Captured::default()), changed: Condvar::new() });
     let writer = sink.clone();
     std::thread::spawn(move || {
@@ -304,6 +310,9 @@ fn capture(mut r: impl Read + Send + 'static) -> Arc<Sink> {
                 break;
             }
             writer.push(&buf[..n]);
+            if let Some(t) = &tee {
+                t.push(&buf[..n]);
+            }
         }
         writer.finish();
     });
@@ -368,6 +377,28 @@ pub fn run_with_input(
     cancel: &CancellationToken,
     input: Option<&str>,
 ) -> Result<Output, ToolError> {
+    spawn_and_wait(argv, cwd, cwd_label, timeout, cancel, input, None)
+}
+
+/// A command listed in the client's terminals (`procs/*`): how it is shown, and its task.
+struct Track<'a> {
+    command: String,
+    task_id: Option<&'a str>,
+}
+
+/// Why a command stopped from the terminal list failed, for the agent.
+pub const STOPPED_FROM_TERMINAL: &str =
+    "The user stopped this command from the task-x Terminals view. Continue with the next step; do not run it again unless the user asks.";
+
+fn spawn_and_wait(
+    argv: &[String],
+    cwd: &Path,
+    cwd_label: &str,
+    timeout: Duration,
+    cancel: &CancellationToken,
+    input: Option<&str>,
+    track: Option<Track>,
+) -> Result<Output, ToolError> {
     let (prog, args) = argv.split_first().ok_or_else(|| ToolError::invalid("empty command"))?;
     if argv.iter().any(|a| a.contains('\0')) {
         return Err(ToolError::invalid("arguments must not contain NUL"));
@@ -392,6 +423,9 @@ pub fn run_with_input(
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let started = Instant::now();
     let mut child = cmd.spawn().map_err(|e| ToolError::new(ToolErrorKind::Failed, format!("could not start {prog}: {e}")))?;
+    // `procs/stop` ends this command only; cancelling the call ends it too.
+    let stop = cancel.child_token();
+    let proc = track.map(|t| crate::procs::start(&t.command, cwd_label, child.id(), t.task_id, stop.clone()));
     if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
         let text = text.to_owned();
         std::thread::spawn(move || {
@@ -399,17 +433,30 @@ pub fn run_with_input(
             let _ = stdin.write_all(text.as_bytes());
         });
     }
-    let out = capture(child.stdout.take().expect("piped stdout"));
-    let err = capture(child.stderr.take().expect("piped stderr"));
+    let out = capture(child.stdout.take().expect("piped stdout"), proc.clone());
+    let err = capture(child.stderr.take().expect("piped stderr"), proc.clone());
     let mut timed_out = false;
     let status = loop {
-        if let Some(s) = child.try_wait().map_err(|e| ToolError::io(e, prog))? {
+        let exited = match child.try_wait() {
+            Ok(s) => s,
+            Err(e) => {
+                if let Some(p) = &proc {
+                    p.end(crate::procs::Status::Failed, None);
+                }
+                return Err(ToolError::io(e, prog));
+            }
+        };
+        if let Some(s) = exited {
             break Some(s);
         }
-        if cancel.is_cancelled() {
+        if stop.is_cancelled() {
             kill_tree(&mut child);
             let _ = child.wait();
-            return Err(ToolError::new(ToolErrorKind::Cancelled, "command cancelled"));
+            let by_user = !cancel.is_cancelled() && proc.as_ref().is_some_and(|p| p.stop_requested());
+            if let Some(p) = &proc {
+                p.end(crate::procs::Status::Stopped, None);
+            }
+            return Err(ToolError::new(ToolErrorKind::Cancelled, if by_user { STOPPED_FROM_TERMINAL } else { "command cancelled" }));
         }
         if started.elapsed() > timeout {
             timed_out = true;
@@ -417,10 +464,22 @@ pub fn run_with_input(
             let _ = child.wait();
             break None;
         }
+        if let Some(p) = &proc {
+            p.flush();
+        }
         std::thread::sleep(POLL);
     };
     let ((so, t1), (se, t2)) = drain(&out, &err);
     let code = status.and_then(|s| s.code());
+    if let Some(p) = &proc {
+        use crate::procs::Status;
+        let st = match status {
+            None => Status::TimedOut,
+            Some(s) if s.success() => Status::Exited,
+            Some(_) => Status::Failed,
+        };
+        p.end(st, code);
+    }
     Ok(Output {
         argv: argv.to_vec(),
         cwd: cwd_label.to_owned(),
@@ -509,6 +568,39 @@ mod tests {
         assert!(run(&argv(&["definitely-not-a-binary-xyz"]), &tmp, ".", Duration::from_secs(1), &CancellationToken::new()).is_err());
     }
 
+    /// A command shown in the Terminals view: listed with its task, its output kept, and Stop in
+    /// the list ends only it, with an error that says the user stopped it.
+    #[test]
+    fn a_tracked_command_is_listed_and_stops_from_the_list() {
+        let tmp = std::env::temp_dir();
+        let track = |command: &str| Some(Track { command: command.into(), task_id: Some("t-exec") });
+        let c = CancellationToken::new();
+        let o = spawn_and_wait(&argv(&["sh", "-c", "echo tracked-ok"]), &tmp, ".", Duration::from_secs(5), &c, None, track("tracked-ok")).unwrap();
+        assert!(o.success);
+        let find = |command: &str| crate::procs::list()["procs"].as_array().unwrap().iter().rev().find(|p| p["command"] == command).cloned();
+        let p = find("tracked-ok").expect("listed");
+        assert_eq!((p["status"].as_str(), p["exitCode"].as_i64(), p["taskId"].as_str()), (Some("exited"), Some(0), Some("t-exec")));
+        assert_eq!(crate::procs::output(p["id"].as_str().unwrap()).unwrap()["data"], "tracked-ok\n");
+
+        let slow = std::thread::spawn(move || {
+            let c = CancellationToken::new();
+            spawn_and_wait(&argv(&["sh", "-c", "echo started; exec sleep 30"]), &std::env::temp_dir(), ".", Duration::from_secs(20), &c, None, track("tracked-slow"))
+        });
+        let started = Instant::now();
+        let id = loop {
+            if let Some(p) = find("tracked-slow").filter(|p| p["status"] == "running") {
+                break p["id"].as_str().unwrap().to_owned();
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "the slow command never showed up");
+            std::thread::sleep(POLL);
+        };
+        assert!(crate::procs::stop(&id).unwrap());
+        let e = slow.join().unwrap().unwrap_err();
+        assert_eq!((e.kind, e.message.as_str()), (ToolErrorKind::Cancelled, STOPPED_FROM_TERMINAL));
+        assert!(started.elapsed() < Duration::from_secs(10), "stopped at once");
+        assert_eq!(find("tracked-slow").unwrap()["status"], "stopped");
+    }
+
     #[test]
     fn task_x_secrets_stay_out_of_commands() {
         assert!(private_env("TASK_X_VSCODE_BROWSER_TOKEN") && private_env("taskx_log") && private_env("ANVIL_KEY"));
@@ -527,7 +619,7 @@ mod tests {
         });
         let outside = home().unwrap().join(format!(".anvil-sandbox-probe-{}", std::process::id()));
         let c = CancellationToken::new();
-        let sb = Sandbox { writable_root: &ws };
+        let sb = Sandbox { writable_root: &ws, terminal: false, task_id: None };
         if !sandbox_available() {
             // Nothing can be wrapped here (a nested sandbox or a container): the command must still
             // run, and the result must say it was not sandboxed.

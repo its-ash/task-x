@@ -506,16 +506,40 @@ impl Index {
             let abs = if p.is_absolute() { p.clone() } else { self.root.join(p) };
             let Some(rel) = relative(&self.root, &abs) else { continue };
             let prev = self.files.remove(&rel);
-            budget += prev.as_ref().and_then(|p| p.content.as_ref()).map_or(0, |c| c.len() as u64);
+            if let Some(ref old) = prev {
+                if let Some(c) = &old.content {
+                    stats.text_files = stats.text_files.saturating_sub(1);
+                    stats.content_bytes = stats.content_bytes.saturating_sub(c.len() as u64);
+                    budget += c.len() as u64;
+                }
+                stats.symbols = stats.symbols.saturating_sub(old.symbols.definitions.len());
+                for s in &old.symbols.definitions {
+                    if let Some(list) = self.defs.get_mut(&s.name) {
+                        list.retain(|(r, _)| r != &rel);
+                        if list.is_empty() {
+                            self.defs.remove(&s.name);
+                        }
+                    }
+                }
+            }
             changed += 1;
             if !abs.is_file() || self.is_excluded(&rel) || in_hidden_dir(&rel) || self.in_build_dir(&rel, &mut stats) || self.is_gitignored(&abs) {
                 continue;
             }
             if let Some(e) = self.load(&rel, &abs, prev, &mut budget, &mut stats) {
+                if let Some(c) = &e.content {
+                    stats.text_files += 1;
+                    stats.content_bytes += c.len() as u64;
+                }
+                stats.symbols += e.symbols.definitions.len();
+                for s in &e.symbols.definitions {
+                    self.defs.entry(s.name.clone()).or_default().push((e.rel.clone(), s.clone()));
+                }
                 self.files.insert(rel, e);
             }
         }
-        self.finish(stats);
+        stats.files = self.files.len();
+        self.stats = stats;
         changed
     }
 

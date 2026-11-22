@@ -156,11 +156,13 @@
   const TARGET_MODEL = { planner: 'nightPlanner', worker: 'nightWorker', refine: 'refineModel', helper: 'helperModel' };
   const targetModel = (t) => (TARGET_MODEL[t] ? state[TARGET_MODEL[t]] : state.active);
   const providerOnly = (t) => t === 'worker' || t === 'refine' || t === 'helper';
-  const menuGroups = () => (providerOnly(menuTarget()) ? state.modelGroups.filter((g) => g.kind !== 'claudeCode') : state.modelGroups);
+  // Claude Code can also plan for Loop Mode; the Antigravity CLI only runs the chat.
+  const groupAllowed = (t, kind) => !((providerOnly(t) && kind === 'claudeCode') || (t !== 'main' && kind === 'antigravity'));
+  const menuGroups = () => state.modelGroups.filter((g) => groupAllowed(menuTarget(), g.kind));
   // The same model: an Ollama name without a tag means `:latest`.
   const sameModel = (a, b) => !!a && !!b && (a === b || a === `${b}:latest` || b === `${a}:latest`);
   const isCurrent = (current, g, m) => current?.kind === g.kind && sameModel(current?.model, m.id);
-  const groupIcon = (g) => (g.kind === 'claudeCode' ? 'sparkle' : g.local ? 'vm' : 'cloud');
+  const groupIcon = (g) => (g.kind === 'claudeCode' ? 'sparkle' : g.kind === 'antigravity' ? 'rocket' : g.local ? 'vm' : 'cloud');
   // Brand colours: Claude's colour for Claude Code and Anthropic, the vendor's for OpenAI; a gateway
   // (OpenAI-compatible, Ollama) takes the colour of the model family it serves.
   const FAMILIES = [[/claude|opus|sonnet|haiku/i, 'claude'], [/gpt|^o\d|codex|openai/i, 'openai'], [/gemini|gemma/i, 'gemini'], [/llama/i, 'meta'], [/qwen|qwq/i, 'qwen'], [/mistral|mixtral|codestral|devstral|magistral/i, 'mistral'], [/deepseek/i, 'deepseek'], [/grok/i, 'grok'], [/kimi|moonshot/i, 'kimi'], [/glm|zhipu/i, 'glm']];
@@ -168,6 +170,7 @@
     const b = g?.brand || g?.kind;
     if (b === 'claudeCode' || b === 'anthropic') return 'claude';
     if (b === 'openai') return 'openai';
+    if (b === 'antigravity') return 'gemini';
     return FAMILIES.find(([re]) => re.test(model || ''))?.[1] ?? (b === 'ollama' ? 'ollama' : 'other');
   };
   const tintBrand = (node, g, model) => { node.dataset.brand = brandOf(g, model); return node; };
@@ -254,6 +257,31 @@
       if (g.loading) head.append(icon('loading', 'codicon-modifier-spin'));
       list.append(head);
       if (g.error) list.append(el('div', 'menu-note error', g.error));
+      if (g.limit?.fiveHour) {
+        const box = el('div', 'limit-box');
+        box.tabIndex = 0;
+        const makeRow = (w, cls) => {
+          const pct = Math.max(0, Math.min(100, Number(w.usedPct) || 0));
+          const tone = pct >= 90 ? 'bad' : pct >= 75 ? 'warn' : 'ok';
+          const rowEl = el('div', `limit-row ${cls}`);
+          const track = el('div', 'limit-track');
+          const fill = el('div', `limit-fill ${tone}`);
+          fill.style.width = `${pct}%`;
+          track.append(fill);
+          const pctEl = el('span', 'limit-pct', `${pct}%`);
+          rowEl.append(el('span', 'limit-lbl', w.label), track, pctEl);
+          if (w.reset) rowEl.append(el('span', 'limit-reset', w.reset));
+          return rowEl;
+        };
+        box.append(makeRow(g.limit.fiveHour, 'limit-5h'));
+        if (g.limit.weekly || g.limit.extra) {
+          const hover = el('div', 'limit-hover');
+          if (g.limit.weekly) hover.append(makeRow(g.limit.weekly, 'limit-week'));
+          if (g.limit.extra) hover.append(el('div', 'limit-extra', g.limit.extra));
+          box.append(hover);
+        }
+        list.append(box);
+      }
       if (g.note) list.append(el('div', 'menu-note', g.note));
       if (!g.models.length) list.append(el('div', 'menu-empty', g.loading ? 'Loading models…' : 'No models found.'));
       for (const m of models) {
@@ -265,7 +293,7 @@
     // A model id the list does not have can still be set, for the open provider page or the current provider.
     const raw = q.value.trim();
     const base = all ? (current ?? state.active) : { kind: modelMenu.tab };
-    if (raw && base && !(providerOnly(target) && base.kind === 'claudeCode') && !menuGroups().some((g) => g.kind === base.kind && g.models.some((m) => sameModel(m.id, raw)))) {
+    if (raw && base && groupAllowed(target, base.kind) && !menuGroups().some((g) => g.kind === base.kind && g.models.some((m) => sameModel(m.id, raw)))) {
       menuItem(list, { icon: 'add', title: `Use "${raw}"`, desc: `Set this model id for ${menuGroups().find((g) => g.kind === base.kind)?.label ?? 'the current provider'}.`, onSelect: () => pick(base.kind, raw) });
     }
     if (focused) q.focus();
@@ -707,9 +735,44 @@
     });
   });
 
-  // ---------- Markdown (fenced code, inline code, bold, italic, highlights, headings, lists, callouts) ----------
-  // Inline: `code`, **bold**, *italic*, ==highlight==, and (recommended) as a badge.
-  const INLINE = /(`[^`\n]+`|\*\*[^*\n]+\*\*|==[^=\n]+==|\*\((?:recommended|suggested)\)\*|\((?:recommended|suggested)\)|(?<![\w*])\*[^*\s][^*\n]*\*(?![\w*])|(?<![\w_])_[^_\s][^_\n]*_(?![\w_]))/gi;
+  // ---------- Inline image output previews (Markdown `![alt](src)` and tool-generated images) ----------
+  const imageCache = new Map();
+  let imgSeq = 0;
+  function imageCard(src, alt = '') {
+    const clean = String(src || '').trim();
+    const isData = /^data:image\/(?:png|jpe?g|gif|webp|svg\+xml);base64,/i.test(clean);
+    const cached = isData ? clean : imageCache.get(clean);
+    const id = `img-${++imgSeq}`;
+    const box = el('div', 'img-preview' + (cached ? '' : ' loading'));
+    box.dataset.id = id;
+    box.dataset.src = clean;
+    const frame = el('div', 'img-frame');
+    const img = el('img');
+    img.alt = alt || clean.split('/').pop() || 'Image';
+    if (cached) img.src = cached;
+    img.addEventListener('click', () => {
+      if (isData) box.classList.toggle('expanded');
+      else vscode.postMessage({ type: 'openImage', src: clean });
+    });
+    frame.append(img);
+    if (!cached) frame.append(el('span', 'img-status', 'Loading image…'));
+    const bar = el('div', 'img-bar');
+    const label = alt || (isData ? 'Generated image' : clean.split(/[\\/]/).pop() || 'Image');
+    const name = el('span', 'img-name', label);
+    name.title = isData ? label : clean;
+    bar.append(
+      icon('file-media'), name, el('span', 'spacer'),
+      button('action', icon('color-mode'), () => box.classList.toggle('dark'), 'Switch between a light and a dark background'),
+      ...(!isData ? [button('btn small secondary', [icon('go-to-file'), 'Open'], () => vscode.postMessage({ type: 'openImage', src: clean }), `Open ${label}`)] : []),
+    );
+    box.append(frame, bar);
+    if (!cached) vscode.postMessage({ type: 'loadImage', id, src: clean });
+    return box;
+  }
+
+  // ---------- Markdown (fenced code, images, inline code, links, bold, italic, strikethrough, highlights, headings, lists, task lists, hr, callouts) ----------
+  // Inline: `code`, [label](url-or-file), **bold**, ~~strike~~, ==highlight==, (recommended) badge, *italic*, _italic_.
+  const INLINE = /(`[^`\n]+`|\[[^\]\n]+\]\((?:https?:\/\/|file:\/\/|\/|\.\.?\/|[\w.-]+\/|[\w.-]+\.[a-z0-9]{1,10})[^)\s]*\)|\*\*[^*\n]+\*\*|~~[^~\n]+~~|==[^=\n]+==|\*\((?:recommended|suggested)\)\*|\((?:recommended|suggested)\)|(?<![\w*])\*[^*\s][^*\n]*\*(?![\w*])|(?<![\w_])_[^_\s][^_\n]*_(?![\w_]))/gi;
   function renderInline(parent, text, opts = {}) {
     // In a question card, the opening question of a paragraph or item stands out.
     const q = opts.ask ? text.match(/^[^.!?\n]{3,240}\?(?=\s|$)/) : null;
@@ -724,10 +787,31 @@
       if (m.index > last) parent.append(text.slice(last, m.index));
       const t = m[0];
       if (t.startsWith('`')) parent.append(el('code', null, t.slice(1, -1)));
-      else if (/^\*?\((?:recommended|suggested)\)\*?$/i.test(t)) parent.append(el('span', 'md-badge', t.replace(/[*()]/g, '').replace(/^./, (c) => c.toUpperCase())));
-      else if (t.startsWith('**')) parent.append(el('strong', null, t.slice(2, -2)));
-      else if (t.startsWith('==')) parent.append(el('mark', 'md-mark', t.slice(2, -2)));
-      else parent.append(el('em', null, t.slice(1, -1)));
+      else if (t.startsWith('[')) {
+        const lm = /^\[([^\]\n]+)\]\(([^)\s]+)\)$/i.exec(t);
+        if (lm) {
+          const a = el('a', 'md-link');
+          a.href = '#';
+          a.title = lm[2];
+          renderInline(a, lm[1]);
+          a.addEventListener('click', (e) => { e.preventDefault(); vscode.postMessage({ type: 'openLink', href: lm[2] }); });
+          parent.append(a);
+        } else parent.append(t);
+      } else if (/^\*?\((?:recommended|suggested)\)\*?$/i.test(t)) parent.append(el('span', 'md-badge', t.replace(/[*()]/g, '').replace(/^./, (c) => c.toUpperCase())));
+      else if (t.startsWith('**')) {
+        const s = el('strong');
+        renderInline(s, t.slice(2, -2));
+        parent.append(s);
+      } else if (t.startsWith('~~')) {
+        const s = el('del');
+        renderInline(s, t.slice(2, -2));
+        parent.append(s);
+      } else if (t.startsWith('==')) parent.append(el('mark', 'md-mark', t.slice(2, -2)));
+      else {
+        const s = el('em');
+        renderInline(s, t.slice(1, -1));
+        parent.append(s);
+      }
       last = m.index + t.length;
     }
     if (last < text.length) parent.append(text.slice(last));
@@ -767,7 +851,7 @@
   }
   function renderMarkdown(container, text) {
     container.replaceChildren();
-    const lines = text.split('\n');
+    const lines = text.replace(/\r\n?/g, '\n').split('\n');
     // Open lists, outermost first: { indent, tag, type, el, li }. A deeper item nests in the last item.
     const stack = [];
     let para = [];
@@ -776,6 +860,17 @@
     const flush = () => { if (para.length) { const p = el('p'); renderInline(p, para.join('\n'), { ask }); out.append(p); para = []; } };
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
+      if (/^\s*(?:[-*_]\s*){3,}$/.test(line)) {
+        flush(); stack.length = 0;
+        out.append(el('hr', 'md-hr'));
+        continue;
+      }
+      const imgLine = /^\s*!\[([^\]\n]*)\]\(([^)\s]+)\)\s*$/.exec(line);
+      if (imgLine) {
+        flush(); stack.length = 0;
+        out.append(imageCard(imgLine[2], imgLine[1]));
+        continue;
+      }
       const quote = line.match(/^\s*>\s?(.*)$/);
       if (quote) {
         flush(); stack.length = 0;
@@ -842,7 +937,7 @@
       }
       // A heading, or a line that is only bold text, starts a section; a section that asks the
       // user something or flags a risk becomes a card until the next heading.
-      const h = line.match(/^(#{1,4})\s+(.*)$/) || line.match(/^\s*()\*\*([^*\n]{2,80})\*\*:?\s*$/);
+      const h = line.match(/^(#{1,6})\s+(.*)$/) || line.match(/^\s*()\*\*([^*\n]{2,80})\*\*:?\s*$/);
       const li = line.match(LIST_ITEM);
       if (h) {
         flush(); stack.length = 0; out = container; ask = false;
@@ -880,7 +975,17 @@
           stack.push(top);
         }
         const e = el('li');
-        renderInline(e, li[3], { ask });
+        const task = /^\[([ xX])\]\s+(.*)$/.exec(li[3]);
+        if (task) {
+          const done = task[1].toLowerCase() === 'x';
+          e.classList.add('md-task', done ? 'done' : 'open');
+          e.append(icon(done ? 'pass-filled' : 'circle-large-outline'));
+          const span = el('span');
+          renderInline(span, task[2], { ask });
+          e.append(span);
+        } else {
+          renderInline(e, li[3], { ask });
+        }
         if (/\((?:recommended|suggested)\)/i.test(li[3])) e.classList.add('md-recommended');
         top.el.append(e);
         top.li = e;
@@ -1167,12 +1272,19 @@
         row.append(lab);
         if (it.browser) row.append(browserChip(it.browser));
         row.append(el('span', EXPANDED.has(tool) ? 'detail cmd' : 'detail', it.detail || ''));
+        if (/^(?:run_command|run_shell_command|Bash|run_tests|check_build|run_linter|format_code)$/.test(tool)) {
+          row.append(button('action tool-term', icon('terminal'), () => vscode.postMessage({ type: 'openTerminal', command: it.detail || '' }), 'Open in Terminal'));
+        }
         step(row);
         // The dot itself is the stop control while the call runs; `toolDone` clears it.
         if (it.stop && it.ok === undefined && state.busy) stopDot(row);
         attachOutput(row, it.id, it.tool, it.ok !== false, it.output, it.outputCut, it.ok === undefined && state.busy);
         tokenChip(row, it.tokens);
         if (it.svg && it.ok) svgPreview(row, it.id, it.svg);
+        else if (it.image && it.ok) {
+          const term = row.nextElementSibling?.classList.contains('term') ? row.nextElementSibling : null;
+          (term || row).after(imageCard(it.image));
+        }
         current = null;
         break;
       }
@@ -1680,8 +1792,14 @@
       d.append(el('summary', null, 'Details'), el('pre', null, m.preview));
       card.append(d);
     }
-    const decide = (decision) => vscode.postMessage({ type: 'approve', callId: m.callId, decision });
+    let decided = false;
     const actions = el('div', 'actions');
+    const decide = (decision) => {
+      if (decided) return;
+      decided = true;
+      for (const b of actions.querySelectorAll('button')) b.disabled = true;
+      vscode.postMessage({ type: 'approve', callId: m.callId, decision });
+    };
     const split = el('div', 'split');
     const more = button('btn', icon('chevron-down'), () => openMenu(more, (menu) => {
       menuItem(menu, { icon: 'check', title: 'Allow once', onSelect: () => decide('allow') });
@@ -2078,16 +2196,22 @@
   // Live: the runtime's totals arrive after each model turn; between them the output count grows with
   // the streamed text (about 4 characters a token, marked "~"), and every number counts up to its value.
   const CHARS_PER_TOKEN = 4, COUNT_MS = 450;
-  let tokBase = { input: 0, output: 0, cached: 0 }, tokLiveChars = 0, tokShown = { input: 0, output: 0, cached: 0, total: 0 }, tokAnim = 0, tokChips = null;
+  let tokBase = { input: 0, output: 0, cached: 0 }, tokLiveChars = 0, tokShown = { input: 0, output: 0, cached: 0, total: 0 }, tokAnim = 0, tokChips = null, tokPaintRaf = 0;
   const tokLive = () => Math.ceil(tokLiveChars / CHARS_PER_TOKEN);
   function renderTokens({ input: inp = 0, output = 0, cached = 0 } = {}) {
     tokBase = { input: inp, output, cached };
     tokLiveChars = 0;
+    if (tokPaintRaf) { cancelAnimationFrame(tokPaintRaf); tokPaintRaf = 0; }
     paintTokens();
   }
   function liveTokens(text) {
     tokLiveChars += text.length;
-    paintTokens();
+    if (!tokPaintRaf) {
+      tokPaintRaf = requestAnimationFrame(() => {
+        tokPaintRaf = 0;
+        paintTokens();
+      });
+    }
   }
   function tokChip(cls, ic, label) {
     const c = el('span', `tok-chip ${cls}`);
@@ -2201,6 +2325,7 @@
   // Each chat tab keeps its own unsent draft: the text typed and the images attached. The text is
   // kept in the webview state too, so it survives a reload; images stay in memory only.
   const drafts = new Map(Object.entries(vscode.getState()?.drafts ?? {}).map(([id, text]) => [id, { text, attachments: [] }]));
+  const tabScrolls = new Map();
   function saveDrafts() {
     const text = Object.fromEntries([...drafts].filter(([, d]) => d.text).map(([id, d]) => [id, d.text]));
     vscode.setState({ ...(vscode.getState() || {}), drafts: text });
@@ -2208,14 +2333,19 @@
   function swapDraft(from, to) {
     if (from === to) return;
     if (from) {
+      tabScrolls.set(from, { top: log.scrollTop, stick });
       if (input.value || attachments.length) drafts.set(from, { text: input.value, attachments });
       else drafts.delete(from);
     }
+    histIndex = -1;
+    histDraft = '';
+    if (typeof closeSlash === 'function' && slashOpen) closeSlash();
     const d = drafts.get(to);
     input.value = d?.text ?? '';
     attachments = d?.attachments ?? [];
     renderAttachments();
     autosize();
+    syncRefiningUi(to);
     saveDrafts();
   }
   function selectTab(id) {
@@ -2227,6 +2357,18 @@
     showView('chat');
   }
   function closeTab(id) { vscode.postMessage({ type: 'closeTab', id }); }
+  const activityBtn = $('activityBtn'), activityBadge = $('activityBadge');
+  activityBtn?.addEventListener('click', () => vscode.postMessage({ type: 'openActivity' }));
+  function renderActivity(agents = 0, terminals = 0) {
+    if (!activityBtn || !activityBadge) return;
+    const total = agents + terminals;
+    activityBadge.textContent = String(total);
+    activityBadge.hidden = total === 0;
+    activityBtn.classList.toggle('live', total > 0);
+    activityBtn.title = total
+      ? `Open Agents & Terminals panel (${agents} active agent${agents === 1 ? '' : 's'}, ${terminals} running terminal${terminals === 1 ? '' : 's'})`
+      : 'Open Agents & Terminals panel';
+  }
   historyTab.addEventListener('click', () => showView('history'));
   $('views').addEventListener('keydown', (e) => {
     const all = [...strip.querySelectorAll('.chat-tab'), historyTab];
@@ -2343,7 +2485,7 @@
     const images = attachments.map(({ mediaType, data }) => ({ mediaType, data }));
     attachments = [];
     renderAttachments();
-    vscode.postMessage({ type: 'send', text, queue, images });
+    vscode.postMessage({ type: 'send', tab: activeTab, text, queue, images });
     scroll(true);
   });
 
@@ -2372,6 +2514,7 @@
     setTimeout(() => { if (attachHint === text) { attachHint = null; renderAttachments(); } }, 4000);
   }
   function attachFiles(files) {
+    const targetTab = activeTab;
     for (const f of files) {
       if (!IMAGE_TYPES.includes(f.type)) { hint(`${f.name || 'This file'} is not a PNG, JPEG, GIF, or WebP image.`); continue; }
       if (attachments.length >= MAX_IMAGES) return hint(`At most ${MAX_IMAGES} images per message.`);
@@ -2379,9 +2522,18 @@
       const r = new FileReader();
       r.onload = () => {
         const data = String(r.result).split(',')[1];
-        if (!data || attachments.length >= MAX_IMAGES) return;
-        attachments.push({ mediaType: f.type, data, name: f.name || 'Pasted image' });
-        renderAttachments();
+        if (!data) return;
+        const item = { mediaType: f.type, data, name: f.name || 'Pasted image' };
+        if (activeTab === targetTab) {
+          if (attachments.length >= MAX_IMAGES) return;
+          attachments.push(item);
+          renderAttachments();
+        } else if (targetTab) {
+          const d = drafts.get(targetTab) ?? { text: '', attachments: [] };
+          if (d.attachments.length >= MAX_IMAGES) return;
+          d.attachments.push(item);
+          drafts.set(targetTab, d);
+        }
       };
       r.readAsDataURL(f);
     }
@@ -2400,23 +2552,35 @@
     attachFiles(files);
   });
   // Stop while working; while sleeping it sends, and the message wakes the task.
-  send.addEventListener('click', () => (state.busy && !state.sleeping ? vscode.postMessage({ type: 'cancel' }) : $('form').requestSubmit()));
-  // Refine: the host rewrites the prompt with the routed model; the input stays locked until the answer comes.
-  let refining = false;
-  function setRefining(on) {
-    refining = on;
+  send.addEventListener('click', () => (state.busy && !state.sleeping ? vscode.postMessage({ type: 'cancel', tab: activeTab }) : $('form').requestSubmit()));
+  // Refine: the host rewrites the prompt with the routed model; only the originating tab stays locked.
+  const refiningTabs = new Set();
+  function syncRefiningUi(tab = activeTab) {
+    const on = Boolean(tab && refiningTabs.has(tab));
     input.readOnly = on;
     refineBtn.disabled = on;
     refineBtn.setAttribute('aria-busy', String(on));
     refineBtn.replaceChildren(on ? icon('loading', 'codicon-modifier-spin') : icon('sparkle'));
   }
   refineBtn.addEventListener('click', () => {
-    if (refining || !input.value.trim()) return input.focus();
-    setRefining(true);
-    vscode.postMessage({ type: 'refine', text: input.value });
+    if (!activeTab || refiningTabs.has(activeTab) || !input.value.trim()) return input.focus();
+    refiningTabs.add(activeTab);
+    syncRefiningUi(activeTab);
+    vscode.postMessage({ type: 'refine', tab: activeTab, text: input.value });
   });
   function applyRefined(m) {
-    setRefining(false);
+    const targetTab = m.tabId || activeTab;
+    if (targetTab) refiningTabs.delete(targetTab);
+    syncRefiningUi(activeTab);
+    if (m.tabId && activeTab && m.tabId !== activeTab) {
+      if (m.text) {
+        const d = drafts.get(m.tabId) ?? { text: '', attachments: [] };
+        d.text = m.text;
+        drafts.set(m.tabId, d);
+        saveDrafts();
+      }
+      return;
+    }
     input.focus();
     if (!m.text) {
       refineBtn.title = `Refine failed: ${m.error || 'no answer'}`;
@@ -2823,13 +2987,20 @@
   }
 
   // ---------- Messages from the extension ----------
+  const TAB_SCOPED = new Set([
+    'history', 'item', 'delta', 'toolDone', 'svgImage', 'approval', 'approvalDone',
+    'questions', 'questionsDone', 'laneUpdate', 'usage', 'tokens', 'contextUsage',
+    'clearDraft', 'setInput', 'restorable',
+  ]);
   window.addEventListener('message', ({ data: m }) => {
+    if (m.tabId && activeTab && m.tabId !== activeTab && TAB_SCOPED.has(m.type)) return;
     switch (m.type) {
       case 'history': {
         log.replaceChildren();
         turn = null; current = null; turnFiles = null;
+        tokLiveChars = 0;
+        tokShown = { input: 0, output: 0, cached: 0, total: 0 };
         lanes.clear();
-        dismissed.clear();
         // Every subtask counts on the board, also those of turns not drawn yet.
         for (const it of m.items) if (it.kind === 'lane') lanes.set(it.taskId, it);
         const start = pageStart(m.items);
@@ -2842,7 +3013,13 @@
         if (!m.streaming) current = null;
         welcome();
         showOlderBar();
-        scroll(true);
+        const savedScroll = activeTab ? tabScrolls.get(activeTab) : undefined;
+        if (savedScroll && !savedScroll.stick) {
+          stick = false;
+          log.scrollTop = savedScroll.top;
+        } else {
+          scroll(true);
+        }
         break;
       }
       case 'status':
@@ -2871,8 +3048,29 @@
           attachOutput(row, m.id, row.querySelector('.label')?.dataset.tool || '', m.ok, m.output, m.outputCut);
           tokenChip(row, m.tokens);
           if (m.svg && m.ok) svgPreview(row, m.id, m.svg);
+          else if (m.image && m.ok) {
+            const term = row.nextElementSibling?.classList.contains('term') ? row.nextElementSibling : null;
+            (term || row).after(imageCard(m.image));
+          }
           scroll();
         }
+        break;
+      }
+      case 'imageLoaded': {
+        if (m.dataUrl && m.src) imageCache.set(m.src, m.dataUrl);
+        const selector = m.src ? `.img-preview[data-src="${CSS.escape(m.src)}"]` : `.img-preview[data-id="${CSS.escape(m.id)}"]`;
+        for (const box of log.querySelectorAll(selector)) {
+          box.classList.remove('loading');
+          const status = box.querySelector('.img-status');
+          if (m.dataUrl) {
+            box.querySelector('img').src = m.dataUrl;
+            status?.remove();
+          } else {
+            box.classList.add('failed');
+            if (status) status.textContent = m.error ? `Image unavailable: ${m.error}` : 'Image unavailable';
+          }
+        }
+        scroll();
         break;
       }
       case 'svgImage': {
@@ -2961,6 +3159,7 @@
         break;
       case 'editor': renderContext(m); break;
       case 'index': state.index = m.index; renderIndex(); break;
+      case 'activityCount': renderActivity(m.agents, m.terminals); break;
       case 'contextUsage': renderMeter(m.used, m.window); break;
       case 'tokens': renderTokens(m); break;
       // A new chat: no images or text left from the last one.
@@ -2978,8 +3177,10 @@
       case 'tasks': renderTasks(m); break;
       case 'tabs':
         swapDraft(activeTab, m.active);
-        // Closed tabs take their drafts with them.
+        // Closed tabs take their drafts, scroll positions, and refining state with them.
         for (const id of [...drafts.keys()]) if (!m.tabs.some((t) => t.id === id)) drafts.delete(id);
+        for (const id of [...tabScrolls.keys()]) if (!m.tabs.some((t) => t.id === id)) tabScrolls.delete(id);
+        for (const id of [...refiningTabs]) if (!m.tabs.some((t) => t.id === id)) refiningTabs.delete(id);
         tabs = m.tabs;
         activeTab = m.active;
         renderTabs();

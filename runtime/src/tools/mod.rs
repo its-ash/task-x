@@ -223,10 +223,17 @@ impl EditLog {
         }
         let body = serde_json::to_vec(&Checkpoints { version: CHECKPOINT_VERSION, operations: self.operations.clone() });
         let write = |b: Vec<u8>| -> std::io::Result<()> {
-            std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")))?;
-            let tmp = file.with_extension("json.tmp");
-            std::fs::write(&tmp, b)?;
-            std::fs::rename(tmp, &file)
+            static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = file.parent().unwrap_or(Path::new("."));
+            std::fs::create_dir_all(dir)?;
+            let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("edits");
+            let tmp = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+            let res = std::fs::write(&tmp, b).and_then(|()| std::fs::rename(&tmp, &file));
+            if res.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            res
         };
         if let Ok(b) = body {
             let _ = write(b);

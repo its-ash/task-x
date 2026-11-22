@@ -70,6 +70,8 @@ export interface ReviewActions {
 
 export class InlineReview implements vscode.CodeLensProvider, vscode.Disposable {
   private originals = new Map<string, string | null>();
+  private hunkCache = new Map<string, { version: number; original: string | null; hunks: Hunk[] }>();
+  private changeTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly added = vscode.window.createTextEditorDecorationType({
     isWholeLine: true,
     backgroundColor: new vscode.ThemeColor('diffEditor.insertedLineBackground'),
@@ -94,14 +96,19 @@ export class InlineReview implements vscode.CodeLensProvider, vscode.Disposable 
       vscode.window.onDidChangeVisibleTextEditors(() => this.decorate()),
       vscode.workspace.onDidChangeTextDocument((e) => {
         if (this.relOf(e.document)) {
-          this.decorate();
-          this.changed.fire();
+          this.hunkCache.delete(e.document.uri.toString());
+          if (this.changeTimer) clearTimeout(this.changeTimer);
+          this.changeTimer = setTimeout(() => {
+            this.changeTimer = undefined;
+            this.decorate();
+            this.changed.fire();
+          }, 120);
         }
       }),
       vscode.commands.registerCommand('task-x.review.keep', (rel: string) => this.actions.keep(rel)),
       vscode.commands.registerCommand('task-x.review.undoFile', (rel: string) => this.actions.undoFile(rel)),
       vscode.commands.registerCommand('task-x.review.diff', (rel: string) => this.actions.diff(rel)),
-      vscode.commands.registerCommand('task-x.review.undoHunk', (uri: vscode.Uri, h: Hunk) => this.undoHunk(uri, h)),
+      vscode.commands.registerCommand('task-x.review.undoHunk', (uri: vscode.Uri, h: Hunk, version?: number) => this.undoHunk(uri, h, version)),
       this.added,
       this.removed,
       this.changed,
@@ -111,6 +118,7 @@ export class InlineReview implements vscode.CodeLensProvider, vscode.Disposable 
   /** The pending files with their original text (null for a file the agent created). */
   update(files: { path: string; original: string | null }[]): void {
     this.originals = new Map(files.map((f) => [f.path, f.original]));
+    this.hunkCache.clear();
     this.decorate();
     this.changed.fire();
   }
@@ -123,7 +131,13 @@ export class InlineReview implements vscode.CodeLensProvider, vscode.Disposable 
   private hunksOf(doc: vscode.TextDocument): Hunk[] | undefined {
     const rel = this.relOf(doc);
     if (!rel || doc.lineCount > MAX_LINES) return undefined;
-    return hunks(this.originals.get(rel) ?? '', doc.getText().replace(/\r\n/g, '\n'));
+    const orig = this.originals.get(rel) ?? null;
+    const key = doc.uri.toString();
+    const cached = this.hunkCache.get(key);
+    if (cached && cached.version === doc.version && cached.original === orig) return cached.hunks;
+    const computed = hunks(orig ?? '', doc.getText().replace(/\r\n/g, '\n'));
+    this.hunkCache.set(key, { version: doc.version, original: orig, hunks: computed });
+    return computed;
   }
 
   private decorate(): void {
@@ -152,14 +166,20 @@ export class InlineReview implements vscode.CodeLensProvider, vscode.Disposable 
     for (const h of hs ?? []) {
       const r = new vscode.Range(Math.min(h.start, Math.max(0, doc.lineCount - 1)), 0, Math.min(h.start, Math.max(0, doc.lineCount - 1)), 0);
       const what = h.count && h.before.length ? `changed ${h.count} line${h.count > 1 ? 's' : ''}` : h.count ? `added ${h.count} line${h.count > 1 ? 's' : ''}` : `removed ${h.before.length} line${h.before.length > 1 ? 's' : ''}`;
-      lenses.push(new vscode.CodeLens(r, { title: `$(discard) Undo change (${what})`, command: 'task-x.review.undoHunk', arguments: [doc.uri, h], tooltip: 'Put back the original lines of this change only' }));
+      lenses.push(new vscode.CodeLens(r, { title: `$(discard) Undo change (${what})`, command: 'task-x.review.undoHunk', arguments: [doc.uri, h, doc.version], tooltip: 'Put back the original lines of this change only' }));
     }
     return lenses;
   }
 
   /** Replaces one change with its original lines, as a normal edit the user can undo with Ctrl+Z. */
-  private async undoHunk(uri: vscode.Uri, h: Hunk): Promise<void> {
+  private async undoHunk(uri: vscode.Uri, h: Hunk, version?: number): Promise<void> {
     const doc = await vscode.workspace.openTextDocument(uri);
+    if (version !== undefined && doc.version !== version) {
+      this.decorate();
+      this.changed.fire();
+      void vscode.window.showInformationMessage('task-x: file changed since this diff was computed; click Undo change again.');
+      return;
+    }
     const eol = doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
     const edit = new vscode.WorkspaceEdit();
     const text = h.before.map((l) => l + eol).join('');
@@ -174,6 +194,7 @@ export class InlineReview implements vscode.CodeLensProvider, vscode.Disposable 
   }
 
   dispose(): void {
+    if (this.changeTimer) clearTimeout(this.changeTimer);
     for (const s of this.subs) s.dispose();
   }
 }

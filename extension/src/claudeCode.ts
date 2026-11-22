@@ -33,7 +33,11 @@ export function findClaude(): string | undefined {
   return undefined;
 }
 
-export const engine = (): 'anvil' | 'claudeCode' => ((chosenEngine() ?? vscode.workspace.getConfiguration(SECTION).get<string>('engine')) === CLAUDE_KIND ? 'claudeCode' : 'anvil');
+/** The chat engine: task-x itself, the Claude Code CLI, or the Antigravity CLI (agyCli.ts). */
+export const engine = (): 'anvil' | 'claudeCode' | 'antigravity' => {
+  const e = chosenEngine() ?? vscode.workspace.getConfiguration(SECTION).get<string>('engine');
+  return e === CLAUDE_KIND ? 'claudeCode' : e === 'antigravity' ? 'antigravity' : 'anvil';
+};
 
 export const claudeModel = () => (chosenClaudeModel() ?? vscode.workspace.getConfiguration(SECTION).get<string>('claudeCode.model', '')).trim() || 'default';
 

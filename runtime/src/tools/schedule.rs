@@ -1,7 +1,6 @@
 //! Waiting tools: `sleep` pauses for a few seconds; `wait_until` runs a check command again and
-//! again until it passes. The agent loop runs `wait_until` in the background (see
-//! `agent::wakeup`), so the result arrives later as a message; a caller without a way to deliver
-//! it later (the MCP server on its own) waits for the result.
+//! again until it passes. Both run in place, as normal calls: a task ends when the model ends its
+//! turn, so nothing could deliver a result later.
 
 use super::{Permission, ToolCtx, ToolDef, ToolError, ToolResult, parse};
 use regex::Regex;
@@ -11,7 +10,7 @@ use std::time::{Duration, Instant};
 
 pub const SLEEP: &str = "sleep";
 pub const WAIT_UNTIL: &str = "wait_until";
-/// The longest `sleep`; longer waits belong to `schedule_wakeup`, which does not hold the turn.
+/// The longest `sleep`; longer waits belong to `wait_until`, which waits for something specific.
 pub const MAX_SLEEP_SECS: f64 = 120.0;
 pub const MIN_INTERVAL_SECS: u64 = 2;
 pub const MAX_INTERVAL_SECS: u64 = 600;
@@ -31,7 +30,7 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: SLEEP,
-            description: "Pause for a few seconds (up to 120), then continue: for example wait 5 seconds for a server to start before calling it. The turn waits, so keep it short. To come back after minutes or hours, use schedule_wakeup; to wait until a command succeeds, use wait_until.",
+            description: "Pause for a few seconds (up to 120), then continue: for example wait 5 seconds for a server to start before calling it. The turn waits, so keep it short. To wait until a command succeeds, use wait_until instead of sleeping again and again. Do not sleep to wait for background subagents: their reports come by themselves. A sleep ends early when the user writes or background work finishes.",
             schema: || {
                 json!({ "type": "object", "properties": {
                     "seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": MAX_SLEEP_SECS, "description": "How long to pause, 0.1 to 120 seconds" },
@@ -44,7 +43,7 @@ pub fn tools() -> Vec<ToolDef> {
         },
         ToolDef {
             name: WAIT_UNTIL,
-            description: "Run a check command every intervalSecs until it passes, for up to timeoutSecs: until it exits with code 0, or, with match, until its output matches the regular expression. Use it to wait for a server to come up, a deploy or CI run to finish, or a file to appear, without spending a turn on every check. In the task-x agent it runs in the background: the call returns at once with an id, and the result comes to you as a message when the check passes or the time is up (list_wakeups and cancel_wakeup also cover it). The command takes no shell: pass the program and its arguments.",
+            description: "Run a check command every intervalSecs until it passes, for up to timeoutSecs: until it exits with code 0, or, with match, until its output matches the regular expression. Use it to wait for a server to come up, a deploy or CI run to finish, or a file to appear, without spending a turn on every check. The call returns when the check passes or the time is up; the user can stop it. The command takes no shell: pass the program and its arguments.",
             schema: || {
                 json!({ "type": "object", "properties": {
                     "command": {
@@ -63,6 +62,59 @@ pub fn tools() -> Vec<ToolDef> {
             handler: wait_until,
         },
     ]
+}
+
+/// Whether `name` is a waiting tool: one that a user message ends early (`call_interruptible`).
+pub fn is_wait(name: &str) -> bool {
+    name == SLEEP || name == WAIT_UNTIL
+}
+
+/// The result of a wait that a user message ended early.
+pub const INTERRUPTED: &str = "Stopped early: the user sent a message. Read it and answer it first; wait again afterwards only if the wait is still needed.";
+/// The result of a wait that a finished background job (a subagent, a background command) ended early.
+pub const BACKGROUND_DONE: &str = "Stopped early: background work finished (a subagent or a background command). Its result comes with this reply: read it and go on with the task. Do not wait again for work that is already done.";
+
+/// Why a wait ended early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interrupt {
+    /// The user sent a message.
+    Message,
+    /// A background subagent or command finished.
+    Background,
+}
+/// How often a wait looks for a user message.
+const INTERRUPT_POLL: Duration = Duration::from_millis(200);
+
+/// Runs `sleep` or `wait_until` until it ends, or until `interrupted()` says why it should stop (the
+/// user sent a message, background work finished): the wait then stops (through `ctx.cancel`) and
+/// the call returns `{ interrupted: true }` at once, not an error, so the model reads the message or
+/// the result now instead of after the wait.
+pub async fn call_interruptible(
+    def: &'static ToolDef,
+    ctx: std::sync::Arc<ToolCtx>,
+    input: Value,
+    interrupted: impl Fn() -> Option<Interrupt>,
+) -> ToolResult {
+    let stop = ctx.cancel.clone();
+    let started = Instant::now();
+    let call = super::call(def, ctx, input);
+    tokio::pin!(call);
+    loop {
+        tokio::select! {
+            r = &mut call => return r,
+            _ = tokio::time::sleep(INTERRUPT_POLL) => {
+                if let Some(why) = interrupted() {
+                    stop.cancel();
+                    let _ = (&mut call).await;
+                    let (by, message) = match why {
+                        Interrupt::Message => ("message", INTERRUPTED),
+                        Interrupt::Background => ("background", BACKGROUND_DONE),
+                    };
+                    return Ok(json!({ "interrupted": true, "by": by, "elapsedSecs": started.elapsed().as_secs(), "message": message }));
+                }
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -90,7 +142,7 @@ fn sleep(c: &ToolCtx, input: Value) -> ToolResult {
     let i: SleepIn = parse(input)?;
     if !i.seconds.is_finite() || i.seconds <= 0.0 || i.seconds > MAX_SLEEP_SECS {
         return Err(ToolError::invalid(format!(
-            "seconds must be more than 0 and at most {MAX_SLEEP_SECS}; to come back later use schedule_wakeup, to wait for a condition use wait_until"
+            "seconds must be more than 0 and at most {MAX_SLEEP_SECS}; to wait for a condition use wait_until"
         )));
     }
     let started = Instant::now();
@@ -147,7 +199,7 @@ pub fn check_wait(input: Value) -> Result<WaitSpec, ToolError> {
     let timeout = i.timeout_secs.unwrap_or(DEFAULT_WAIT_SECS);
     if !(MIN_WAIT_SECS..=MAX_WAIT_SECS).contains(&timeout) {
         return Err(ToolError::invalid(format!(
-            "timeoutSecs must be {MIN_WAIT_SECS} to {MAX_WAIT_SECS}; for a longer wait, schedule_wakeup and check again then"
+            "timeoutSecs must be {MIN_WAIT_SECS} to {MAX_WAIT_SECS}; for a longer job, end your turn and tell the user what is still pending"
         )));
     }
     let reason = i.reason.as_deref().map(str::trim).filter(|r| !r.is_empty()).map_or_else(|| label.clone(), str::to_owned);
@@ -228,7 +280,28 @@ mod tests {
             let e = run(&c, SLEEP, bad).unwrap_err();
             assert_eq!(e.kind, ToolErrorKind::InvalidInput);
         }
-        assert!(run(&c, SLEEP, json!({ "seconds": 500 })).unwrap_err().message.contains("schedule_wakeup"));
+        assert!(run(&c, SLEEP, json!({ "seconds": 500 })).unwrap_err().message.contains("wait_until"));
+    }
+
+    /// A user message ends a wait early: the call returns `interrupted`, not an error, at once.
+    #[tokio::test]
+    async fn a_message_ends_a_wait_early() {
+        let c = ctx(&[("a.txt", "x")]);
+        let def = super::super::find(SLEEP).unwrap();
+        let t = Instant::now();
+        let r = call_interruptible(def, c.clone(), json!({ "seconds": 60 }), move || (t.elapsed() > Duration::from_millis(300)).then_some(Interrupt::Message))
+            .await
+            .unwrap();
+        assert_eq!((r["interrupted"].as_bool(), r["by"].as_str(), r["message"].as_str()), (Some(true), Some("message"), Some(INTERRUPTED)));
+        assert!(t.elapsed() < Duration::from_secs(2), "ended in {:?}", t.elapsed());
+        assert!(c.cancel.is_cancelled(), "the wait itself was stopped");
+        let t = Instant::now();
+        let r = call_interruptible(def, ctx(&[("a.txt", "x")]), json!({ "seconds": 60 }), || Some(Interrupt::Background)).await.unwrap();
+        assert_eq!((r["by"].as_str(), r["message"].as_str()), (Some("background"), Some(BACKGROUND_DONE)), "finished background work ends a wait too");
+        assert!(t.elapsed() < Duration::from_secs(2));
+        let done = call_interruptible(def, ctx(&[("a.txt", "x")]), json!({ "seconds": 0.1 }), || None).await.unwrap();
+        assert_eq!(done["slept"], true, "without a message the wait ends as usual");
+        assert!(is_wait(SLEEP) && is_wait(WAIT_UNTIL) && !is_wait("run_command"));
     }
 
     #[test]
@@ -245,7 +318,7 @@ mod tests {
         assert!(check_wait(json!({ "command": [] })).is_err());
         assert!(check_wait(json!({ "command": ["true"], "match": "(" })).unwrap_err().message.contains("regular expression"));
         assert!(check_wait(json!({ "command": ["true"], "intervalSecs": 1 })).is_err());
-        assert!(check_wait(json!({ "command": ["true"], "timeoutSecs": 7200 })).unwrap_err().message.contains("schedule_wakeup"));
+        assert!(check_wait(json!({ "command": ["true"], "timeoutSecs": 7200 })).unwrap_err().message.contains("tell the user what is still pending"));
         let s = check_wait(json!({ "command": ["curl", "-sf", "http://x"] })).unwrap();
         assert_eq!((s.label.as_str(), s.reason.as_str(), s.interval.as_secs(), s.timeout.as_secs()), ("curl -sf http://x", "curl -sf http://x", 15, 600));
     }

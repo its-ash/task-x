@@ -161,8 +161,9 @@ pub fn drop_retrieval(messages: &mut [Message]) -> usize {
     let mut saved = 0;
     for p in &mut first.content {
         let ContentPart::Text { text } = p else { continue };
-        let (Some(a), Some(b)) = (text.find("<repository_context>"), text.find("</repository_context>")) else { continue };
-        let end = b + "</repository_context>".len();
+        let Some(a) = text.find("<repository_context>") else { continue };
+        let Some(rel_b) = text[a..].find("</repository_context>") else { continue };
+        let end = a + rel_b + "</repository_context>".len();
         let note = format!("{MARK} The repository excerpts for this request were removed; search and read files with the tools.");
         if end - a > note.len() {
             saved += end - a - note.len();

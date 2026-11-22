@@ -3,11 +3,12 @@ import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
-import { EDIT_MODES, type EditMode, activeRef, editMode, effort, sandboxOn, setSandbox, windowChoice, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, setEditMode, toolModels, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setProvider, setWindowChoice, settings, SECTION } from './config.js';
+import { EDIT_MODES, type EditMode, type ProviderRef, activeRef, editMode, effort, sandboxOn, setSandbox, windowChoice, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, setEditMode, toolModels, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setWindowChoice, settings, SECTION } from './config.js';
 import {
   type AgentEvent,
   type AgentEventParams,
   type AgentSummary,
+  type AgyRunParams,
   type ApprovalDecision,
   type ApprovalRequest,
   type AskUserRequest,
@@ -32,7 +33,9 @@ import {
   type SkillInfo,
 } from './protocol.js';
 import { type PluginEntry, catalog, managePlugin, newAgent, newCommand, newSkill, setPlugin, viewPlugin } from './catalog.js';
-import { CLAUDE_KIND, CLAUDE_LABEL, claudeAuth, claudeModel, claudePermissions, claudeSignIn, claudeSubagentModel, claudeSignOut, engine, findClaude, useClaude } from './claudeCode.js';
+import { CLAUDE_KIND, CLAUDE_LABEL, claudeAuth, claudeModel, claudePermissions, claudeSignIn, claudeSubagentModel, claudeSignOut, engine, findClaude } from './claudeCode.js';
+import { ClaudeUsage } from './claudeUsage.js';
+import { AGY_CONVERSATIONS_KEY, AGY_KIND, AGY_LABEL, AgyCli, agyModel, agyPermissions, findAgy } from './agyCli.js';
 import { CLAUDE_MODEL_INFO, type Listed, MODEL_LIST_TTL_MS, formatTokens, listModels, missingNote, withSaved } from './models.js';
 import { type JsonRpcClient, RpcError } from './rpc.js';
 import { diffStats, formatOutput } from './output.js';
@@ -85,7 +88,7 @@ const MAX_STEERS = 10;
 const MAX_SAVED_OUTPUT = 8_000;
 /** Diff kept on each file item so its edit card can show the change after a reload. */
 const MAX_CARD_DIFF = 6_000;
-const OUTPUT_TOOLS = new Set(['Bash', 'BashOutput', 'run_command', 'run_tests', 'check_build', 'run_linter', 'format_code', 'get_diagnostics', 'git_status', 'git_diff', 'git_log', 'git_show']);
+const OUTPUT_TOOLS = new Set(['Bash', 'BashOutput', 'run_command', 'run_shell_command', 'run_tests', 'check_build', 'run_linter', 'format_code', 'get_diagnostics', 'git_status', 'git_diff', 'git_log', 'git_show']);
 const SEVERITY = ['error', 'warning', 'info', 'hint'];
 const CONTINUE_PROMPT = 'Continue the task from where you stopped. Check what is already done, finish the remaining work, then run the build and tests.';
 /** Loop Mode (stored under the old "night" keys): the last request runs again until it completes, for free models that drop requests or stall. */
@@ -178,7 +181,7 @@ const MAX_LANE_STEPS = 30;
 type Item =
   | { kind: 'user'; text: string; mode: ChatMode; images?: number; context?: SentContext[]; id?: string; operations?: number[] }
   | { kind: 'assistant'; text: string }
-  | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string }; tokens?: number; browser?: string; svg?: string }
+  | { kind: 'tool'; id: string; tool: string; detail: string; ok?: boolean; output?: string; outputCut?: boolean; stop?: { taskId: string; callId: string }; tokens?: number; browser?: string; svg?: string; image?: string }
   | { kind: 'file'; path: string; operation: number | null; diffKey: string; added: number; removed: number; diff: string; diffCut: boolean; undone?: boolean; kept?: boolean }
   | { kind: 'context'; text: string }
   | { kind: 'steer'; text: string }
@@ -241,6 +244,9 @@ type Inbound =
   | { type: 'approve'; callId: string; decision: string }
   | { type: 'openDiff'; diffKey: string; path?: string }
   | { type: 'openFile'; path: string }
+  | { type: 'openLink'; href: string }
+  | { type: 'openTerminal'; command?: string }
+  | { type: 'openActivity' }
   | { type: 'undo'; operation: number }
   | { type: 'keep'; paths?: string[] }
   | { type: 'revert'; paths?: string[] }
@@ -266,7 +272,7 @@ type Inbound =
   | { type: 'stopLane'; taskId: string }
   | { type: 'steerLane'; taskId: string; text: string }
   | { type: 'stopTool'; id: string }
-  | { type: 'refine'; text: string }
+  | { type: 'refine'; text: string; tab?: string }
   | { type: 'applyWorktree'; name: string }
   | { type: 'discardWorktree'; name: string }
   | { type: 'openWorktree'; name: string }
@@ -280,7 +286,9 @@ type Inbound =
   | { type: 'clearHistory' }
   | { type: 'answerQuestions'; callId: string; answers: unknown; other?: unknown }
   | { type: 'svgPreview'; id: string; path: string }
-  | { type: 'exportSvg'; path: string };
+  | { type: 'exportSvg'; path: string }
+  | { type: 'loadImage'; id: string; src: string }
+  | { type: 'openImage'; src: string };
 
 /** One saved task in the History tab. */
 interface TaskRow {
@@ -351,6 +359,8 @@ interface ChatTab {
   lastUsed?: number;
   /** Chrome mode: this chat's web work goes to the user's Chrome through the task-x extension. */
   chrome?: boolean;
+  /** Per-tab engine/provider/model override so changing models in one tab never affects other tabs or windows. */
+  modelChoice?: { engine: 'anvil' | 'claudeCode' | 'antigravity'; provider?: ProviderRef; model: string };
 }
 
 /** One chat tab's running task: each tab runs its own, at the same time as the others. */
@@ -372,6 +382,10 @@ interface Run {
   wakeups: Set<string>;
   /** Set while the task sleeps until a wake-up (`sleeping` → `awake`): when it wakes at the latest. */
   sleepingUntil?: number;
+  /** Edit mode captured when this run started, so changing modes for another tab does not leak in. */
+  editMode: ReturnType<typeof editMode>;
+  /** True if the user cleared this tab while the run was stopping. */
+  cleared?: boolean;
 }
 
 /** Chat tabs that run a task at the same time; a request beyond this waits for a free slot. */
@@ -486,12 +500,12 @@ function toolDetail(tool: string, input: Record<string, unknown>): string {
     return v.length > 120 ? `${v.slice(0, 117)}…` : v;
   }
   // Commands are shown in full; the chat row wraps them.
-  const cmd = s('command');
+  const cmd = s('command') || s('CommandLine') || s('cmd');
   if (cmd) return cmd;
-  const claude = s('file_path') || s('url') || s('notebook_path');
+  const claude = s('file_path') || s('filePath') || s('TargetFile') || s('AbsolutePath') || s('Path') || s('DirectoryPath') || s('SearchPath') || s('url') || s('Url') || s('notebook_path');
   if (claude) return claude.length > 120 ? `${claude.slice(0, 117)}…` : claude;
   if (tool === 'apply_patch') return [...s('patch').matchAll(/^\+\+\+ (?:b\/)?(.+)$/gm)].map((m) => m[1]).join(', ');
-  const v = s('path') || s('query') || s('pattern') || s('name') || s('glob') || (s('from') && `${s('from')} → ${s('to')}`) || s('rev');
+  const v = s('path') || s('query') || s('Query') || s('pattern') || s('Pattern') || s('name') || s('glob') || (s('from') && `${s('from')} → ${s('to')}`) || s('rev');
   return v.length > 120 ? `${v.slice(0, 117)}…` : v;
 }
 
@@ -539,17 +553,17 @@ function summaryText(s: AgentSummary): { text: string; ok: boolean; canContinue:
   const m = s.metrics;
   if (m?.subagents) parts.push(`${m.subagents} subagent${m.subagents > 1 ? 's' : ''}${m.subagentTokens ? ` · ${fmtTokens(m.subagentTokens)} tokens` : ''}`);
   const error = s.error?.trim() || undefined;
-  const signIn = !!error && AUTH_ERROR.test(error);
+  const isClaudeAuth = !!error && AUTH_ERROR.test(error) && (s as { engine?: string }).engine === 'claudeCode';
   const canContinue = ['maxIterations', 'budgetExceeded', 'deadlineExceeded', 'cancelled', 'interrupted'].includes(s.status);
   return {
     text: [title, ...parts, ...(error ? [error] : [])].join(' · '),
     ok: s.status === 'completed',
     canContinue,
     raiseLimit: s.status === 'maxIterations',
-    title: signIn ? 'Sign in required' : title,
+    title: isClaudeAuth ? 'Sign in required' : title,
     stats: parts,
-    error: signIn ? 'Your Anthropic session is not active. Sign in to continue with Claude Code.' : error,
-    signIn,
+    error: isClaudeAuth ? 'Your Anthropic session is not active. Sign in to continue with Claude Code.' : error,
+    signIn: isClaudeAuth,
   };
 }
 
@@ -581,7 +595,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   // Context window per `kind:model`; 0 means unknown.
   private readonly windows = new Map<string, number>();
   /** Messages sent to a tab while its task runs (or while every run slot is taken); each runs after the one before it. */
-  private readonly queue: { text: string; mode?: ChatMode; images?: ImageInput[]; tab: string }[] = [];
+  private readonly queue: { text: string; mode?: ChatMode; images?: ImageInput[]; tab: string; editor?: EditorContext }[] = [];
+  /** Tabs currently awaiting pre-run checks (`sessionCommand`, `checkChrome`), preventing duplicate starts. */
+  private readonly startingTabs = new Set<string>();
+  /** Serializes `CHATS_KEY` archive updates so concurrent finishing runs never drop each other. */
+  private archiveChain: Promise<void> = Promise.resolve();
   private night: boolean;
   /** The last request the user sent; Night mode runs it again until a run completes. */
   private nightRequest: string | undefined;
@@ -613,6 +631,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   onBusyChange?: (busy: boolean) => void;
   /** Opens the project graph panel. */
   onShowGraph?: () => void;
+  /** Opens the bottom Agents & Terminals panel. */
+  onOpenActivity?: () => void;
+  /** Opens the live terminal for a command run by an agent. */
+  onOpenTerminal?: (taskId: string | undefined, command?: string) => boolean;
+  private activityCount = { agents: 0, terminals: 0 };
   private includeEditor: boolean;
   private autoCommit: boolean;
   private files: { at: number; list: string[] } | undefined;
@@ -636,7 +659,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.nightTodo = ctx.workspaceState.get<boolean>(NIGHT_TODO_KEY, false);
     this.nightItem = ctx.workspaceState.get<string>(NIGHT_ITEM_KEY);
     this.watchNight();
+    this.agy = new AgyCli(getClient);
+    this.claudeUsage = new ClaudeUsage(ctx.globalState);
+    this.claudeUsage.update();
+    if (findClaude()) void this.claudeUsage.refreshUsage();
+    this.agy.update();
+    if (findAgy()) void this.agy.refreshUsage();
+    // New models or limits from agy / Claude redraw the model picker.
+    ctx.subscriptions.push(
+      this.agy,
+      this.agy.onDidChange(() => void this.postModels()),
+      this.claudeUsage,
+      this.claudeUsage.onDidChange(() => void this.postModels()),
+    );
   }
+
+  /** The Antigravity CLI engine: its models and limits (the status bar item, `task-x.agyUsage`). */
+  readonly agy: AgyCli;
+  /** The Claude Code CLI engine's daily usage and rate-limit windows (status bar item, `task-x.claudeUsage`). */
+  readonly claudeUsage: ClaudeUsage;
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
@@ -671,6 +712,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** The chat tab whose running task owns a runtime task id (its own, a subagent's, or a plan's). */
   private tabForTask(taskId: string): string | undefined {
     return this.tabs.find((t) => t.kind === 'chat' && t.taskId && this.runs.has(t.id) && (taskId === t.taskId || taskId.startsWith(`${t.taskId}-`)))?.id;
+  }
+  /** The title of the chat tab a runtime task (or one of its subagents) belongs to, running or not (the Terminals view). */
+  chatTitleForTask(taskId: string): string | undefined {
+    const tab = this.tabs.find((t) => t.kind === 'chat' && t.taskId && (taskId === t.taskId || taskId.startsWith(`${t.taskId}-`)));
+    return tab && tabTitle(tab);
   }
   private get items(): Item[] {
     return this.chat.items;
@@ -718,6 +764,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /** Empties the current chat tab: a new task, no transcript, and the context meter reset. */
   async clear(): Promise<void> {
+    const curRun = this.runs.get(this.chat.id);
+    if (curRun) {
+      curRun.cleared = true;
+      curRun.steering.length = 0;
+    }
     this.cancel(this.chat.id);
     await this.archive();
     this.items = [];
@@ -799,10 +850,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Opens an empty chat in a new tab, after the open tabs and before History. */
   async newChat(): Promise<void> {
     if (this.tabs.filter((t) => t.kind === 'chat').length >= MAX_CHAT_TABS) return void vscode.window.showWarningMessage(`task-x: close a chat tab first. Up to ${MAX_CHAT_TABS} chats can be open.`);
-    this.showTab(this.addTab(blankTab()).id);
+    const created = this.addTab(blankTab());
+    this.showTab(created.id);
     // A new chat starts clean: no conversation (a new task id), no context meter, plan, or images.
-    this.post({ type: 'contextUsage', used: 0, window: 0 });
-    this.post({ type: 'clearDraft' });
+    this.post({ type: 'contextUsage', tabId: created.id, used: 0, window: 0 });
+    this.post({ type: 'clearDraft', tabId: created.id });
   }
 
   private addTab(tab: ChatTab): ChatTab {
@@ -841,6 +893,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       return this.postTabs();
     }
     if (this.runs.has(tab.id)) return void vscode.window.showWarningMessage('task-x: stop the running task before you close its tab.');
+    // Purge any queued messages for the closed tab immediately so they don't count against MAX_QUEUE.
+    for (let q = this.queue.length - 1; q >= 0; q--) if (this.queue[q].tab === id) this.queue.splice(q, 1);
     await this.archive(tab);
     const strip = this.tabs.filter(onStrip);
     const i = strip.indexOf(tab);
@@ -913,12 +967,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const tab = this.tabs.find((t) => t.id === this.activeTab) ?? this.chat;
     const run = this.runs.get(tab.id);
     const live = tab.kind === 'subagent' ? tab.status === 'running' && !!tab.assistant : !!run;
-    this.post({ type: 'history', items: tab.items, streaming: live && tab.items.at(-1)?.kind === 'assistant' });
-    this.post({ type: 'contextUsage', used: tab.usage?.used ?? 0, window: tab.usage?.window ?? 0 });
+    this.post({ type: 'history', tabId: tab.id, items: tab.items, streaming: live && tab.items.at(-1)?.kind === 'assistant' });
+    this.post({ type: 'contextUsage', tabId: tab.id, used: tab.usage?.used ?? 0, window: tab.usage?.window ?? 0 });
     // A subagent tab shows the tokens of the chat it belongs to.
     const owner = tab.kind === 'chat' ? tab : this.tabs.find((t) => t.id === tab.parent);
-    this.post({ type: 'tokens', ...(owner?.tokens ?? { input: 0, output: 0, cached: 0 }) });
-    for (const c of run?.cards.values() ?? []) this.post(c);
+    this.post({ type: 'tokens', tabId: tab.id, ...(owner?.tokens ?? { input: 0, output: 0, cached: 0 }) });
+    for (const c of run?.cards.values() ?? []) this.post({ ...c, tabId: tab.id });
     this.postQueue();
     this.postTodos();
   }
@@ -930,7 +984,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /** Posts a message about the chat only while its tab is on screen; the tab's items draw it later. */
   private postChat(msg: object): void {
-    if (this.activeTab === this.chat.id) this.post(msg);
+    if (this.activeTab === this.chat.id) this.post({ ...msg, tabId: this.chat.id });
   }
 
   invalidateModels(): void {
@@ -941,10 +995,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.post({ type: 'copySelection' });
   }
 
+  private tabEngine(tab: ChatTab = this.chat): 'anvil' | 'claudeCode' | 'antigravity' {
+    return tab.modelChoice?.engine ?? engine();
+  }
+
+  private tabProviderRef(tab: ChatTab = this.chat): ProviderRef {
+    return tab.modelChoice?.provider && isProviderRef(tab.modelChoice.provider) ? tab.modelChoice.provider : activeRef();
+  }
+
+  private tabModel(tab: ChatTab = this.chat): string {
+    const eng = this.tabEngine(tab);
+    if (tab.modelChoice) return tab.modelChoice.model;
+    return eng === 'claudeCode' ? claudeModel() : eng === AGY_KIND ? agyModel() : modelFor(this.tabProviderRef(tab));
+  }
+
   refreshStatus(): void {
-    const ref = activeRef();
-    const claude = engine() === 'claudeCode';
-    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : refLabel(ref), model: claude ? claudeModel() : modelFor(ref) || '(no model)', busy: this.runs.has(this.activeTab), sleeping: this.runs.get(this.activeTab)?.sleepingUntil ?? null, chrome: { on: !!this.reviewTab()?.chrome, ...this.chromeStatus }, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null, agent: windowChoice().agent ?? null });
+    const tab = this.reviewTab() ?? this.chat;
+    const ref = this.tabProviderRef(tab);
+    const eng = this.tabEngine(tab);
+    const claude = eng === 'claudeCode';
+    const agy = eng === AGY_KIND;
+    this.agy.update();
+    if (findAgy()) void this.agy.refreshUsage();
+    this.claudeUsage.update();
+    if (findClaude()) void this.claudeUsage.refreshUsage();
+    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : agy ? AGY_LABEL : refLabel(ref), model: this.tabModel(tab) || '(no model)', busy: this.runs.has(this.activeTab), sleeping: this.runs.get(this.activeTab)?.sleepingUntil ?? null, chrome: { on: !!this.reviewTab()?.chrome, ...this.chromeStatus }, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null, agent: windowChoice().agent ?? null });
     void this.postModels();
   }
 
@@ -959,12 +1034,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Fires when a subagent starts, changes, or ends in any chat tab, or a tab's run starts or ends. */
   readonly onDidChangeLanes = this.lanesChanged.event;
 
-  /** Every chat tab that has subagents, with copies of them (the Agents view). */
+  /** Every running chat tab and every chat tab that has subagents (the Agents view). */
   agentChats(): AgentChat[] {
     return this.tabs
       .filter((t) => t.kind === 'chat')
       .map((t) => ({ tabId: t.id, title: tabTitle(t), running: this.runs.has(t.id), lanes: t.items.filter((i): i is Lane => i.kind === 'lane').map((l) => ({ ...l, steps: [...l.steps] })) }))
-      .filter((c) => c.lanes.length);
+      .filter((c) => c.running || c.lanes.length);
+  }
+
+  /** Reveals a chat tab from the Agents view. */
+  revealChatTab(tabId: string): Promise<boolean> {
+    return this.revealTab(tabId);
+  }
+
+  /** Updates the live Agents & Terminals badge in the Chat header. */
+  setActivityCount(agents: number, terminals: number): void {
+    this.activityCount = { agents, terminals };
+    this.post({ type: 'activityCount', agents, terminals });
   }
 
   /** Shows a chat tab in the view, revealing the view first. */
@@ -1276,7 +1362,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /** Saves the open chat tabs. Subagent tabs show live activity only and are not saved. */
   private async saveTabs(): Promise<void> {
-    const tabs = this.tabs.filter((t) => t.kind === 'chat').map(({ id, kind, items, taskId, tokens, lastUsed, chrome }) => ({ id, kind, items: items.slice(-MAX_ITEMS), taskId, tokens, lastUsed, chrome }));
+    const tabs = this.tabs.filter((t) => t.kind === 'chat').map(({ id, kind, items, taskId, tokens, lastUsed, chrome, modelChoice }) => ({ id, kind, items: items.slice(-MAX_ITEMS), taskId, tokens, lastUsed, chrome, modelChoice }));
     const active = this.tabs.find((t) => t.id === this.activeTab)?.kind === 'chat' ? this.activeTab : this.chatTabId;
     await this.ctx.workspaceState.update(TABS_KEY, { tabs, active });
   }
@@ -1287,24 +1373,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /** Saves a chat tab to the History list. The time changes only when the transcript grows. */
-  private async archive(tab = this.chat): Promise<void> {
+  private archive(tab = this.chat): Promise<void> {
     const { taskId: id, items } = tab;
     const first = items.find((i): i is Extract<Item, { kind: 'user' }> => i.kind === 'user');
-    if (!id || !first) return;
-    const all = this.chats();
-    const prev = all.find((c) => c.id === id);
-    const last = items.findLast((i): i is Extract<Item, { kind: 'summary' }> => i.kind === 'summary');
-    const chat: SavedChat = {
-      id,
-      title: first.text.trim().split('\n')[0].slice(0, MAX_TITLE) || '(untitled)',
-      status: last ? (last.ok ? 'completed' : 'failed') : 'cancelled',
-      mode: first.mode,
-      updatedMs: prev && prev.items.length === items.length ? prev.updatedMs : Date.now(),
-      files: new Set(items.flatMap((i) => (i.kind === 'file' ? [i.path] : []))).size,
-      items,
+    if (!id || !first) return Promise.resolve();
+    const snapshot = [...items];
+    const run = async () => {
+      const all = this.chats();
+      const prev = all.find((c) => c.id === id);
+      const last = snapshot.findLast((i): i is Extract<Item, { kind: 'summary' }> => i.kind === 'summary');
+      const chat: SavedChat = {
+        id,
+        title: first.text.trim().split('\n')[0].slice(0, MAX_TITLE) || '(untitled)',
+        status: last ? (last.ok ? 'completed' : 'failed') : 'cancelled',
+        mode: first.mode,
+        updatedMs: prev && prev.items.length === snapshot.length ? prev.updatedMs : Date.now(),
+        files: new Set(snapshot.flatMap((i) => (i.kind === 'file' ? [i.path] : []))).size,
+        items: snapshot,
+      };
+      const rest = all.filter((c) => c.id !== id);
+      await this.ctx.workspaceState.update(CHATS_KEY, [chat, ...rest].sort((a, b) => b.updatedMs - a.updatedMs).slice(0, MAX_CHATS));
     };
-    const rest = all.filter((c) => c.id !== id);
-    await this.ctx.workspaceState.update(CHATS_KEY, [chat, ...rest].sort((a, b) => b.updatedMs - a.updatedMs).slice(0, MAX_CHATS));
+    this.archiveChain = this.archiveChain.then(run, run);
+    return this.archiveChain;
   }
 
   /** Deletes one saved chat here and in the runtime; the open chat starts fresh when it is the one deleted. */
@@ -1385,11 +1476,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const note = [l?.note, complete ? missingNote(l.models, modelFor(ref), local) : undefined].filter(Boolean).join(' ') || undefined;
       groups.push({ kind: ref, brand: refKind(ref), label: refLabel(ref), local, models, loading: this.listing.has(ref), note, error: l?.models.length ? undefined : l?.error });
     }
-    if (findClaude()) groups.push({ kind: CLAUDE_KIND, brand: CLAUDE_KIND, label: CLAUDE_LABEL, local: false, models: withSaved(CLAUDE_MODEL_INFO, claudeModel()).map(row), loading: false });
+    if (findClaude()) groups.push({ kind: CLAUDE_KIND, brand: CLAUDE_KIND, label: CLAUDE_LABEL, local: false, models: withSaved(CLAUDE_MODEL_INFO, claudeModel()).map(row), loading: false, note: this.claudeUsage.note, limit: this.claudeUsage.limitSummary });
+    if (findAgy()) {
+      this.agy.loadModels();
+      const agyModels: ModelInfo[] = [{ id: 'default', capabilities: [], details: "agy's default model" }, ...this.agy.models.map((m) => ({ id: m.id, capabilities: [], details: m.label }))];
+      // Structured 5h usage bar (with weekly bar on hover) for the model picker.
+      groups.push({ kind: AGY_KIND, brand: AGY_KIND, label: AGY_LABEL, local: false, models: withSaved(agyModels, agyModel()).map(row), loading: false, note: this.agy.note, limit: this.agy.limitSummary });
+    }
     // `brand` is the provider kind behind a ref (a custom endpoint is openaiCompatible), for the chip colour.
-    const current = engine() === 'claudeCode'
-      ? { kind: CLAUDE_KIND, brand: CLAUDE_KIND, model: claudeModel() }
-      : { kind: active, brand: refKind(active), local: refKind(active) === 'ollama', model: modelFor(active), window: this.windowFor(active, modelFor(active)) };
+    const tab = this.reviewTab() ?? this.chat;
+    const eng = this.tabEngine(tab);
+    const tabRef = this.tabProviderRef(tab);
+    const chosenModel = this.tabModel(tab);
+    const current = eng === 'claudeCode'
+      ? { kind: CLAUDE_KIND, brand: CLAUDE_KIND, model: chosenModel || 'default' }
+      : eng === AGY_KIND
+        ? { kind: AGY_KIND, brand: AGY_KIND, model: chosenModel || 'default' }
+        : { kind: tabRef, brand: refKind(tabRef), local: refKind(tabRef) === 'ollama', model: chosenModel, window: this.windowFor(tabRef, chosenModel) };
     this.post({ type: 'models', active: current, groups });
   }
 
@@ -1456,6 +1559,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.refreshStatus();
         this.postEditor();
         this.post({ type: 'index', index: this.indexState });
+        this.post({ type: 'activityCount', ...this.activityCount });
         void this.refreshChanges();
         this.resumeNight();
         this.watchChrome();
@@ -1515,7 +1619,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // Each chat tab runs its own task. In a tab whose task runs, Enter steers it (text only); a
         // message with images, or one sent to be queued, waits for that task.
         const images = imagesFrom(m.images);
-        const tab = this.chatTabId;
+        const rawTab = 'tab' in m ? (m as { tab?: unknown }).tab : undefined;
+        const requestedTab = typeof rawTab === 'string' ? rawTab : undefined;
+        const tab = requestedTab && this.tabs.some((t) => t.id === requestedTab && t.kind === 'chat') ? requestedTab : this.chatTabId;
         const steer = this.activeTab === tab && this.runs.has(tab) && !images.length && m.queue !== true;
         const text = m.text;
         await (steer ? this.inTab(tab, () => this.steer(text)) : this.send(text, undefined, false, images, tab));
@@ -1595,18 +1701,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'signOut':
         await claudeSignOut(() => this.refreshStatus());
         break;
-      case 'selectModel':
-        // A running task keeps the model it started with, so only the tab on screen must be idle.
-        if (this.runs.has(this.chatTabId) || typeof m.model !== 'string' || !m.model.trim() || m.model.length > 256) this.refreshStatus();
-        else if (m.kind === CLAUDE_KIND) {
-          await useClaude(m.model.trim());
+      case 'selectModel': {
+        // Model selection is scoped to the active chat tab only, never mutating other tabs or windows.
+        const tab = this.tabs.find((t) => t.id === this.chatTabId && t.kind === 'chat');
+        if (!tab || this.runs.has(tab.id) || typeof m.model !== 'string' || !m.model.trim() || m.model.length > 256) {
           this.refreshStatus();
+          break;
+        }
+        const chosen = m.model.trim();
+        if (m.kind === CLAUDE_KIND) {
+          tab.modelChoice = { engine: 'claudeCode', model: chosen };
+          await this.saveTabs();
+        } else if (m.kind === AGY_KIND) {
+          tab.modelChoice = { engine: 'antigravity', model: chosen };
+          await this.saveTabs();
         } else if (isProviderRef(m.kind)) {
-          await setWindowChoice({ engine: 'task-x' });
-          await setProvider(m.kind, m.model.trim());
-          this.refreshStatus();
-        } else this.refreshStatus();
+          tab.modelChoice = { engine: 'anvil', provider: m.kind, model: chosen };
+          await this.saveTabs();
+        }
+        this.refreshStatus();
         break;
+      }
       case 'approve': {
         const d = (['allow', 'allowSession', 'always', 'deny'] as const).find((x) => x === m.decision) ?? 'deny';
         const id = m.callId as string;
@@ -1685,11 +1800,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'openFile':
         await this.openFile(m.path);
         break;
+      case 'openLink':
+        if (typeof m.href === 'string') await this.openLink(m.href);
+        break;
+      case 'openActivity':
+        this.onOpenActivity?.();
+        break;
+      case 'openTerminal':
+        this.onOpenTerminal?.(this.taskId, typeof m.command === 'string' ? m.command : undefined);
+        break;
       case 'svgPreview':
         if (typeof m.id === 'string' && typeof m.path === 'string') await this.svgPreview(m.id, m.path);
         break;
       case 'exportSvg':
         if (typeof m.path === 'string') await this.exportSvg(m.path);
+        break;
+      case 'loadImage':
+        if (typeof m.id === 'string' && typeof m.src === 'string') await this.loadImage(m.id, m.src);
+        break;
+      case 'openImage':
+        if (typeof m.src === 'string') await this.openImage(m.src);
         break;
       case 'undo':
         if (Number.isInteger(m.operation)) await this.undo(m.operation);
@@ -1698,10 +1828,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         await vscode.commands.executeCommand('workbench.actions.view.problems');
         break;
       case 'refine':
-        if (typeof m.text === 'string') await this.refine(m.text);
+        if (typeof m.text === 'string') await this.refine(m.text, typeof m.tab === 'string' ? m.tab : this.activeTab);
         break;
       case 'stopTool': {
-        const it = this.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === m.id);
+        const active = this.tabs.find((t) => t.id === this.activeTab);
+        const searchItems = active ? active.items : this.items;
+        const it = searchItems.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === m.id) ?? this.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === m.id);
         if (it?.stop && it.ok === undefined && this.runs.size) await (await this.getClient()).request('agent/cancelTool', it.stop).catch((e) => this.log('warn', `cancelTool: ${describeError(e)}`));
         break;
       }
@@ -2052,6 +2184,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return named ?? (ok ? this.lastBrowser : undefined);
   }
 
+  /** Extracts a generated/saved raster image path from a finished tool result, if any. */
+  private imagePathFrom(ok: boolean, output?: string): string | undefined {
+    if (!ok || !output) return undefined;
+    const IMG_RE = /(?:file:\/\/|\/|[A-Za-z]:\\|[\w.-]+\/)[^\s"'`<>()[\]]+\.(?:png|jpe?g|webp|gif)\b/i;
+    const m = IMG_RE.exec(output);
+    return m && this.resolveImage(m[0]) ? m[0] : undefined;
+  }
+
   /** Only an SVG that a `render_svg` call in an open chat drew; never just any path from the webview. */
   private knownSvg(rel: string): boolean {
     return isWorkspaceSvg(rel) && this.allItems().some((i) => i.kind === 'tool' && i.svg === rel);
@@ -2101,10 +2241,144 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
   }
 
-  private async openFile(rel: string): Promise<void> {
+  /** Resolves a local image path or `file://` URI if it lives inside the workspace, `~/.gemini`, or OS temp dir. */
+  private resolveImage(src: string): { uri: vscode.Uri; mime: string } | undefined {
+    const MIME: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.svg': 'image/svg+xml' };
+    const clean = src.trim().replace(/^['"]|['"]$/g, '').split(/[?#]/)[0];
+    if (!clean) return undefined;
+    let uri: vscode.Uri;
+    try {
+      if (clean.startsWith('file://')) uri = vscode.Uri.parse(clean);
+      else if (path.isAbsolute(clean)) uri = vscode.Uri.file(clean);
+      else {
+        const root = WorkspaceSync.root();
+        if (!root || clean.split(/[\\/]/).includes('..')) return undefined;
+        uri = vscode.Uri.joinPath(vscode.Uri.file(root), ...clean.split(/[\\/]/).filter(Boolean));
+      }
+    } catch {
+      return undefined;
+    }
+    const ext = path.extname(uri.fsPath).toLowerCase();
+    const mime = MIME[ext];
+    if (!mime) return undefined;
+    const resolved = path.resolve(uri.fsPath);
     const root = WorkspaceSync.root();
-    if (!root || typeof rel !== 'string' || rel.split('/').includes('..')) return;
-    await vscode.window.showTextDocument(vscode.Uri.joinPath(vscode.Uri.file(root), ...rel.split('/')), { preview: true });
+    const allowed = [root && path.resolve(root), path.resolve(os.homedir(), '.gemini'), path.resolve(os.tmpdir())].filter((d): d is string => !!d);
+    if (!allowed.some((dir) => resolved === dir || resolved.startsWith(dir + path.sep))) return undefined;
+    return { uri: vscode.Uri.file(resolved), mime };
+  }
+
+  /** Reads a local image (up to 10 MB) as a data URL for inline display in the chat webview. */
+  private async loadImage(id: string, src: string): Promise<void> {
+    const target = this.resolveImage(src);
+    if (!target) return void this.post({ type: 'imageLoaded', id, src, error: 'Image path is outside allowed folders or unsupported.' });
+    try {
+      const stat = await vscode.workspace.fs.stat(target.uri);
+      if (stat.size > 10 * 1024 * 1024) return void this.post({ type: 'imageLoaded', id, src, error: 'Image is larger than 10 MB.' });
+      const bytes = await vscode.workspace.fs.readFile(target.uri);
+      const dataUrl = `data:${target.mime};base64,${Buffer.from(bytes).toString('base64')}`;
+      this.post({ type: 'imageLoaded', id, src, dataUrl });
+    } catch (e) {
+      this.post({ type: 'imageLoaded', id, src, error: describeError(e) });
+    }
+  }
+
+  /** Opens a generated or referenced image in VS Code's built-in image viewer. */
+  private async openImage(src: string): Promise<void> {
+    const target = this.resolveImage(src);
+    if (target) await vscode.commands.executeCommand('vscode.open', target.uri, { preview: true });
+  }
+
+  private async openFile(raw: string): Promise<void> {
+    if (typeof raw !== 'string' || !raw.trim()) return;
+    await this.openLink(raw);
+  }
+
+  /**
+   * Opens a clickable link or file path from a rendered Markdown response:
+   * - `http(s)://...` externally
+   * - `file://...`, absolute paths, or workspace-relative paths (with optional `#L10-L20` or `:10` line numbers)
+   *   in VS Code, falling back to `vscode.open` for non-text/binary files.
+   */
+  private async openLink(href: string): Promise<void> {
+    const trimmed = href.trim().replace(/^<|>$/g, '');
+    if (!trimmed) return;
+    if (/^https?:\/\//i.test(trimmed)) {
+      await vscode.env.openExternal(vscode.Uri.parse(trimmed));
+      return;
+    }
+    try {
+      let targetPath = trimmed;
+      let fragment = '';
+      if (/^file:\/\//i.test(trimmed)) {
+        const parsed = vscode.Uri.parse(trimmed);
+        targetPath = parsed.fsPath;
+        fragment = parsed.fragment;
+      } else {
+        const hash = targetPath.indexOf('#');
+        if (hash >= 0) {
+          fragment = targetPath.slice(hash + 1);
+          targetPath = targetPath.slice(0, hash);
+        }
+        try {
+          targetPath = decodeURIComponent(targetPath);
+        } catch {
+          // Keep literal path if not percent-encoded.
+        }
+      }
+      // Support trailing `:line` or `:line:col` suffixes (e.g. `src/app.ts:42:10`).
+      let startLine: number | undefined;
+      let endLine: number | undefined;
+      const colonLine = /^(.*):(\d+)(?::\d+)?$/.exec(targetPath);
+      if (colonLine && colonLine[1] && !/^[A-Za-z]$/.test(colonLine[1])) {
+        targetPath = colonLine[1];
+        startLine = Math.max(0, Number(colonLine[2]) - 1);
+        endLine = startLine;
+      }
+      const fragLine = /^L?(\d+)(?:-L?(\d+))?$/i.exec(fragment);
+      if (fragLine) {
+        startLine = Math.max(0, Number(fragLine[1]) - 1);
+        endLine = fragLine[2] ? Math.max(startLine, Number(fragLine[2]) - 1) : startLine;
+      }
+      let uri: vscode.Uri | undefined;
+      if (path.isAbsolute(targetPath)) {
+        uri = vscode.Uri.file(path.resolve(targetPath));
+      } else {
+        const cleaned = targetPath.replace(/^\.\//, '');
+        if (!cleaned || cleaned.split(/[\\/]/).includes('..')) return;
+        const folders = vscode.workspace.workspaceFolders ?? [];
+        for (const f of folders) {
+          const candidate = vscode.Uri.joinPath(f.uri, ...cleaned.split(/[\\/]/).filter(Boolean));
+          const exists = await vscode.workspace.fs.stat(candidate).then(() => true, () => false);
+          if (exists) {
+            uri = candidate;
+            break;
+          }
+        }
+        if (!uri) {
+          const root = WorkspaceSync.root();
+          if (root) uri = vscode.Uri.joinPath(vscode.Uri.file(root), ...cleaned.split(/[\\/]/).filter(Boolean));
+        }
+      }
+      if (!uri) return;
+      const stat = await vscode.workspace.fs.stat(uri).then((s) => s, () => undefined);
+      if (!stat) {
+        void vscode.window.showWarningMessage(`task-x: file not found: ${targetPath}`);
+        return;
+      }
+      if (stat.type === vscode.FileType.Directory) {
+        await vscode.commands.executeCommand('revealInExplorer', uri);
+        return;
+      }
+      const selection = startLine !== undefined ? new vscode.Range(startLine, 0, endLine ?? startLine, 0) : undefined;
+      try {
+        await vscode.window.showTextDocument(uri, { preview: true, selection });
+      } catch {
+        await vscode.commands.executeCommand('vscode.open', uri, { preview: true });
+      }
+    } catch {
+      // Ignore malformed URIs.
+    }
   }
 
   async undo(operation: number): Promise<void> {
@@ -2130,14 +2404,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     await this.undo(last.operation!);
   }
 
+  wireClient(client: JsonRpcClient): void {
+    this.wire(client);
+  }
+
   private wire(client: JsonRpcClient): void {
     if (this.wired.has(client)) return;
     this.wired.add(client);
     // Requests from the runtime name their task; each goes to the tab whose run owns that task.
     client.onRequest('agent/requestApproval', (p) => {
       const req = p as ApprovalRequest;
-      if (editMode() === 'auto') return Promise.resolve({ decision: 'allowSession' as const });
       const tab = this.tabForTask(req.taskId);
+      const runMode = tab ? this.runs.get(tab)?.editMode : editMode();
+      if (runMode === 'auto') return Promise.resolve({ decision: 'allowSession' as const });
       return tab ? this.inTab(tab, () => this.requestApproval(req)) : (this.foreignApproval?.(req) ?? Promise.resolve({ decision: 'deny' as const }));
     });
     client.onRequest('agent/askUser', (p) => {
@@ -2245,15 +2524,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private askUser(req: AskUserRequest): Promise<AskUserResult> {
     const run = this.run;
     if (!this.taskId || !req.taskId.startsWith(this.taskId) || !run) return Promise.resolve<AskUserResult>({ answers: null });
+    const tabId = this.chat.id;
     this.view?.show?.(true);
-    this.notify('input', 'task-x has questions for you', 'Answer');
-    if (this.activeTab !== this.chat.id) this.showTab(this.chat.id);
+    this.notify('input', 'task-x has questions for you', 'Answer', tabId);
     // Plan steps run in parallel and can reuse a call id; the task id keeps each question card apart.
     const id = `${req.taskId}:${req.callId}`;
     run.questions.get(id)?.done({ answers: null });
     const card = { type: 'questions', callId: id, questions: req.questions };
     run.cards.set(id, card);
     this.postChat(card);
+    if (this.activeTab !== tabId) this.postTabs();
     return new Promise((resolve) => {
       run.questions.set(id, {
         questions: req.questions,
@@ -2262,6 +2542,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           run.cards.delete(id);
           this.postChat({ type: 'questionsDone', callId: id });
           this.add({ kind: 'questions', questions: req.questions, answers: res.answers, other: res.other });
+          this.postTabs();
           resolve(res);
         },
       });
@@ -2271,23 +2552,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private requestApproval(req: ApprovalRequest): Promise<{ decision: ApprovalDecision }> {
     const run = this.run;
     if (!this.taskId || !req.taskId.startsWith(this.taskId) || !run) return this.foreignApproval?.(req) ?? Promise.resolve({ decision: 'deny' });
+    const tabId = this.chat.id;
     this.view?.show?.(true);
-    this.notify('input', `task-x needs your approval to use ${req.tool}`, 'Review');
-    if (this.activeTab !== this.chat.id) this.showTab(this.chat.id);
+    this.notify('input', `task-x needs your approval to use ${req.tool}`, 'Review', tabId);
+    // Namespace by taskId so parallel subagents or plan steps reusing sequential callIds never collide.
+    const id = `${req.taskId}:${req.callId}`;
+    run.approvals.get(id)?.('deny');
     const card = {
       type: 'approval',
-      callId: req.callId,
+      callId: id,
       tool: req.tool,
       permission: req.permission,
       detail: toolDetail(req.tool, req.input),
       preview: req.preview ?? JSON.stringify(req.input, null, 2).slice(0, 6_000),
     };
-    run.cards.set(req.callId, card);
+    run.cards.set(id, card);
     this.postChat(card);
+    if (this.activeTab !== tabId) this.postTabs();
     return new Promise((resolve) => {
-      run.approvals.set(req.callId, (decision) => {
-        run.cards.delete(req.callId);
-        this.postChat({ type: 'approvalDone', callId: req.callId, decision });
+      run.approvals.set(id, (decision) => {
+        run.approvals.delete(id);
+        run.cards.delete(id);
+        this.postChat({ type: 'approvalDone', callId: id, decision });
+        this.postTabs();
         if (decision === 'always') {
           // Persist the user's choice; the runtime treats it like a session grant for this run.
           const c = vscode.workspace.getConfiguration(SECTION);
@@ -2437,7 +2724,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (!e.background && isBackgroundStart(e.output)) break;
         const it = this.items.find((i): i is Extract<Item, { kind: 'tool' }> => i.kind === 'tool' && i.id === e.callId);
         // `tokens`: about how much this result adds to every later turn.
-        const out = { ...this.captureOutput(e.callId, e.tool, e.ok, e.output), tokens: e.tokens, svg: svgPathFrom(e.tool, e.ok, e.output) };
+        const svg = svgPathFrom(e.tool, e.ok, e.output);
+        const image = !svg ? this.imagePathFrom(e.ok, e.output) : undefined;
+        const out = { ...this.captureOutput(e.callId, e.tool, e.ok, e.output), tokens: e.tokens, svg, ...(image ? { image } : {}) };
         if (it) {
           Object.assign(it, { ok: e.ok }, out);
           this.postChat({ type: 'toolDone', id: e.callId, ok: e.ok, ...out });
@@ -2475,6 +2764,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         break;
       case 'warning':
         this.add({ kind: 'context', text: e.message });
+        break;
+      case 'rateLimit':
+        this.claudeUsage.recordRateLimit(e.info);
         break;
       case 'subagentStarted':
         this.add({ kind: 'lane', taskId: e.taskId, name: e.name, role: e.role, agent: e.agent ?? null, objective: e.objective, model: e.model, step: e.step, status: 'running', steps: [], dir: e.dir, stoppable: e.kind !== 'claudeCode', startedMs: Date.now() });
@@ -2605,9 +2897,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * (`task-x.routing` for the prompt's task kind), else the active provider model. The webview puts the
    * result in the input, where Ctrl+Z restores the original.
    */
-  private async refine(raw: string): Promise<void> {
+  private async refine(raw: string, tabId = this.activeTab): Promise<void> {
     const text = raw.trim();
-    const fail = (error: string) => this.post({ type: 'refined', error });
+    const fail = (error: string) => this.post({ type: 'refined', tabId, error });
     if (!text) return fail('Type a prompt to refine.');
     if (text.length > MAX_INPUT_CHARS) return fail(`The prompt is longer than ${MAX_INPUT_CHARS} characters.`);
     try {
@@ -2619,7 +2911,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const focusPaths = [...(ed.mentions ?? []), ...(ed.activeFile ? [ed.activeFile] : [])];
       const r = await client.request<RefineResult>('prompt/refine', { prompt: text, provider, routes: own ? [] : await routes(this.ctx.secrets), focusPaths });
       this.log('info', `prompt refined by ${r.model}${r.routed ? ` (route for ${r.kind})` : ''}`);
-      this.post({ type: 'refined', text: r.text, model: r.model });
+      this.post({ type: 'refined', tabId, text: r.text, model: r.model });
     } catch (e) {
       fail(describeError(e));
       void vscode.window.showWarningMessage(`task-x: refine failed: ${describeError(e)}`);
@@ -2690,51 +2982,62 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * Runs a request in a chat tab (`tabId`, else the current chat). Each tab runs its own task, beside
    * the others; a request to a tab whose task runs waits in that tab's queue.
    */
-  private send(raw: string, modeOverride?: ChatMode, retry = false, images: ImageInput[] = [], tabId?: string): Promise<void> {
+  private send(raw: string, modeOverride?: ChatMode, retry = false, images: ImageInput[] = [], tabId?: string, capturedEditor?: EditorContext): Promise<void> {
     const tab = tabId && this.tabs.some((t) => t.id === tabId && t.kind === 'chat') ? tabId : this.chat.id;
-    return this.inTab(tab, () => this.sendIn(raw, modeOverride, retry, images));
+    return this.inTab(tab, () => this.sendIn(raw, modeOverride, retry, images, capturedEditor));
   }
 
   /** `send` inside the tab's scope: `chat`, `items`, and `taskId` are that tab's for the whole run. */
-  private async sendIn(raw: string, modeOverride: ChatMode | undefined, retry: boolean, images: ImageInput[]): Promise<void> {
+  private async sendIn(raw: string, modeOverride: ChatMode | undefined, retry: boolean, images: ImageInput[], capturedEditor?: EditorContext): Promise<void> {
     const text = raw.trim() || (images.length ? `Look at the attached image${images.length > 1 ? 's' : ''}.` : '');
     if (!text) return;
     const tab = this.chat.id;
     if (text.length > MAX_INPUT_CHARS) return void vscode.window.showWarningMessage(`task-x: the message is longer than ${MAX_INPUT_CHARS} characters.`);
     if (!images.length && this.screenCommand(text)) return;
-    // This tab's task runs, or every run slot is taken: the request waits its turn.
-    if (this.runs.has(tab) || this.runs.size >= MAX_PARALLEL_RUNS) {
+    // This tab's task runs (or is starting), or every run slot is taken: the request waits its turn.
+    if (this.runs.has(tab) || this.startingTabs.has(tab) || this.runs.size >= MAX_PARALLEL_RUNS) {
       if (this.queue.length >= MAX_QUEUE) return void vscode.window.showWarningMessage(`task-x: only ${MAX_QUEUE} messages can wait. Stop a task or wait for one to finish.`);
-      this.queue.push({ text, mode: modeOverride, images, tab });
-      if (!this.runs.has(tab)) void vscode.window.showInformationMessage(`task-x: ${MAX_PARALLEL_RUNS} chats are running. This request starts when one finishes.`);
+      this.queue.push({ text, mode: modeOverride, images, tab, editor: capturedEditor ?? this.editorContext(text) });
+      if (!this.runs.has(tab) && !this.startingTabs.has(tab)) void vscode.window.showInformationMessage(`task-x: ${MAX_PARALLEL_RUNS} chats are running. This request starts when one finishes.`);
       return void this.postQueue();
     }
     // `/clear` (or `/new`): a fresh conversation in this chat, for either engine.
     if (!images.length && /^\/(clear|new)\s*$/i.test(text)) return this.clear();
-    if (!images.length && engine() !== 'claudeCode' && (await this.sessionCommand(text))) return;
-    // Chrome mode needs the task-x Chrome extension: without it the request would browse elsewhere.
-    if (this.chat.chrome) {
-      const c = await this.checkChrome();
-      if (!c.connected || c.paused) {
-        this.post({ type: 'setInput', text: raw });
-        const why = c.paused
-          ? 'task-x is paused in Chrome. Resume it from the task-x side panel in Chrome'
-          : 'the task-x Chrome extension is not connected. Run `make chrome-install`, load the chrome/ folder in chrome://extensions (Developer mode, Load unpacked), and click its toolbar button';
-        void vscode.window.showWarningMessage(`task-x: Chrome mode is on, but ${why}. Or turn Chrome mode off.`);
-        return;
-      }
-    }
-    // The run is registered before anything waits, so a second request to this tab queues behind it.
+    const tabEng = this.tabEngine();
+    // `/usage` (or `/limits`) with the Antigravity or Claude Code engine: show limits and daily usage.
+    if (!images.length && tabEng === AGY_KIND && /^\/(usage|limits)\s*$/i.test(text)) return void this.agy.show();
+    if (!images.length && tabEng === CLAUDE_KIND && /^\/(usage|limits)\s*$/i.test(text)) return void this.claudeUsage.show();
+    this.startingTabs.add(tab);
+    let run: Run;
     const abort = new AbortController();
-    const run: Run = { abort, started: Date.now(), cards: new Map(), approvals: new Map(), questions: new Map(), steering: [], stalled: false, lastActivity: Date.now(), wakeups: new Set() };
-    this.runs.set(tab, run);
+    try {
+      if (!images.length && tabEng === 'anvil' && (await this.sessionCommand(text))) return;
+      // Chrome mode needs the task-x Chrome extension: without it the request would browse elsewhere.
+      if (this.chat.chrome) {
+        const c = await this.checkChrome();
+        if (!c.connected || c.paused) {
+          this.post({ type: 'setInput', tabId: tab, text: raw });
+          const why = c.paused
+            ? 'task-x is paused in Chrome. Resume it from the task-x side panel in Chrome'
+            : 'the task-x Chrome extension is not connected. Run `make chrome-install`, load the chrome/ folder in chrome://extensions (Developer mode, Load unpacked), and click its toolbar button';
+          void vscode.window.showWarningMessage(`task-x: Chrome mode is on, but ${why}. Or turn Chrome mode off.`);
+          return;
+        }
+      }
+      // The run is registered before anything else waits, so a second request to this tab queues behind it.
+      run = { abort, started: Date.now(), cards: new Map(), approvals: new Map(), questions: new Map(), steering: [], stalled: false, lastActivity: Date.now(), wakeups: new Set(), editMode: editMode() };
+      this.runs.set(tab, run);
+    } finally {
+      this.startingTabs.delete(tab);
+    }
     if (this.night) this.nightTab = tab;
     this.runsChanged();
     const mode: ChatMode = modeOverride ?? 'agent';
     // A new request starts without the old plan.
     this.todos = [];
     this.postTodos();
-    const sent = sentContext(this.editorContext(text));
+    const editor = capturedEditor ?? this.editorContext(text);
+    const sent = sentContext(editor);
     const request: Extract<Item, { kind: 'user' }> = { kind: 'user', text, mode, id: randomBytes(6).toString('hex'), ...(images.length ? { images: images.length } : {}), ...(sent.length ? { context: sent } : {}) };
     this.add(request);
     run.lastRequest = request;
@@ -2753,30 +3056,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // #9 `#` items and #12 the chat mode: the model gets their context; the message shows the user's words.
     // MCP resources (`#mcp:`) are read through the runtime, so it is connected first.
     await this.getClient().then((c) => this.wire(c), () => undefined);
-    const claudeRun = engine() === 'claudeCode' && !worker;
+    const claudeRun = tabEng === 'claudeCode' && !worker;
+    const agyRun = tabEng === AGY_KIND && !worker;
+    const cleanupRun = async () => {
+      off();
+      for (const it of this.items) if (it.kind === 'lane' && it.status === 'running') this.updateLane(it, { status: 'cancelled', endedMs: Date.now() });
+      for (const t of this.tabs) {
+        if (t.parent !== tab || t.status !== 'running') continue;
+        t.status = 'cancelled';
+        t.assistant = undefined;
+      }
+      this.closePreviews(tab);
+      for (const resolveApproval of [...run.approvals.values()]) resolveApproval('deny');
+      run.approvals.clear();
+      for (const q of [...run.questions.values()]) q.done({ answers: null });
+      run.questions.clear();
+      run.cards.clear();
+      // Steers the task never read are sent again as the next message, unless the tab was cleared.
+      if (!run.cleared) this.queue.push(...run.steering.splice(0).map((text) => ({ text, tab })));
+      else run.steering.length = 0;
+      if (this.runs.get(tab) === run) this.runs.delete(tab);
+      this.markUsed(tab);
+      this.runsChanged();
+      await this.persistAfterRun();
+      this.drain();
+      if (!run.cleared) this.afterRun(before, abort.signal, run.stalled);
+    };
     // The run is registered, so nothing may throw before the `try` below: a throw here would leave
     // the tab marked as running and every later message waiting behind it.
     let full = text;
     try {
-      full = await withHashContext(withDocs(withChatMode(withAgent(text, claudeRun))));
+      full = await withHashContext(withDocs(withChatMode(withAgent(text, claudeRun || agyRun))));
     } catch (e) {
       this.log('warn', `context for the request failed, sending it without: ${describeError(e)}`);
     }
-    if (claudeRun) {
+    if (claudeRun || agyRun) {
       try {
         const task = this.night ? await this.nightTask(full, retry, abort.signal) : full;
-        await this.sendClaude(text, mode, abort.signal, (o) => (off = o), task, images);
+        if (agyRun) await this.sendAgy(text, mode, abort.signal, (o) => (off = o), task, images);
+        else await this.sendClaude(text, mode, abort.signal, (o) => (off = o), task, images);
       } catch (e) {
-        this.add({ kind: 'error', text: describeError(e), retryText: e instanceof RpcError && e.cancelled ? undefined : text });
+        if (!run.cleared) this.add({ kind: 'error', text: describeError(e), retryText: e instanceof RpcError && e.cancelled ? undefined : text });
       } finally {
-        off();
-        this.queue.push(...run.steering.splice(0).map((text) => ({ text, tab })));
-        this.runs.delete(tab);
-        this.markUsed(tab);
-        this.runsChanged();
-        await this.persistAfterRun();
-        this.drain();
-        this.afterRun(before, abort.signal, run.stalled);
+        await cleanupRun();
       }
       return;
     }
@@ -2786,9 +3108,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.taskId ??= `c${Date.now()}${randomBytes(3).toString('hex')}`;
       const taskId = this.taskId;
       const prompt = this.night ? await this.nightTask(full, retry, abort.signal) : full;
-      const provider = worker && isProviderRef(worker.kind) ? await providerConfigWith(this.ctx.secrets, worker.kind, worker.model) : undefined;
+      const tabChoice = this.chat.modelChoice?.engine === 'anvil' && this.chat.modelChoice.provider ? this.chat.modelChoice : undefined;
+      const provider = worker && isProviderRef(worker.kind)
+        ? await providerConfigWith(this.ctx.secrets, worker.kind, worker.model)
+        : tabChoice
+          ? await providerConfigWith(this.ctx.secrets, tabChoice.provider!, tabChoice.model)
+          : undefined;
       // A chat tab is its own session: it cannot recall other tabs' tasks (project memory stays).
-      const params = { ...(await runParams(this.ctx.secrets, { prompt, mode, taskId, editor: this.editorContext(text), provider, images, isolated: true })), ...(this.chat.chrome ? { chrome: true } : {}) };
+      const params = { ...(await runParams(this.ctx.secrets, { prompt, mode, taskId, editor, provider, images, isolated: true })), ...(this.chat.chrome ? { chrome: true } : {}) };
       const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
       // Bound to this run's tab: the event arrives outside the run's async context.
       off = client.onNotification(
@@ -2806,32 +3133,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         state.assistant = undefined;
         summary = await client.request<AgentSummary>('agent/run', { ...params, prompt: CONTINUE_PROMPT, images: [] }, { signal: abort.signal });
       }
-      this.add({ kind: 'summary', ...summaryText(summary) });
-      this.noteOperations(summary);
-      await this.commitTask(summary, text);
-      this.finished(summary, text);
-      void this.refreshChanges();
-    } catch (e) {
-      this.add({ kind: 'error', text: describeError(e), retryText: e instanceof RpcError && e.cancelled ? undefined : text });
-    } finally {
-      off();
-      for (const it of this.items) if (it.kind === 'lane' && it.status === 'running') this.updateLane(it, { status: 'cancelled', endedMs: Date.now() });
-      for (const t of this.tabs) {
-        if (t.parent !== tab || t.status !== 'running') continue;
-        t.status = 'cancelled';
-        t.assistant = undefined;
+      if (!run.cleared) {
+        this.add({ kind: 'summary', ...summaryText(summary) });
+        this.noteOperations(summary);
+        await this.commitTask(summary, text);
+        this.finished(summary, text);
+        void this.refreshChanges();
       }
-      this.closePreviews(tab);
-      run.approvals.clear();
-      run.cards.clear();
-      // Steers the task never read are sent again as the next message, so nothing is lost.
-      this.queue.push(...run.steering.splice(0).map((text) => ({ text, tab })));
-      this.runs.delete(tab);
-      this.markUsed(tab);
-      this.runsChanged();
-      await this.persistAfterRun();
-      this.drain();
-      this.afterRun(before, abort.signal, run.stalled);
+    } catch (e) {
+      if (!run.cleared) this.add({ kind: 'error', text: describeError(e), retryText: e instanceof RpcError && e.cancelled ? undefined : text });
+    } finally {
+      await cleanupRun();
     }
   }
 
@@ -2969,9 +3281,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private drain(): void {
     for (const next of [...this.queue]) {
       if (this.runs.size >= MAX_PARALLEL_RUNS) break;
-      if (this.runs.has(next.tab) || !this.tabs.some((t) => t.id === next.tab)) continue;
+      if (this.runs.has(next.tab) || this.startingTabs.has(next.tab) || !this.tabs.some((t) => t.id === next.tab)) continue;
       this.queue.splice(this.queue.indexOf(next), 1);
-      void this.send(next.text, next.mode, false, next.images, next.tab);
+      void this.send(next.text, next.mode, false, next.images, next.tab, next.editor);
     }
     // Messages for a tab that was closed in the meantime are dropped.
     for (let i = this.queue.length - 1; i >= 0; i--) if (!this.tabs.some((t) => t.id === this.queue[i].tab)) this.queue.splice(i, 1);
@@ -2981,26 +3293,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Hooks for a finished task, and a notification when the chat is not on screen. */
   private finished(summary: AgentSummary, prompt: string): void {
     this.onSummary?.(summary);
+    const tabId = this.chat.id;
     const title = prompt.length > 60 ? `${prompt.slice(0, 57)}…` : prompt;
     const { title: status } = summaryText(summary);
     // A final answer that ends with a question is the model asking for input.
     const asks = summary.status === 'completed' && /\?\s*(?:`{3}\s*)?$/.test(summary.text.trim().split('\n').slice(-3).join('\n'));
-    if (asks) this.notify('input', `task-x is waiting for your reply · ${title}`, 'Reply');
-    else this.notify(summary.status === 'completed' ? 'done' : 'stopped', `task-x: ${status} · ${title}`, 'Open Chat');
+    if (asks) this.notify('input', `task-x is waiting for your reply · ${title}`, 'Reply', tabId);
+    else this.notify(summary.status === 'completed' ? 'done' : 'stopped', `task-x: ${status} · ${title}`, 'Open Chat', tabId);
   }
 
   /**
    * Notifications for a finished task or a request for input. `task-x.notifications`: "whenHidden"
    * (default) when the chat is not on screen or VS Code is not focused, "always", or "off".
    */
-  private notify(kind: 'done' | 'stopped' | 'input', text: string, action: string): void {
+  private notify(kind: 'done' | 'stopped' | 'input', text: string, action: string, tabId?: string): void {
     const when = vscode.workspace.getConfiguration(SECTION).get<string>('notifications', 'whenHidden');
     if (when === 'off') return;
     const show = () => {
       const fn = kind === 'done' ? vscode.window.showInformationMessage : vscode.window.showWarningMessage;
-      void fn(text, action).then((pick) => pick && vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`));
+      void fn(text, action).then((pick) => {
+        if (!pick) return;
+        if (tabId && this.activeTab !== tabId) this.showTab(tabId);
+        void vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
+      });
     };
-    if (when === 'always' || !vscode.window.state.focused || !this.view?.visible) show();
+    const tabHidden = !!tabId && this.activeTab !== tabId;
+    if (when === 'always' || !vscode.window.state.focused || !this.view?.visible || (kind === 'input' && tabHidden)) show();
   }
 
   /** Files the `/` menu may open, by the key it sent to the webview; the webview never sends a path. */
@@ -3264,7 +3582,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       ),
     );
     const budget = c.get<number>('claudeCode.maxBudgetUsd', 0);
-    const model = claudeModel();
+    const model = this.tabModel();
     const summary = await client.request<AgentSummary & { sessionId?: string }>(
       'claude/run',
       {
@@ -3290,11 +3608,67 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     );
     // Read again: another tab's Claude Code run may have saved its session in the meantime.
     if (summary.sessionId) await this.ctx.workspaceState.update(CLAUDE_SESSIONS_KEY, { ...this.ctx.workspaceState.get<Record<string, string>>(CLAUDE_SESSIONS_KEY, {}), [taskId]: summary.sessionId });
+    this.claudeUsage.recordRun(summary);
+    void this.claudeUsage.refreshUsage(true);
     this.add({ kind: 'summary', ...summaryText(summary) });
     this.noteOperations(summary);
     await this.commitTask(summary, text);
     this.finished(summary, text);
     void this.refreshChanges();
+  }
+
+  /** Runs the request through the Antigravity CLI (agy); follow-ups continue the same agy conversation. */
+  private async sendAgy(text: string, mode: ChatMode, signal: AbortSignal, setOff: (off: () => void) => void, task = text, images: ImageInput[] = []): Promise<void> {
+    const cliPath = findAgy();
+    if (!cliPath) throw new Error('Antigravity CLI (agy) not found. Install it, or set task-x.agy.path.');
+    const client = await this.getClient();
+    this.wire(client);
+    this.taskId ??= `c${Date.now()}${randomBytes(3).toString('hex')}`;
+    const taskId = this.taskId;
+    const conversations = this.ctx.workspaceState.get<Record<string, string>>(AGY_CONVERSATIONS_KEY, {});
+    const ed = this.editorContext();
+    const perms = agyPermissions(mode);
+    let prompt = task;
+    if (ed.selection) prompt += `\n\nSelected code in ${ed.selection.path} (lines ${ed.selection.startLine}-${ed.selection.endLine}):\n\`\`\`\n${ed.selection.text}\n\`\`\``;
+    else if (ed.activeFile) prompt += `\n\n(Active file: ${ed.activeFile})`;
+    if (perms.sandbox === false) prompt += '\n\n(Terminal sandbox is disabled for this session; run commands directly without passing BypassSandbox.)';
+    prompt = await this.withSkills(client, prompt, [ed.selection?.path, ed.activeFile].filter((p): p is string => !!p));
+    const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
+    setOff(
+      client.onNotification(
+        'agent/event',
+        // Bound to this run's tab: the event arrives outside the run's async context.
+        AsyncResource.bind((p: unknown) => {
+          const { taskId: id, event } = p as AgentEventParams;
+          if (id === taskId) this.onEvent(event, state);
+        }),
+      ),
+    );
+    const model = this.tabModel();
+    const params: AgyRunParams = {
+      prompt,
+      taskId,
+      cliPath,
+      chatMode: mode,
+      model: model === 'default' ? undefined : model,
+      conversationId: conversations[taskId],
+      effort: effort(),
+      images,
+      ...perms,
+    };
+    try {
+      const summary = await client.request<AgentSummary & { conversationId?: string }>('agy/run', params, { signal });
+      // Read again: another tab's agy run may have saved its conversation in the meantime.
+      if (summary.conversationId) await this.ctx.workspaceState.update(AGY_CONVERSATIONS_KEY, { ...this.ctx.workspaceState.get<Record<string, string>>(AGY_CONVERSATIONS_KEY, {}), [taskId]: summary.conversationId });
+      this.add({ kind: 'summary', ...summaryText(summary) });
+      this.noteOperations(summary);
+      await this.commitTask(summary, text);
+      this.finished(summary, text);
+      void this.refreshChanges();
+    } finally {
+      // Every run spends quota: show what is left.
+      void this.agy.refreshUsage(true);
+    }
   }
 
   private html(webview: vscode.Webview, media: vscode.Uri): string {
@@ -3320,6 +3694,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <div id="tabStrip" class="tab-strip" role="tablist" aria-label="Open chats"></div>
   <button type="button" id="newChat" class="action new-tab" title="New chat in a new tab" aria-label="New chat"><span class="codicon codicon-add" aria-hidden="true"></span></button>
   <span class="spacer"></span>
+  <button type="button" id="activityBtn" class="view-tab activity-btn" title="Open Agents & Terminals panel"><span class="codicon codicon-terminal" aria-hidden="true"></span><span class="view-label">Activity</span><span id="activityBadge" class="activity-badge" hidden>0</span></button>
   <button type="button" id="indexBtn" class="pick index" hidden></button>
   <button type="button" role="tab" id="tabHistory" class="view-tab" aria-controls="history" title="History"><span class="codicon codicon-history" aria-hidden="true"></span><span class="view-label">History</span></button>
 </nav>

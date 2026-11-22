@@ -42,6 +42,12 @@ struct PortStopParams {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcIdParams {
+    id: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TaskIdParams {
     task_id: String,
@@ -574,7 +580,12 @@ impl Server {
                 &id,
                 params::<ApprovalParams>(msg.params).and_then(|p| {
                     let (tool, choice) = p.tool.zip(p.choice).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "give tool and choice (allow, ask, or deny)"))?;
-                    agent::approvals::set(&p.policy, &tool, choice).map(|e| json!(e)).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))
+                    let res = agent::approvals::set(&p.policy, &tool, choice).map(|e| json!(e)).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?;
+                    if !matches!(choice, agent::approvals::Choice::Allow) {
+                        let mut grants = self.grants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        grants.retain(|g| !agent::policy::tool_matches(&tool, g));
+                    }
+                    Ok(res)
                 }),
             ),
             "agent/tasks" => self.reply(&id, Ok(json!(self.store.read().expect("store lock").list(100)))),
@@ -635,6 +646,17 @@ impl Server {
                     agent::edit_steer(&self.steers, &p.task_id, &p.old, &p.text).map(|ok| json!(ok)).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))
                 }),
             ),
+            "procs/list" => self.reply(&id, Ok(crate::procs::list())),
+            "procs/output" => self.reply(
+                &id,
+                params::<ProcIdParams>(msg.params).and_then(|p| crate::procs::output(&p.id).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))),
+            ),
+            "procs/stop" => self.reply(
+                &id,
+                params::<ProcIdParams>(msg.params)
+                    .and_then(|p| crate::procs::stop(&p.id).map(|stopped| json!({ "stopped": stopped })).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))),
+            ),
+            "procs/clear" => self.reply(&id, Ok(json!({ "cleared": crate::procs::clear() }))),
             "agent/cancelTool" => self.reply(
                 &id,
                 params::<CancelToolParams>(msg.params).map(|p| agent::cancel_tool(&self.tool_cancels, &p.task_id, &p.call_id).into()),
@@ -664,6 +686,9 @@ impl Server {
             | "edits/revert"
             | "chrome/status"
             | "claude/run"
+            | "agy/run"
+            | "agy/usage"
+            | "agy/models"
             | "mcp/configure"
             | "worktrees/apply"
             | "worktrees/discard"
@@ -728,7 +753,10 @@ impl Server {
                 }
                 Flow::Continue
             }
-            "exit" => Flow::Exit,
+            "exit" => {
+                self.shutting_down.store(true, Ordering::SeqCst);
+                Flow::Exit
+            }
             _ => Flow::Continue,
         }
     }
@@ -747,6 +775,9 @@ impl Server {
         // OAuth tokens of MCP servers go to the client to keep (SecretStorage); the runtime never stores them.
         let sink = self.clone();
         mcp::set_token_sink(Arc::new(move |server, tokens| sink.send(rpc::notification("mcp/tokens", json!({ "server": server, "tokens": tokens })))));
+        // The agent's commands and their live output, for the client's terminal list.
+        let sink = self.clone();
+        crate::procs::set_sink(Arc::new(move |method, params| sink.send(rpc::notification(method, params))));
         // MCP elicitation: a server's question goes to the client (`mcp/elicit`); no answer cancels it.
         let me = self.clone();
         mcp::set_elicit(Arc::new(move |server, params| {
@@ -805,8 +836,8 @@ impl Server {
                 "tools/call" => this.call_tool(p, &token).await,
                 "agent/run" => this.run_agent(p, &token).await,
                 "agent/bestOf" => this.best_of(p, &token).await,
-                "agent/rewind" => this.rewind(p).await,
-                "agent/compact" => this.compact_task(p).await,
+                "agent/rewind" => this.rewind(p, &token).await,
+                "agent/compact" => this.compact_task(p, &token).await,
                 m if m.starts_with("timeline/") => this.timeline(m, p).await,
                 "agent/export" => this.export(p).await,
                 "agent/turns" => this.turns(p),
@@ -818,6 +849,18 @@ impl Server {
                 "chrome/status" => Ok(crate::chrome::status().await),
                 "ports/list" | "ports/stop" => this.ports(&method, p).await,
                 "claude/run" => this.run_claude(p, &token).await,
+                "agy/run" => this.run_agy(p, &token).await,
+                "agy/usage" => {
+                    let root = this.root();
+                    match params::<crate::agy_cli::QueryParams>(p) {
+                        Ok(q) => crate::agy_cli::usage(q, root).await.map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e)),
+                        Err(e) => Err(e),
+                    }
+                }
+                "agy/models" => match params::<crate::agy_cli::QueryParams>(p) {
+                    Ok(q) => crate::agy_cli::models(q).await.map_err(|e| RpcError::new(rpc::INTERNAL_ERROR, e)),
+                    Err(e) => Err(e),
+                },
                 "mcp/status" => Ok(this.mcp.read().await.status()),
                 "tools/approvals" => this.approvals(p).await,
                 "mcp/authorize" => this.mcp_authorize(p, &token).await,
@@ -996,19 +1039,28 @@ impl Server {
 
     /// Sends a request to the client and waits for its response.
     async fn request_client(&self, method: &str, params: Value, cancel: &CancellationToken) -> Result<Value, Value> {
+        type OutboundMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, Value>>>>>;
+        struct OutboundGuard {
+            map: OutboundMap,
+            key: String,
+        }
+        impl Drop for OutboundGuard {
+            fn drop(&mut self) {
+                self.map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.key);
+            }
+        }
         let key = format!("srv-{}", self.next_out.fetch_add(1, Ordering::SeqCst));
         let (tx, rx) = oneshot::channel();
-        self.outbound.lock().expect("outbound lock").insert(key.clone(), tx);
+        self.outbound.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key.clone(), tx);
+        let _guard = OutboundGuard { map: self.outbound.clone(), key: key.clone() };
         self.send(rpc::request(&key, method, params));
-        let res = tokio::select! {
+        tokio::select! {
             _ = cancel.cancelled() => Err(json!("cancelled")),
             r = tokio::time::timeout(APPROVAL_TIMEOUT, rx) => match r {
                 Ok(Ok(v)) => v,
                 _ => Err(json!("no response")),
             },
-        };
-        self.outbound.lock().expect("outbound lock").remove(&key);
-        res
+        }
     }
 
     fn host(&self) -> Host {
@@ -1052,23 +1104,29 @@ impl Server {
     }
 
     async fn run_agent(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
-        let p: RunParams = params(p)?;
-        // A follow-up rewrites the task record; waiting here keeps the history in order.
-        let _slot = self.task_slot(p.task_id.as_deref()).await;
+        let mut p: RunParams = params(p)?;
+        // Assign a task id up front if omitted so follow-ups arriving after `started` serialize
+        // behind this run rather than racing on the same record.
+        let id = p.task_id.as_deref().filter(|i| agent::store::valid_id(i)).map(str::to_owned).unwrap_or_else(agent::store::new_id);
+        p.task_id = Some(id.clone());
+        let _slot = self.task_slot(Some(&id), cancel).await?;
         let rec = agent::run(self.host(), p, cancel.clone()).await.map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?;
         Ok(agent::summary(&rec))
     }
 
     /// Waits for this task's turn: two runs on one id would lose each other's history and changes.
     /// The entry is dropped as soon as nobody holds or waits for it.
-    async fn task_slot(&self, task_id: Option<&str>) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        let key = task_id?;
+    async fn task_slot(&self, task_id: Option<&str>, cancel: &CancellationToken) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, RpcError> {
+        let Some(key) = task_id else { return Ok(None) };
         let lock = {
-            let mut slots = self.task_slots.lock().expect("task slots lock");
+            let mut slots = self.task_slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             slots.retain(|_, l| Arc::strong_count(l) > 1);
             slots.entry(key.to_owned()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
         };
-        Some(lock.lock_owned().await)
+        tokio::select! {
+            _ = cancel.cancelled() => Err(RpcError::new(rpc::REQUEST_CANCELLED, "cancelled")),
+            guard = lock.lock_owned() => Ok(Some(guard)),
+        }
     }
 
     async fn best_of(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
@@ -1113,10 +1171,10 @@ impl Server {
 
     /// `agent/rewind`: cuts the conversation back to before a prompt and, by default, undoes the
     /// edits made since. A file the user changed after the agent's edit is left as is (a conflict).
-    async fn rewind(&self, p: Value) -> Result<Value, RpcError> {
+    async fn rewind(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
         let p: CheckpointParams = params(p)?;
         let at = p.checkpoint.ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "checkpoint is required"))?;
-        let _slot = self.task_slot(Some(&p.task_id)).await;
+        let _slot = self.task_slot(Some(&p.task_id), cancel).await?;
         let store = self.store.read().expect("store lock").clone();
         let mut r = store.load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "unknown task"))?;
         let ops = agent::session::cut(&mut r, at).map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))?;
@@ -1280,9 +1338,9 @@ impl Server {
     }
 
     /// `agent/compact`: compresses a saved conversation now, between runs.
-    async fn compact_task(&self, p: Value) -> Result<Value, RpcError> {
+    async fn compact_task(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
         let p: TaskIdParams = params(p)?;
-        let _slot = self.task_slot(Some(&p.task_id)).await;
+        let _slot = self.task_slot(Some(&p.task_id), cancel).await?;
         let store = self.store.read().expect("store lock").clone();
         let mut r = store.load(&p.task_id).ok_or_else(|| RpcError::new(rpc::INVALID_PARAMS, "unknown task"))?;
         let out = agent::session::compact_record(&mut r);
@@ -1346,10 +1404,21 @@ impl Server {
     async fn run_claude(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
         let p: crate::claude_cli::Params = params(p)?;
         // Claude Code edits the same workspace and records changes under the same task id.
-        let _slot = self.task_slot(Some(&p.task_id)).await;
+        let _slot = self.task_slot(Some(&p.task_id), cancel).await?;
+        crate::claude_cli::run(self.cli_host(), p, cancel.clone()).await.map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))
+    }
+
+    async fn run_agy(&self, p: Value, cancel: &CancellationToken) -> Result<Value, RpcError> {
+        let p: crate::agy_cli::Params = params(p)?;
+        let _slot = self.task_slot(Some(&p.task_id), cancel).await?;
+        crate::agy_cli::run(self.cli_host(), p, cancel.clone()).await.map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))
+    }
+
+    /// What a CLI engine (Claude Code, Antigravity) needs from the server.
+    fn cli_host(&self) -> crate::cli_common::Host {
         let out = self.clone();
         let agent_host = self.host();
-        let host = crate::claude_cli::Host {
+        crate::cli_common::Host {
             workspace: self.workspace.clone(),
             store: self.store.read().expect("store lock").clone(),
             edits: self.edits.clone(),
@@ -1359,8 +1428,7 @@ impl Server {
             approve: agent_host.approve,
             ask: agent_host.ask,
             tool_cancels: self.tool_cancels.clone(),
-        };
-        crate::claude_cli::run(host, p, cancel.clone()).await.map_err(|e| RpcError::new(rpc::INVALID_PARAMS, e))
+        }
     }
 
     /// The servers other tools set up (`import`), then the workspace's `.task-x/mcp.json`, then the
@@ -1672,11 +1740,13 @@ mod tests {
     #[tokio::test]
     async fn runs_that_share_a_task_id_wait_for_each_other() {
         let s = server();
-        let first = s.task_slot(Some("t1")).await.unwrap();
+        let c = CancellationToken::new();
+        let first = s.task_slot(Some("t1"), &c).await.unwrap().unwrap();
         let waiter = {
             let s = s.clone();
+            let c = c.clone();
             tokio::spawn(async move {
-                let _slot = s.task_slot(Some("t1")).await;
+                let _slot = s.task_slot(Some("t1"), &c).await.unwrap();
                 true
             })
         };
@@ -1685,12 +1755,12 @@ mod tests {
         drop(first);
         assert!(waiter.await.unwrap(), "it starts once the first run is done");
         // A different task never waits for this one.
-        let a = s.task_slot(Some("t2")).await.unwrap();
-        let other = tokio::time::timeout(std::time::Duration::from_secs(1), s.task_slot(Some("t3"))).await;
-        assert!(other.is_ok_and(|g| g.is_some()));
+        let a = s.task_slot(Some("t2"), &c).await.unwrap().unwrap();
+        let other = tokio::time::timeout(std::time::Duration::from_secs(1), s.task_slot(Some("t3"), &c)).await;
+        assert!(other.is_ok_and(|g| g.is_ok_and(|opt| opt.is_some())));
         drop(a);
         // Slots are dropped on the next acquisition, so the map never grows with old task ids.
-        let _fresh = s.task_slot(Some("t4")).await.unwrap();
+        let _fresh = s.task_slot(Some("t4"), &c).await.unwrap().unwrap();
         let keys: Vec<String> = s.task_slots.lock().unwrap().keys().cloned().collect();
         assert_eq!(keys, ["t4"], "stale slots are pruned");
     }
@@ -1698,7 +1768,25 @@ mod tests {
     #[tokio::test]
     async fn a_run_without_a_task_id_takes_no_slot() {
         let s = server();
-        assert!(s.task_slot(None).await.is_none());
+        let c = CancellationToken::new();
+        assert!(s.task_slot(None, &c).await.unwrap().is_none());
         assert!(s.task_slots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiting_task_slot_returns_immediately() {
+        let s = server();
+        let c1 = CancellationToken::new();
+        let c2 = CancellationToken::new();
+        let _first = s.task_slot(Some("t1"), &c1).await.unwrap().unwrap();
+        let c2_cancel = c2.clone();
+        let waiter = {
+            let s = s.clone();
+            tokio::spawn(async move { s.task_slot(Some("t1"), &c2).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        c2_cancel.cancel();
+        let res = tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await.unwrap().unwrap();
+        assert!(res.is_err(), "cancelled waiter should fail instead of hanging");
     }
 }

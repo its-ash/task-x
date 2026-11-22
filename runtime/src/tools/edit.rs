@@ -175,10 +175,12 @@ fn read_existing(abs: &Path, rel: &str) -> Result<String, ToolError> {
 }
 
 fn write_atomic(abs: &Path, content: &str) -> std::io::Result<()> {
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = abs.parent().ok_or_else(|| std::io::Error::other("no parent directory"))?;
     std::fs::create_dir_all(dir)?;
     let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = dir.join(format!(".{name}.task-x-{}.tmp", std::process::id()));
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.task-x-{}-{seq}.tmp", std::process::id()));
     let res = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(content.as_bytes())?;

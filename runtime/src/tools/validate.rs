@@ -137,7 +137,7 @@ fn execute(c: &ToolCtx, cmd: &Command, extra: &[String], timeout: Duration) -> R
         }
         argv.extend(extra.iter().cloned());
     }
-    exec::run_sandboxed(&argv, &abs, &label, timeout, &c.cancel, &exec::Sandbox { writable_root: &c.root })
+    exec::run_sandboxed(&argv, &abs, &label, timeout, &c.cancel, &exec::Sandbox { writable_root: &c.root, terminal: true, task_id: c.task_id.as_deref() })
 }
 
 fn validate_args(args: &[String]) -> Result<(), ToolError> {
@@ -346,17 +346,19 @@ struct RunIn {
 }
 
 fn run_command(c: &ToolCtx, input: Value) -> ToolResult {
-    run(c, input, true)
+    run(c, input, false)
 }
 
 /// `run_command` for a `wait_until` check: the check itself may wait (`sleep 1; curl …`), since
 /// it already runs on the waiting tool's schedule.
 pub(super) fn run_check(c: &ToolCtx, input: Value) -> ToolResult {
-    run(c, input, false)
+    run(c, input, true)
 }
 
-/// `no_sleep`: refuse `sleep` used to wait; the waiting tools do that for every provider.
-fn run(c: &ToolCtx, input: Value, no_sleep: bool) -> ToolResult {
+/// `check`: a `wait_until` check, run every few seconds. It may `sleep` (a command may not: the
+/// waiting tools do that for every provider), it is not listed in the client's terminals, and the
+/// index is not refreshed after it.
+fn run(c: &ToolCtx, input: Value, check: bool) -> ToolResult {
     let i: RunIn = parse(input)?;
     if i.background {
         // The agent loop runs background commands itself; other callers (MCP) cannot be told later.
@@ -376,7 +378,7 @@ fn run(c: &ToolCtx, input: Value, no_sleep: bool) -> ToolResult {
     if command[0].trim().is_empty() {
         return Err(ToolError::invalid("the program name is empty"));
     }
-    if no_sleep && exec::is_sleep_command(&line.clone().unwrap_or_else(|| command.join(" "))) {
+    if !check && exec::is_sleep_command(&line.clone().unwrap_or_else(|| command.join(" "))) {
         return Err(ToolError::new(ToolErrorKind::Forbidden, exec::SLEEP_BLOCKED));
     }
     let (abs, label) = c.resolve(i.cwd.as_deref().unwrap_or("."))?;
@@ -388,7 +390,11 @@ fn run(c: &ToolCtx, input: Value, no_sleep: bool) -> ToolResult {
         return r;
     }
     let timeout = Duration::from_secs(i.timeout_secs.unwrap_or(DEFAULT_COMMAND_SECS).clamp(1, MAX_COMMAND_SECS));
-    let out = exec::run_sandboxed(&command, &abs, &label, timeout, &c.cancel, &exec::Sandbox { writable_root: &c.root })?;
+    let sb = exec::Sandbox { writable_root: &c.root, terminal: !check, task_id: c.task_id.as_deref() };
+    let out = exec::run_sandboxed(&command, &abs, &label, timeout, &c.cancel, &sb)?;
+    if check {
+        return Ok(json!({ "result": out }));
+    }
     // Commands can change files: refresh the index and require re-reads before edits.
     if let Some(w) = c.workspace.write().expect("workspace lock").as_mut() {
         w.refresh();

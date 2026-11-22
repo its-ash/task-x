@@ -31,6 +31,11 @@
       ],
       "panel": [
         {
+          "id": "task-x-activity",
+          "title": "task-x Agents & Terminals",
+          "icon": "media/logo-mono.svg"
+        },
+        {
           "id": "task-x-logs",
           "title": "task-x Logs",
           "icon": "media/logs.svg"
@@ -43,13 +48,20 @@
           "type": "webview",
           "id": "task-x.chat",
           "name": "Chat"
-        },
+        }
+      ],
+      "task-x-activity": [
         {
           "type": "tree",
           "id": "task-x.agents",
           "name": "Agents",
-          "icon": "$(organization)",
-          "visibility": "collapsed"
+          "icon": "$(organization)"
+        },
+        {
+          "type": "tree",
+          "id": "task-x.terminals",
+          "name": "Terminals",
+          "icon": "$(terminal)"
         }
       ],
       "task-x-logs": [
@@ -63,10 +75,26 @@
     "viewsWelcome": [
       {
         "view": "task-x.agents",
-        "contents": "No subtasks yet. When the agent splits work into subtasks (Team mode, or a run_subagent call), every chat's subtasks show here, live."
+        "contents": "No active agents yet. Every running chat agent and spawned subagent appears here live — click any agent to jump straight to its conversation."
+      },
+      {
+        "view": "task-x.terminals",
+        "contents": "No commands yet. Every command the agent runs (run_command, run_tests, check_build, ...) shows here live. Select one to open its live terminal; Ctrl+C or Stop ends it."
       }
     ],
     "commands": [
+      {
+        "command": "task-x.openActivity",
+        "title": "Show Agents & Terminals",
+        "category": "task-x",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "task-x.agents.showChat",
+        "title": "Show Chat",
+        "category": "task-x Agents",
+        "icon": "$(comment-discussion)"
+      },
       {
         "command": "task-x.agents.refresh",
         "title": "Refresh",
@@ -454,10 +482,58 @@
         "icon": "$(tasklist)"
       },
       {
+        "command": "task-x.terminals.open",
+        "title": "Open Terminal",
+        "category": "task-x Terminals",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "task-x.terminals.stop",
+        "title": "Stop",
+        "category": "task-x Terminals",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "task-x.terminals.copyCommand",
+        "title": "Copy Command",
+        "category": "task-x Terminals",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "task-x.terminals.stopAll",
+        "title": "Stop All Commands",
+        "category": "task-x Terminals",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "task-x.terminals.clear",
+        "title": "Clear Ended Commands",
+        "category": "task-x Terminals",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "task-x.terminals.refresh",
+        "title": "Refresh",
+        "category": "task-x Terminals",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "task-x.showPorts",
         "title": "Show Ports in Use",
         "category": "task-x",
         "icon": "$(radio-tower)"
+      },
+      {
+        "command": "task-x.agyUsage",
+        "title": "Show Antigravity CLI Limits",
+        "category": "task-x",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "task-x.claudeUsage",
+        "title": "Show Claude Code Limits",
+        "category": "task-x",
+        "icon": "$(pulse)"
       },
       {
         "command": "task-x.bestOf",
@@ -568,9 +644,49 @@
           "command": "task-x.agents.refresh",
           "when": "view == task-x.agents",
           "group": "navigation@2"
+        },
+        {
+          "command": "task-x.terminals.stopAll",
+          "when": "view == task-x.terminals && task-x.terminalsRunning",
+          "group": "navigation@1"
+        },
+        {
+          "command": "task-x.terminals.clear",
+          "when": "view == task-x.terminals",
+          "group": "navigation@2"
+        },
+        {
+          "command": "task-x.terminals.refresh",
+          "when": "view == task-x.terminals",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
+        {
+          "command": "task-x.terminals.stop",
+          "when": "view == task-x.terminals && viewItem == 'proc:run'",
+          "group": "inline@1"
+        },
+        {
+          "command": "task-x.terminals.open",
+          "when": "view == task-x.terminals && viewItem =~ /^proc/",
+          "group": "inline@2"
+        },
+        {
+          "command": "task-x.terminals.open",
+          "when": "view == task-x.terminals && viewItem =~ /^proc/",
+          "group": "1_open@1"
+        },
+        {
+          "command": "task-x.terminals.copyCommand",
+          "when": "view == task-x.terminals && viewItem =~ /^proc/",
+          "group": "2_copy@1"
+        },
+        {
+          "command": "task-x.terminals.stop",
+          "when": "view == task-x.terminals && viewItem == 'proc:run'",
+          "group": "3_stop@1"
+        },
         {
           "command": "task-x.agents.message",
           "when": "view == task-x.agents && viewItem =~ /:msg/",
@@ -645,6 +761,18 @@
         }
       ],
       "commandPalette": [
+        {
+          "command": "task-x.terminals.open",
+          "when": "false"
+        },
+        {
+          "command": "task-x.terminals.stop",
+          "when": "false"
+        },
+        {
+          "command": "task-x.terminals.copyCommand",
+          "when": "false"
+        },
         {
           "command": "task-x.copySelection",
           "when": "false"
@@ -1132,14 +1260,27 @@
           "type": "string",
           "enum": [
             "task-x",
-            "claudeCode"
+            "claudeCode",
+            "antigravity"
           ],
           "enumDescriptions": [
             "task-x's built-in agent with the configured provider",
-            "The Claude Code CLI (claude -p), using your Anthropic account (task-x: Sign In with Anthropic)"
+            "The Claude Code CLI (claude -p), using your Anthropic account (task-x: Sign In with Anthropic)",
+            "The Antigravity CLI (agy), using the Google account agy is signed in with"
           ],
           "default": "task-x",
-          "description": "Which agent runs chat requests. You can also pick Claude Code CLI in the chat's model menu."
+          "description": "Which agent runs chat requests. You can also pick Claude Code CLI or Antigravity CLI in the chat's model menu."
+        },
+        "task-x.agy.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Absolute path to the agy (Antigravity CLI) executable. Empty searches PATH and the usual install folders (~/.local/bin, /opt/homebrew/bin, /usr/local/bin)."
+        },
+        "task-x.agy.model": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Default Antigravity CLI model (an id from `agy models`, e.g. `gemini-3.8-flash-low`). Empty uses agy's default. The chat's model menu overrides it per window."
         },
         "task-x.claudeCode.path": {
           "type": "string",

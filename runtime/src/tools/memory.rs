@@ -62,7 +62,10 @@ struct In {
 }
 
 fn remember(c: &ToolCtx, input: Value) -> ToolResult {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let i: In = parse(input)?;
+    let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let file = path(&c.root);
     let text = match (i.note.map(|n| n.trim().replace('\n', " ")), i.content) {
         (Some(n), None) if !n.is_empty() => {
@@ -81,8 +84,16 @@ fn remember(c: &ToolCtx, input: Value) -> ToolResult {
     let (text, dropped) = fit(&text, MAX_MEMORY_CHARS);
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir).map_err(|e| ToolError::io(e, ".task-x"))?;
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".memory.task-x-{}-{seq}.tmp", std::process::id()));
+        let res = std::fs::write(&tmp, &text).and_then(|()| std::fs::rename(&tmp, &file));
+        if let Err(e) = res {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ToolError::io(e, MEMORY_FILE));
+        }
+    } else {
+        std::fs::write(&file, &text).map_err(|e| ToolError::io(e, MEMORY_FILE))?;
     }
-    std::fs::write(&file, &text).map_err(|e| ToolError::io(e, MEMORY_FILE))?;
     let mut out = json!({ "path": MEMORY_FILE, "chars": text.chars().count(), "limit": MAX_MEMORY_CHARS });
     if !dropped.is_empty() {
         out["dropped"] = json!(dropped);

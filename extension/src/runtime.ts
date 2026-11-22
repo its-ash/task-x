@@ -49,8 +49,25 @@ export class RuntimeProcess {
   ) {
     this.client = new JsonRpcClient(child.stdout!, child.stdin!, (m) => log(`protocol: ${m}`));
     child.stderr!.setEncoding('utf8');
-    child.stderr!.on('data', (d: string) => d.split('\n').filter(Boolean).forEach(log));
+    let stderrBuf = '';
+    child.stderr!.on('data', (d: string) => {
+      stderrBuf += d;
+      let start = 0;
+      let nl: number;
+      while ((nl = stderrBuf.indexOf('\n', start)) >= 0) {
+        const line = stderrBuf.slice(start, nl).trimEnd();
+        start = nl + 1;
+        if (line) log(line);
+      }
+      if (start > 0) stderrBuf = stderrBuf.slice(start);
+      if (stderrBuf.length > 65_536) {
+        log(stderrBuf);
+        stderrBuf = '';
+      }
+    });
     child.on('exit', (code, signal) => {
+      if (stderrBuf.trim()) log(stderrBuf.trimEnd());
+      stderrBuf = '';
       this.exited = true;
       this.client.dispose(new Error(`runtime exited (${signal ?? code})`));
       onExit(code, signal);
@@ -79,8 +96,16 @@ export class RuntimeProcess {
     }
     const child = spawn(binary, [], { stdio: ['pipe', 'pipe', 'pipe'], env, windowsHide: true });
     await new Promise<void>((resolve, reject) => {
-      child.once('spawn', resolve);
-      child.once('error', reject);
+      const onSpawn = () => {
+        child.off('error', onError);
+        resolve();
+      };
+      const onError = (err: Error) => {
+        child.off('spawn', onSpawn);
+        reject(err);
+      };
+      child.once('spawn', onSpawn);
+      child.once('error', onError);
     });
     const runtime = new RuntimeProcess(child, opts.onExit, opts.log);
     try {
@@ -104,15 +129,25 @@ export class RuntimeProcess {
   async stop(): Promise<void> {
     if (this.exited) return;
     const exited = new Promise<void>((r) => this.child.once('exit', () => r()));
-    const timeout = new Promise<void>((r) => setTimeout(r, SHUTDOWN_TIMEOUT_MS).unref());
+    const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref());
     try {
-      await Promise.race([this.client.request('shutdown', undefined, { timeoutMs: SHUTDOWN_TIMEOUT_MS }), timeout]);
+      await Promise.race([this.client.request('shutdown', undefined, { timeoutMs: SHUTDOWN_TIMEOUT_MS }), wait(SHUTDOWN_TIMEOUT_MS)]);
       this.client.notify('exit');
     } catch {
       // Fall through to the kill below.
     }
-    await Promise.race([exited, timeout]);
-    this.kill();
+    await Promise.race([exited, wait(SHUTDOWN_TIMEOUT_MS)]);
+    if (!this.exited) {
+      this.kill();
+      await Promise.race([exited, wait(1000)]);
+      if (!this.exited) {
+        try {
+          this.child.kill('SIGKILL');
+        } catch {
+          // Process already gone.
+        }
+      }
+    }
   }
 
   kill(): void {

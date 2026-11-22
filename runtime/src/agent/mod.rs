@@ -1755,7 +1755,15 @@ impl Run {
                 .map_err(|e| e.to_string())??;
             self.worktrees.lock().expect("worktrees lock").insert(name.clone(), false);
             let d2 = d.clone();
-            let ws = tokio::task::spawn_blocking(move || Workspace::open(&d2, &[])).await.map_err(|e| e.to_string())??;
+            let ws = match tokio::task::spawn_blocking(move || Workspace::open(&d2, &[])).await.map_err(|e| e.to_string()).and_then(|r| r) {
+                Ok(ws) => ws,
+                Err(e) => {
+                    let (repo, nm) = (self.cwd.clone(), name.clone());
+                    let _ = tokio::task::spawn_blocking(move || team::remove(&repo, &nm, true, false, &CancellationToken::new())).await;
+                    self.worktrees.lock().expect("worktrees lock").remove(&name);
+                    return Err(e);
+                }
+            };
             host.workspace = Arc::new(RwLock::new(Some(ws)));
             dir = Some(d);
         }
@@ -2031,10 +2039,6 @@ impl Run {
             }
             // A command that keeps running is handed to the background instead of blocking the turn.
             Target::Builtin(def) if def.name == "run_command" => self.command_with(def, call, COMMAND_HANDOFF).await,
-            // Checks run in the background; the result comes as a wake-up.
-            Target::Builtin(def) if def.name == tools::schedule::WAIT_UNTIL => {
-                self.wakeups.call(def.name, &call.input, |stop| self.ctx_with(stop).map_err(|e| tools::ToolError::new(ToolErrorKind::Failed, e)))
-            }
             Target::Wakeup(name) => {
                 self.wakeups.call(name, &call.input, |_| Err(tools::ToolError::new(ToolErrorKind::Failed, "no tool context needed")))
             }
@@ -2050,7 +2054,24 @@ impl Run {
                         Ok(c) => c,
                         Err(e) => break Err(tools::ToolError::new(ToolErrorKind::Failed, e)),
                     };
-                    let res = tools::call(def, ctx, call.input.clone()).await;
+                    // A user message, or a background job's report, ends a wait early, so the
+                    // model reads it now and does not sleep past finished work.
+                    let res = if tools::schedule::is_wait(def.name) {
+                        use tools::schedule::Interrupt;
+                        let (steers, id, bg) = (self.host.steers.clone(), self.rec.id.clone(), self.background.clone());
+                        let waiting = move || {
+                            if steers.lock().expect("steers lock").get(&id).is_some_and(|q| !q.is_empty()) {
+                                Some(Interrupt::Message)
+                            } else if !bg.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty() {
+                                Some(Interrupt::Background)
+                            } else {
+                                None
+                            }
+                        };
+                        tools::schedule::call_interruptible(def, ctx, call.input.clone(), waiting).await
+                    } else {
+                        tools::call(def, ctx, call.input.clone()).await
+                    };
                     let Err(e) = &res else { break res };
                     let failure = errors::Error { retry_count: retries, ..errors::Error::from_tool(&call.name, e) };
                     if !target.parallel_safe() || !failure.is_retryable() {
@@ -2256,6 +2277,9 @@ impl Run {
         };
         let out = self.host.providers.stream_chat(&provider, &req, &self.cancel, |_| {}).await.map_err(|e| fail(e.message))?;
         let t = out.usage.input_tokens.unwrap_or(0) + out.usage.output_tokens.unwrap_or(0);
+        if let Some(b) = &self.budget {
+            b.add(t);
+        }
         let mut totals = self.sub_totals.lock().expect("sub totals lock");
         totals.tokens += t;
         match (is_local(&provider), cost::estimate(&self.prices, &provider, &out.usage)) {
@@ -2630,8 +2654,6 @@ impl Run {
         let mut empty_answers = 0;
         // Times a stop hook sent the agent back to work.
         let mut stop_blocks = 0;
-        // Whether the model was reminded to schedule the come-back it promised (`wakeup::Promise`).
-        let mut reminded = false;
         // Replies cut off at the output limit: tool calls that could not be read, and text that
         // stopped mid-way (kept in `cut_text` so the answer is whole once the model continues).
         let (mut bad_calls, mut cut_offs, mut cut_text) = (0, 0, String::new());
@@ -2701,7 +2723,6 @@ impl Run {
             }
             if !out.tool_calls.is_empty() {
                 cut_text.clear();
-                reminded = false;
             }
             content.extend(out.tool_calls.iter().map(|c| ContentPart::ToolUse {
                 id: c.id.clone(),
@@ -2756,28 +2777,6 @@ impl Run {
                         break Status::Cancelled;
                     }
                 }
-                // The reply promises to come back later, but nothing is scheduled: a named time is
-                // scheduled here and the task sleeps; without one, the model is reminded once.
-                if !had_wakeups && !self.over_budget() && self.tool_specs.iter().any(|t| t.name == wakeup::SCHEDULE) {
-                    match wakeup::promise(&out.text) {
-                        Some(wakeup::Promise::After { delay, said }) => {
-                            if self.wakeups.schedule_promised(delay, &said).is_ok() && self.sleep_until_wakeup().await {
-                                continue;
-                            }
-                            if self.cancel.is_cancelled() {
-                                break Status::Cancelled;
-                            }
-                        }
-                        Some(wakeup::Promise::Unscheduled { said }) if !reminded => {
-                            reminded = true;
-                            self.emit(json!({ "type": "warning", "message": "The model said it would come back later but scheduled nothing; task-x asks it to schedule the wait." }));
-                            let text = wakeup::unscheduled_nudge(&said, "");
-                            self.rec.messages.push(Message { role: Role::User, content: vec![ContentPart::Text { text }] });
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
                 // A stop hook can send the agent back to work (for example "run the tests first").
                 if stop_blocks < MAX_STOP_BLOCKS && !self.over_budget() {
                     if let Some(reason) = self.stop_reason(stop_blocks > 0).await {
@@ -2826,7 +2825,8 @@ impl Run {
             m.cost_usd += t.cost_usd;
             m.unpriced_tokens += t.unpriced;
         }
-        // Wake-ups end with the task.
+        // Wake-ups and any still-running background subagents/commands end with the task.
+        self.cancel.cancel();
         self.wakeups.cancel_all();
         if self.chrome {
             tools::browser::set_chrome_mode(&self.rec.id, false);
@@ -2884,6 +2884,16 @@ pub async fn run(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
     let id = run.rec.id.clone();
     let fallback = run.rec.clone();
     host.steers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.clone(), Vec::new());
+    struct SteerGuard {
+        steers: Arc<Mutex<HashMap<String, Vec<String>>>>,
+        id: String,
+    }
+    impl Drop for SteerGuard {
+        fn drop(&mut self) {
+            self.steers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.id);
+        }
+    }
+    let _steer_guard = SteerGuard { steers: host.steers.clone(), id: id.clone() };
     // The loop runs in its own task, so a panic in it ends the task as failed (saved, with `error`
     // and `done` events) instead of leaving the client waiting and the record "running".
     /// Aborts the loop's task when `run`'s future is dropped, as awaiting it in place would.
@@ -2909,7 +2919,6 @@ pub async fn run(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
             rec
         }
     };
-    host.steers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
     Ok(rec)
 }
 
@@ -3099,8 +3108,8 @@ async fn prepare(host: Host, p: RunParams, cancel: CancellationToken) -> Result<
         system.push_str(
             "\n\nWhen you would end by offering the user a choice of next steps (\"should I do A or B?\"), ask it with ask_user instead of writing the options as text, and put your pick in `recommended`: the user then gets a 'Proceed with recommendation' button.",
         );
-        // Subagents work to a deadline set by the lead: only top-level tasks sleep and wake.
-        tool_specs.extend(wakeup::specs());
+        system.push_str("\n\n");
+        system.push_str(wakeup::END_OF_TASK_NOTE);
     }
     if has_ws {
         tool_specs.push(summarize_spec());
@@ -3370,6 +3379,16 @@ pub async fn best_of(host: Host, p: BestOfParams, cancel: CancellationToken) -> 
         budget: None,
     };
     let lead = prepare(host, params, cancel).await?;
+    struct ActivityGuard {
+        id: String,
+        status: &'static str,
+    }
+    impl Drop for ActivityGuard {
+        fn drop(&mut self) {
+            activity::ended(&self.id, self.status);
+        }
+    }
+    let mut activity_guard = ActivityGuard { id: lead.rec.id.clone(), status: "failed" };
     if !lead.cwd.join(".git").exists() {
         return Err("best-of-N needs a git repository with at least one commit".into());
     }
@@ -3402,6 +3421,7 @@ pub async fn best_of(host: Host, p: BestOfParams, cancel: CancellationToken) -> 
         })
         .collect();
     let total: f64 = candidates.iter().filter_map(|c| c["costUsd"].as_f64()).sum();
+    activity_guard.status = if lead.cancel.is_cancelled() { "cancelled" } else { "completed" };
     lead.emit(json!({ "type": "bestOfDone", "candidates": candidates.len(), "costUsd": total }));
     Ok(json!({ "taskId": lead.rec.id, "candidates": candidates, "costUsd": total }))
 }
@@ -4026,106 +4046,64 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// `wait_until` returns at once; with nothing else to do the task sleeps, and the passed check
-    /// wakes it with the result.
+    /// `wait_until` runs in place: the call returns with the check's result, and the task never sleeps.
     #[tokio::test]
-    async fn a_wait_until_check_puts_the_task_to_sleep_and_wakes_it() {
+    async fn wait_until_returns_its_result_in_place() {
         let root = temp_repo(&[("a.txt", "x\n")]);
-        let check = json!({ "command": ["sh", "-c", "sleep 1; echo server ready"], "match": "ready", "intervalSecs": 2, "reason": "server up" });
-        let (base, seen) = mock(vec![sse_tool("c1", "wait_until", check), sse_text("Waiting for the server."), sse_text("The server is up.")]);
+        let check = json!({ "command": ["sh", "-c", "echo server ready"], "match": "ready", "intervalSecs": 2, "reason": "server up" });
+        let (base, seen) = mock(vec![sse_tool("c1", "wait_until", check), sse_text("The server is up.")]);
         let events = Arc::new(Mutex::new(Vec::new()));
         let h = host(&root, ApprovalDecision::Allow, events.clone());
         let r = run(h, params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new()).await.unwrap();
         assert_eq!(r.status, Status::Completed, "{:?}", r.error);
         assert_eq!(r.final_text, "The server is up.");
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 3, "one more step after the wake-up");
-        assert!(seen[1]["messages"].to_string().contains("runs in the background"), "the call returned at once");
-        assert!(seen[2]["messages"].to_string().contains("w1 (server up) passed"), "the result came as a message");
-        let events = events.lock().unwrap();
-        let types: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).filter(|t| ["wakeupScheduled", "sleeping", "wakeupFired", "awake"].contains(t)).collect();
-        assert_eq!(types, ["wakeupScheduled", "sleeping", "wakeupFired", "awake"]);
-        assert!(events.iter().any(|e| e["type"] == "awake" && e["by"] == "wakeup"));
+        assert_eq!(seen.len(), 2, "the result came back with the call");
+        // The tool result is the last message of the second request.
+        let result = seen[1]["messages"].as_array().unwrap().last().unwrap().to_string();
+        assert!(result.contains(r#"\"met\":true"#) && !result.contains("background"), "{result}");
+        assert!(!events.lock().unwrap().iter().any(|e| ["wakeupScheduled", "sleeping"].contains(&e["type"].as_str().unwrap_or_default())));
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// A message from the user wakes a sleeping task; once nothing is pending the task completes.
+    /// A message sent while `wait_until` runs ends the wait at once: the model gets `interrupted`
+    /// and the message in its next step, instead of after the check's 10 minutes.
     #[tokio::test]
-    async fn a_message_wakes_a_sleeping_task() {
+    async fn a_message_ends_a_running_wait() {
         let root = temp_repo(&[("a.txt", "x\n")]);
-        let (base, seen) = mock(vec![
-            sse_tool("c1", "schedule_wakeup", json!({ "delaySeconds": 1800, "prompt": "Check the deploy of v2", "reason": "deploy check" })),
-            sse_text("I will check the deploy in 30 minutes."),
-            sse_tool("c2", "cancel_wakeup", json!({ "id": "all" })),
-            sse_text("Cancelled the check as asked."),
-        ]);
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let check = json!({ "command": ["sh", "-c", "exit 1"], "intervalSecs": 2, "timeoutSecs": 600, "reason": "deploy" });
+        let (base, seen) = mock(vec![sse_tool("c1", "wait_until", check), sse_text("Answered the question.")]);
         let mut h = host(&root, ApprovalDecision::Allow, Arc::default());
-        let (log, steers) = (events.clone(), h.steers.clone());
+        let steers = h.steers.clone();
         h.emit = Arc::new(move |id, e| {
-            if e["type"] == "sleeping" {
-                assert!(steer(&steers, id, "never mind, cancel the check").unwrap());
+            if e["type"] == "toolStarted" && e["tool"] == "wait_until" {
+                assert!(steer(&steers, id, "what is the status?").unwrap());
             }
-            log.lock().unwrap().push(e);
         });
-        let mut p = params(&base, ChatMode::Ask, Mode::AskBeforeEdit);
-        p.task_id = Some("sleepy".into());
-        let store = h.store.clone();
-        let r = run(h, p, CancellationToken::new()).await.unwrap();
-        assert_eq!(r.status, Status::Completed, "{:?}", r.error);
-        assert_eq!(store.load("sleepy").unwrap().status, Status::Completed);
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 4);
-        assert!(seen[2]["messages"].to_string().contains("never mind, cancel the check"));
-        let events = events.lock().unwrap();
-        let sleeping = events.iter().find(|e| e["type"] == "sleeping").unwrap();
-        assert_eq!((sleeping["pending"][0]["id"].as_str(), sleeping["pending"][0]["reason"].as_str()), (Some("w1"), Some("deploy check")));
-        assert!(events.iter().any(|e| e["type"] == "awake" && e["by"] == "message"));
-        assert!(events.iter().any(|e| e["type"] == "wakeupCancelled" && e["by"] == "model"));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    /// A reply that promises "in 30 minutes" with nothing scheduled gets that wake-up and sleeps.
-    #[tokio::test]
-    async fn a_promised_time_is_scheduled_and_the_task_sleeps() {
-        let root = temp_repo(&[("a.txt", "x\n")]);
-        // The message wakes it early; the model then cancels the wake-up that is still pending.
-        let (base, seen) = mock(vec![
-            sse_text("The job runs. I'll check again in 30 minutes."),
-            sse_tool("c1", "cancel_wakeup", json!({ "id": "all" })),
-            sse_text("Checked: the job is done."),
-        ]);
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let mut h = host(&root, ApprovalDecision::Allow, Arc::default());
-        let (log, steers) = (events.clone(), h.steers.clone());
-        h.emit = Arc::new(move |id, e| {
-            if e["type"] == "sleeping" {
-                assert!(steer(&steers, id, "look now").unwrap());
-            }
-            log.lock().unwrap().push(e);
-        });
+        let started = Instant::now();
         let r = run(h, params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new()).await.unwrap();
         assert_eq!(r.status, Status::Completed, "{:?}", r.error);
-        assert_eq!(seen.lock().unwrap().len(), 3);
-        let events = events.lock().unwrap();
-        let w = events.iter().find(|e| e["type"] == "wakeupScheduled").expect("scheduled by task-x");
-        assert_eq!(w["wakeup"]["dueMs"].as_u64().unwrap() - w["wakeup"]["createdMs"].as_u64().unwrap(), 1_800_000);
-        assert!(w["wakeup"]["reason"].as_str().unwrap().starts_with("you said: I'll check again in 30 minutes"));
-        assert!(events.iter().any(|e| e["type"] == "sleeping"));
+        assert!(started.elapsed() < Duration::from_secs(10), "the wait ended early: {:?}", started.elapsed());
+        let seen = seen.lock().unwrap();
+        let next = seen[1]["messages"].to_string();
+        assert!(next.contains("interrupted") && next.contains("what is the status?"), "{next}");
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// A promise with no time gets one reminder to schedule the wait; it is not repeated.
+    /// The task ends when the model ends its turn: a promise to come back later neither schedules a
+    /// wake-up nor sends the model back, and the scheduling tools are not offered.
     #[tokio::test]
-    async fn a_promise_without_a_time_gets_one_reminder() {
+    async fn a_promise_to_come_back_does_not_keep_the_task_open() {
         let root = temp_repo(&[("a.txt", "x\n")]);
-        let (base, seen) = mock(vec![sse_text("I'll report when the build finishes."), sse_text("I'll report when the build finishes.")]);
+        let (base, seen) = mock(vec![sse_text("The job runs. I'll check again in 30 minutes."), sse_text("never asked")]);
         let events = Arc::new(Mutex::new(Vec::new()));
         let r = run(host(&root, ApprovalDecision::Allow, events.clone()), params(&base, ChatMode::Agent, Mode::Autonomous), CancellationToken::new()).await.unwrap();
         assert_eq!(r.status, Status::Completed, "{:?}", r.error);
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2, "one reminder, then the task ends");
-        assert!(seen[1]["messages"].to_string().contains("nothing is scheduled to wake you"));
+        assert_eq!(seen.len(), 1, "one model call, then the task ends");
+        let tools = seen[0]["tools"].to_string();
+        assert!(tools.contains("wait_until") && !tools.contains("schedule_wakeup"), "{tools}");
+        assert!(!events.lock().unwrap().iter().any(|e| e["type"] == "sleeping" || e["type"] == "wakeupScheduled"));
         std::fs::remove_dir_all(root).ok();
     }
 

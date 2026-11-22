@@ -318,6 +318,53 @@ export interface PortInfo {
   cwd?: string;
 }
 
+/**
+ * `agy/run` params: one request through the Antigravity CLI (`agy`). Chat modes other than agent
+ * run agy's plan mode. The result is an `AgentSummary` with `engine: 'antigravity'` and the
+ * `conversationId` to resume with.
+ */
+export interface AgyRunParams {
+  prompt: string;
+  taskId: string;
+  /** Absolute path of the `agy` executable. */
+  cliPath: string;
+  model?: string;
+  conversationId?: string;
+  chatMode?: ChatMode;
+  /** agy cannot ask for permission headless: `default` denies edits, `accept-edits` allows them, `auto` decides itself. */
+  permissionMode?: 'default' | 'accept-edits' | 'auto';
+  /** `--dangerously-skip-permissions` (agent mode only). */
+  skipPermissions?: boolean;
+  effort?: Effort;
+  /** `--sandbox`: agy's terminal restrictions. */
+  sandbox?: boolean;
+  /** Images attached to the prompt; saved to a temp folder exposed via `--add-dir`. */
+  images?: ImageInput[];
+}
+
+/** One limit of `agy/usage`: `remainingFraction` is 0-1, `resetTime` an RFC 3339 time. */
+export interface AgyUsageBucket {
+  id: string;
+  name: string;
+  /** `5h` or `weekly`. */
+  window: string;
+  remainingFraction: number;
+  resetTime?: string;
+  description?: string;
+}
+
+/** `agy/usage` result: model groups sharing a 5-hour and a weekly limit, and the AI credits left. */
+export interface AgyUsage {
+  description?: string;
+  groups: { name: string; description?: string; buckets: AgyUsageBucket[] }[];
+  credits: { remaining: number; upgradeUri?: string } | null;
+}
+
+/** `agy/models` result. */
+export interface AgyModels {
+  models: { id: string; label: string }[];
+}
+
 /** `ports/list` result. `supported: false` when the machine has neither `lsof` nor `ss`. */
 export interface PortList {
   supported: boolean;
@@ -330,6 +377,47 @@ export interface PortStopResult {
   forced: boolean;
   port: number;
   name: string;
+}
+
+/**
+ * One command the agent ran (`procs/list`, `procs/started`, `procs/ended`): `run_command`,
+ * `run_tests`, `check_build`, and the other project commands. `exited` is exit code 0, `failed` any
+ * other end, `stopped` a `procs/stop` or a cancelled call.
+ */
+export interface ProcInfo {
+  id: string;
+  taskId?: string;
+  command: string;
+  cwd: string;
+  pid: number;
+  startedMs: number;
+  endedMs?: number;
+  status: 'running' | 'exited' | 'failed' | 'stopped' | 'timedOut';
+  exitCode?: number;
+}
+
+/** `procs/list` result, oldest first. */
+export interface ProcList {
+  procs: ProcInfo[];
+}
+
+/**
+ * `procs/output` (`{ id }`) result: the output up to byte `to`. The `procs/output` notifications
+ * with `from >= to` continue it; those before it are already in `data`.
+ */
+export interface ProcOutput {
+  proc: ProcInfo;
+  data: string;
+  truncated: boolean;
+  to: number;
+}
+
+/** `procs/output` notification: new output of a running command, bytes `from` to `to` of its output. */
+export interface ProcOutputParams {
+  id: string;
+  data: string;
+  from: number;
+  to: number;
 }
 
 /** `agent/run` `policy`. */
@@ -471,7 +559,7 @@ export type AgentEvent =
   | { type: 'compacted'; folded: number; pruned?: number; droppedRetrieval?: boolean; beforeTokens?: number; afterTokens?: number; windowTokens?: number }
   | { type: 'context'; usedTokens: number; windowTokens: number }
   | { type: 'hook'; event: string; command: string; blocked: boolean; message: string }
-  | { type: 'subagentStarted'; name: string; taskId: string; role: Role; agent?: string | null; objective: string; kind: ProviderKind | 'claudeCode'; model: string; dir: string | null; step: string | null }
+  | { type: 'subagentStarted'; name: string; taskId: string; role: Role; agent?: string | null; objective: string; kind: ProviderKind | 'claudeCode' | 'antigravity'; model: string; dir: string | null; step: string | null }
   | { type: 'subagentFinished'; name: string; taskId: string; role: Role; agent?: string | null; status: TaskStatus; error?: string | null; costUsd?: number; unpricedTokens?: number; tokens?: number; files?: string[]; added?: number; removed?: number; worktree?: string | null }
   | { type: 'planStarted'; callId: string; maxParallel: number; steps: { id: string; role: Role; agent?: string | null; objective: string; dependsOn: string[] }[] }
   | { type: 'stepSkipped'; step: string; reason: string }
@@ -482,7 +570,16 @@ export type AgentEvent =
   | { type: 'wakeupFired'; id: string; kind: Wakeup['kind']; reason: string; met?: boolean }
   | { type: 'wakeupCancelled'; id: string; by: 'model' | 'taskEnded' }
   | { type: 'sleeping'; untilMs: number; pending: PendingWakeup[] }
-  | { type: 'awake'; by: 'wakeup' | 'message' | 'nothingPending' | 'cancelled'; sleptMs: number; pending: PendingWakeup[] };
+  | { type: 'awake'; by: 'wakeup' | 'message' | 'nothingPending' | 'cancelled'; sleptMs: number; pending: PendingWakeup[] }
+  | { type: 'rateLimit'; info: ClaudeRateLimitInfo };
+
+/** Claude Code CLI rate-limit window reported by `rate_limit_event`. */
+export interface ClaudeRateLimitInfo {
+  rateLimitType?: string;
+  status?: string;
+  utilization?: number;
+  resetsAt?: number | string;
+}
 
 /** A wake-up (`schedule_wakeup`) or a check (`wait_until`) of a task. */
 export interface Wakeup {

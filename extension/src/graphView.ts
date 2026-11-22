@@ -32,8 +32,8 @@ export class GraphPanel {
       return;
     }
     const media = vscode.Uri.joinPath(ctx.extensionUri, 'media');
-    const panel = vscode.window.createWebviewPanel('task-x.graph', 'task-x: Project Graph', vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [media] });
-    panel.iconPath = vscode.Uri.joinPath(media, 'logo.svg');
+    const panel = vscode.window.createWebviewPanel('task-x.graph', 'task-x: Workspace Index', vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [media] });
+    panel.iconPath = vscode.Uri.joinPath(media, 'icon.png');
     const view = new GraphPanel(panel, getClient);
     if (focus) view.last = { type: 'load', level: 'file', focus };
     GraphPanel.current = view;
@@ -118,25 +118,29 @@ export class GraphPanel {
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="${uri('icon.png')}">
 <link rel="stylesheet" href="${uri('codicons/codicon.css')}">
 <link rel="stylesheet" href="${uri('tokens.css')}">
 <link rel="stylesheet" href="${uri('graph.css')}">
-<title>Project Graph</title>
+<title>Workspace Index</title>
 </head>
 <body>
 <header class="top">
-  <div class="brand"><span class="logo" aria-hidden="true"></span><div><h1>Project graph</h1><p id="summary" class="muted">Loading…</p></div></div>
+  <div class="brand"><img class="logo-img" src="${uri('icon.png')}" alt="" width="36" height="36"><div><h1>Workspace Index</h1><p id="summary" class="muted">Loading…</p></div></div>
   <div class="controls">
-    <div id="level" class="tabs" role="tablist" aria-label="Level"><span class="tab-ind"></span><button type="button" role="tab" class="tab" data-level="module">Modules</button><button type="button" role="tab" class="tab" data-level="file">Files</button></div>
+    <div id="level" class="tabs" role="tablist" aria-label="View"><span class="tab-ind"></span><button type="button" role="tab" class="tab" data-level="module">Modules</button><button type="button" role="tab" class="tab" data-level="file">Files</button></div>
     <label class="check"><input id="imports" type="checkbox"> Imports only</label>
-    <label class="field"><span class="codicon codicon-search" aria-hidden="true"></span><input id="focus" type="search" placeholder="Focus on a file or folder" aria-label="Focus on a file or folder" maxlength="300"></label>
-    <button type="button" id="reindex" class="btn secondary" title="Scan the workspace again and rebuild the graph"><span class="codicon codicon-refresh" aria-hidden="true"></span><span id="reindexText">Reindex</span></button>
+    <label class="field"><span class="codicon codicon-search" aria-hidden="true"></span><input id="focus" type="search" placeholder="Filter by file or folder" aria-label="Filter by file or folder" maxlength="300"></label>
+    <button type="button" id="reindex" class="btn secondary" title="Scan the workspace again and rebuild the index"><span class="codicon codicon-refresh" aria-hidden="true"></span><span id="reindexText">Reindex</span></button>
   </div>
 </header>
 <div id="chips" class="chips" aria-live="polite"></div>
 <main class="stage">
-  <canvas id="canvas" aria-label="Dependency graph. Use the list on the right to move between files."></canvas>
-  <div id="empty" class="empty" hidden></div>
+  <section class="list-pane" aria-label="Indexed modules and files">
+    <div id="listHead" class="list-head"></div>
+    <div id="empty" class="empty" hidden></div>
+    <ul id="nodeList" class="node-list"></ul>
+  </section>
   <aside id="side" class="side" aria-live="polite"></aside>
 </main>
 <script nonce="${nonce}" src="${uri('graph.js')}"></script>

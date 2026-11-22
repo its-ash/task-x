@@ -1,17 +1,16 @@
-//! Wake-ups: a task can ask to be woken later with a note to itself (`schedule_wakeup`), or when a
-//! check command passes (`wait_until`, run in the background). When the model has nothing else to
-//! do while some are pending, the task sleeps (status `sleeping`) and wakes when one fires or the
-//! user sends a message. Wake-ups live in memory only: they end with their task, and when the
-//! runtime (VS Code) stops.
+//! Wake-ups: the scheduler behind `schedule_wakeup`, `list_wakeups`, and `cancel_wakeup`. A task
+//! ends when the model ends its turn, so these tools are not offered to models any more (a task
+//! that slept on them never stopped by itself); `wait_until` runs in place, as a normal call. The
+//! scheduler stays for a model that still calls them by name: when it has nothing else to do while
+//! some are pending, the task sleeps (status `sleeping`) and wakes when one fires or the user sends
+//! a message. Wake-ups live in memory only: they end with their task, and when the runtime stops.
 
 use super::EmitFn;
-use crate::provider::ToolSpec;
-use regex::Regex;
 use crate::tools::schedule::{WAIT_UNTIL, check_wait, clip};
 use crate::tools::{self, ToolCtx, ToolError, ToolErrorKind, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -92,40 +91,17 @@ struct CancelIn {
     id: String,
 }
 
-/// Tool specs of `schedule_wakeup`, `list_wakeups`, and `cancel_wakeup`.
-pub fn specs() -> Vec<ToolSpec> {
-    let spec = |name: &str, description: &str, input_schema: Value| ToolSpec { name: name.into(), description: description.into(), input_schema };
-    vec![
-        spec(
-            SCHEDULE,
-            "Come back to something later: check a deploy in 30 minutes, look at a long job's progress, retry after a rate limit. The call returns at once with an id. Keep working if there is more to do; when you finish your turn, the task sleeps and wakes when the wake-up is due, with your prompt as a message. delaySeconds is 10 to 86400 (24 hours). For a pause under 2 minutes use sleep; to wait until a command succeeds use wait_until. Wake-ups end with the task and when task-x restarts.",
-            json!({ "type": "object", "properties": {
-                "delaySeconds": { "type": "integer", "minimum": MIN_DELAY_SECS, "maximum": MAX_DELAY_SECS, "description": "Seconds from now, e.g. 1800 for 30 minutes" },
-                "prompt": { "type": "string", "description": "The note you get on waking: what to check or do then, with the facts you will need" },
-                "reason": { "type": "string", "description": "A few words shown to the user while the task sleeps" }
-            }, "required": ["delaySeconds", "prompt"], "additionalProperties": false }),
-        ),
-        spec(
-            LIST,
-            "List this task's pending wake-ups and wait_until checks: id, kind, reason, and seconds until each is due.",
-            json!({ "type": "object", "properties": {}, "additionalProperties": false }),
-        ),
-        spec(
-            CANCEL,
-            "Cancel a pending wake-up or wait_until check by id, or every one with id \"all\".",
-            json!({ "type": "object", "properties": { "id": { "type": "string", "description": "An id from schedule_wakeup, wait_until, or list_wakeups; \"all\" for every one" } }, "required": ["id"], "additionalProperties": false }),
-        ),
-    ]
-}
+/// Told to every top-level model (the agent's and Claude Code's): nothing brings it back later.
+pub const END_OF_TASK_NOTE: &str = "The task ends when you end your turn: nothing wakes you or brings you back later, and background commands stop with it. The one exception is subagents you started in the background: the task stays open until each has reported, and its report starts your next step. So after starting background subagents, work on something else or end your turn; never sleep or poll to wait for them. Do not promise to check back or report later. Finish what you can now (wait for a short job when you need its result), then give your final answer and say plainly what is still pending: a deploy that is still running, a check the user should do.";
 
 /// The scheduler's own tool called `name`.
 pub fn name(name: &str) -> Option<&'static str> {
     NAMES.iter().copied().find(|n| *n == name)
 }
 
-/// Whether `name` is run by the scheduler.
+/// Whether `name` is run by the scheduler (`wait_until` is not: it runs in place, as a normal call).
 pub fn handles(name: &str) -> bool {
-    NAMES.contains(&name) || name == WAIT_UNTIL
+    NAMES.contains(&name)
 }
 
 fn now_ms() -> u64 {
@@ -362,16 +338,6 @@ impl Scheduler {
         }
     }
 
-    /// Schedules the wake-up a reply promised (`Promise::After`), as if the model had called
-    /// `schedule_wakeup`; the delay is kept within `MIN_DELAY_SECS..=MAX_DELAY_SECS`.
-    pub fn schedule_promised(self: &Arc<Self>, delay: Duration, said: &str) -> ToolResult {
-        let secs = delay.as_secs().clamp(MIN_DELAY_SECS, MAX_DELAY_SECS);
-        let prompt = format!(
-            "You said: \"{said}\". Nothing was scheduled, so task-x scheduled this wake-up for you. It is time now: do what you said, then continue."
-        );
-        self.schedule(&json!({ "delaySeconds": secs, "prompt": prompt, "reason": format!("you said: {said}") }))
-    }
-
     /// Ends every pending wake-up (the task is over).
     pub fn cancel_all(&self) {
         let gone: Vec<Pending> = {
@@ -387,102 +353,6 @@ impl Scheduler {
             self.emit(json!({ "type": "wakeupCancelled", "id": p.id, "by": "taskEnded" }));
         }
     }
-}
-
-/// A reply that ends a turn with a promise to come back later.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Promise {
-    /// It names a time ("I'll check again in 30 minutes"): task-x schedules the wake-up itself.
-    After { delay: Duration, said: String },
-    /// It names no time ("I'll report when the build finishes"): the model is reminded to schedule it.
-    Unscheduled { said: String },
-}
-
-/// The model says it will do something itself, later.
-static COME_BACK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\b(?:i'll|i’ll|i will|i'm going to|i’m going to|i am going to|i shall)\b[^\n]*?\b(?:check|come back|look|wait|report|follow up|get back|revisit|resume|retry|try again|continue|poll|see)\b",
-    )
-    .expect("come-back regex")
-});
-/// ...and that it is later, not now.
-static LATER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(?:when|once|after|later|back|until|as soon as|in a (?:bit|while))\b").expect("later regex"));
-/// An offer to the user ("if you want, I'll check again later") is not a promise.
-static OFFER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(?:if you|would you|should i|do you want|let me know)\b").expect("offer regex"));
-/// "in 30 minutes", "after an hour", "for another 2h", "in half an hour".
-static DELAY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)\b(?:in|after|for|another|wait)\s+(?:about\s+|around\s+|roughly\s+|another\s+|~\s*)?(\d+(?:\.\d+)?|an?|one|two|three|four|five|ten|fifteen|twenty|thirty|forty|sixty|half an?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|h|m)\b",
-    )
-    .expect("delay regex")
-});
-
-/// Sentences of a reply: they end at `.`, `!`, or `?` before a space, or at a line break.
-fn sentences(text: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut chars = text.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        let next_space = chars.peek().is_none_or(|(_, n)| n.is_whitespace());
-        if c == '\n' || (matches!(c, '.' | '!' | '?') && next_space) {
-            out.push(&text[start..i + c.len_utf8()]);
-            start = i + c.len_utf8();
-        }
-    }
-    out.push(&text[start..]);
-    out.into_iter().map(str::trim).filter(|s| !s.is_empty()).collect()
-}
-
-fn delay_in(sentence: &str) -> Option<Duration> {
-    let c = DELAY.captures(sentence)?;
-    let n = match c[1].to_ascii_lowercase().as_str() {
-        "a" | "an" | "one" => 1.0,
-        "two" => 2.0,
-        "three" => 3.0,
-        "four" => 4.0,
-        "five" => 5.0,
-        "ten" => 10.0,
-        "fifteen" => 15.0,
-        "twenty" => 20.0,
-        "thirty" => 30.0,
-        "forty" => 40.0,
-        "sixty" => 60.0,
-        h if h.starts_with("half") => 0.5,
-        num => num.parse::<f64>().ok()?,
-    };
-    let unit = c[2].to_ascii_lowercase();
-    let secs = match unit.as_bytes()[0] {
-        b'h' => 3600.0,
-        b'm' => 60.0,
-        _ => 1.0,
-    };
-    Some(Duration::from_secs_f64(n * secs))
-}
-
-/// The last promise in `text` to come back later, if any.
-pub fn promise(text: &str) -> Option<Promise> {
-    let mut found = None;
-    for s in sentences(text) {
-        if !COME_BACK.is_match(s) || OFFER.is_match(s) || s.ends_with('?') {
-            continue;
-        }
-        let said = clip(s, MAX_REASON_CHARS);
-        if let Some(delay) = delay_in(s) {
-            found = Some(Promise::After { delay, said });
-        } else if LATER.is_match(s) {
-            found = Some(Promise::Unscheduled { said });
-        }
-    }
-    found
-}
-
-/// The reminder for `Promise::Unscheduled`; `prefix` is how the client names the task-x tools
-/// (empty for the agent's own tools, `mcp__task-x__` for Claude Code).
-pub fn unscheduled_nudge(said: &str, prefix: &str) -> String {
-    format!(
-        "You said \"{said}\", but nothing is scheduled to wake you, so the task would end here and nothing would bring you back. To wait, call {prefix}{WAIT_UNTIL} now (until a command succeeds: a build, a job, a log line) or {prefix}{SCHEDULE} (after a delay), then end your turn. If you do not need to wait, give your final answer."
-    )
 }
 
 /// `1h 5m`, `30m`, `45s`.
@@ -598,43 +468,6 @@ mod tests {
         assert!(events.lock().unwrap().iter().any(|e| e["type"] == "wakeupFired" && e["met"] == true));
         assert_eq!(s.call(WAIT_UNTIL, &json!({ "command": [] }), make).unwrap_err().kind, ToolErrorKind::InvalidInput, "checked before it is scheduled");
         assert_eq!(s.pending(), 0);
-    }
-
-    #[test]
-    fn promises_to_come_back_are_found() {
-        let after = |t: &str| match promise(t) {
-            Some(Promise::After { delay, .. }) => Some(delay.as_secs()),
-            _ => None,
-        };
-        assert_eq!(after("The build runs. I'll check again in 30 minutes."), Some(1800));
-        assert_eq!(after("I will come back after an hour to see the results."), Some(3600));
-        assert_eq!(after("I'll look at it in half an hour."), Some(1800));
-        assert_eq!(after("I’ll check the job in 1.5 hours."), Some(5400));
-        assert_eq!(after("I'm going to wait 10 min and check the deploy."), Some(600));
-        assert!(matches!(
-            promise("Started the run. I'll come back when the first optimisation reports in."),
-            Some(Promise::Unscheduled { said }) if said == "I'll come back when the first optimisation reports in."
-        ));
-        assert!(matches!(promise("I'll report when they finish."), Some(Promise::Unscheduled { .. })));
-        for none in [
-            "Done. The tests pass.",
-            "I'll check the config file next.",
-            "If you want, I'll check again in 30 minutes.",
-            "Should I check back in an hour?",
-            "This will retry in 5 minutes on its own.",
-        ] {
-            assert_eq!(promise(none), None, "{none}");
-        }
-        assert!(unscheduled_nudge("x", "mcp__task-x__").contains("mcp__task-x__wait_until"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_promised_wakeup_is_scheduled_within_limits() {
-        let (s, _) = scheduler();
-        let r = s.schedule_promised(Duration::from_secs(1), "I'll check in a second.").unwrap();
-        assert_eq!(r["in"], "10s", "at least the shortest wake-up");
-        assert!(s.wait(|| false).await);
-        assert!(s.take_fired()[0].contains("You said: \"I'll check in a second.\""));
     }
 
     #[test]

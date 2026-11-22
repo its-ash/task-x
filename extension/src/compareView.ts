@@ -65,6 +65,7 @@ export async function runBestOf(ctx: vscode.ExtensionContext, getClient: () => P
 /** Side-by-side candidates with Diff, Keep (apply one, discard the rest), Open folder, and Discard all. */
 class CompareView {
   private resolved = false;
+  private settling = false;
 
   private constructor(
     private readonly panel: vscode.WebviewPanel,
@@ -76,10 +77,11 @@ class CompareView {
   static show(ctx: vscode.ExtensionContext, prompt: string, candidates: Candidate[], chat: ChatViewProvider): void {
     const media = vscode.Uri.joinPath(ctx.extensionUri, 'media');
     const panel = vscode.window.createWebviewPanel('task-x.compare', 'task-x: Compare', vscode.ViewColumn.Active, { enableScripts: true, localResourceRoots: [media] });
-    panel.iconPath = vscode.Uri.joinPath(media, 'logo.svg');
+    panel.iconPath = vscode.Uri.joinPath(media, 'icon.png');
     const view = new CompareView(panel, prompt, candidates, chat);
     panel.webview.html = view.html(panel.webview, media);
-    panel.webview.onDidReceiveMessage((m: Inbound) => view.onMessage(m), undefined, ctx.subscriptions);
+    const msgSub = panel.webview.onDidReceiveMessage((m: Inbound) => view.onMessage(m));
+    panel.onDidDispose(() => msgSub.dispose());
   }
 
   private post(msg: object): void {
@@ -99,10 +101,24 @@ class CompareView {
         if (c?.dir && c.name && !this.resolved) await vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.file(c.dir), { forceNewWindow: true });
         break;
       case 'keep':
-        if (c?.name && !this.resolved && (await this.chat.settleWorktree(c.name, true))) await this.finish(c.name);
+        if (c?.name && !this.resolved && !this.settling) {
+          this.settling = true;
+          try {
+            if (await this.chat.settleWorktree(c.name, true)) await this.finish(c.name);
+          } finally {
+            this.settling = false;
+          }
+        }
         break;
       case 'discardAll':
-        if (!this.resolved) await this.finish(undefined);
+        if (!this.resolved && !this.settling) {
+          this.settling = true;
+          try {
+            await this.finish(undefined);
+          } finally {
+            this.settling = false;
+          }
+        }
         break;
     }
   }

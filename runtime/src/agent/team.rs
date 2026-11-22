@@ -109,7 +109,9 @@ pub fn create_with_base(repo: &Path, name: &str, base: &[String], cancel: &Cance
     }
     let setup = || -> Result<(), String> {
         for (i, p) in patches.iter().enumerate() {
-            let file = std::env::temp_dir().join(format!("task-x-base-{name}-{i}-{}.patch", std::process::id()));
+            static PATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = PATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let file = std::env::temp_dir().join(format!("task-x-base-{name}-{i}-{}-{seq}.patch", std::process::id()));
             std::fs::write(&file, p).map_err(|e| e.to_string())?;
             let res = git(&["apply", "--whitespace=nowarn", &file.to_string_lossy()], &dir, cancel);
             let _ = std::fs::remove_file(&file);
@@ -221,7 +223,9 @@ fn read_text(abs: &Path) -> Result<Option<String>, ()> {
 }
 
 fn apply_patch(repo: &Path, name: &str, patch: &str, cancel: &CancellationToken) -> Result<(), String> {
-    let file = std::env::temp_dir().join(format!("task-x-{name}-{}.patch", std::process::id()));
+    static PATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = PATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file = std::env::temp_dir().join(format!("task-x-{name}-{}-{seq}.patch", std::process::id()));
     std::fs::write(&file, patch).map_err(|e| e.to_string())?;
     let f = file.to_string_lossy().to_string();
     let res = git(&["apply", "--check", &f], repo, cancel).and_then(|_| git(&["apply", &f], repo, cancel));

@@ -11,6 +11,7 @@ type Source = {
   agentChats(): AgentChat[];
   readonly onDidChangeLanes: vscode.Event<void>;
   laneAction(tabId: string, taskId: string, action: LaneAction, text?: string): Promise<void>;
+  revealChatTab(tabId: string): Promise<boolean>;
 };
 
 type ChatNode = { kind: 'chat'; chat: AgentChat };
@@ -73,6 +74,10 @@ export class AgentsView implements vscode.TreeDataProvider<Node>, vscode.Disposa
       this.tree,
       source.onDidChangeLanes(() => this.refresh()),
       vscode.commands.registerCommand('task-x.agents.refresh', () => this.refresh()),
+      vscode.commands.registerCommand('task-x.agents.showChat', (n?: Node) => {
+        const node = n ?? this.tree.selection[0];
+        if (node?.kind === 'chat') void this.source.revealChatTab(node.chat.tabId);
+      }),
       vscode.commands.registerCommand('task-x.agents.show', (n?: Node) => this.act(n, 'show')),
       vscode.commands.registerCommand('task-x.agents.open', (n?: Node) => this.act(n, 'open')),
       vscode.commands.registerCommand('task-x.agents.stop', (n?: Node) => this.act(n, 'stop')),
@@ -98,9 +103,11 @@ export class AgentsView implements vscode.TreeDataProvider<Node>, vscode.Disposa
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = undefined;
       const chats = this.source.agentChats();
-      const running = chats.flatMap((c) => c.lanes).filter((l) => l.status === 'running').length;
-      this.tree.badge = running ? { value: running, tooltip: `${running} subtask${running === 1 ? '' : 's'} running` } : undefined;
-      void vscode.commands.executeCommand('setContext', 'task-x.agentsRunning', running > 0);
+      const runningSubagents = chats.flatMap((c) => c.lanes).filter((l) => l.status === 'running').length;
+      const runningChats = chats.filter((c) => c.running).length;
+      const running = runningChats + runningSubagents;
+      this.tree.badge = running ? { value: running, tooltip: `${running} active agent${running === 1 ? '' : 's'}` } : undefined;
+      void vscode.commands.executeCommand('setContext', 'task-x.agentsRunning', runningSubagents > 0);
       if (running && !this.tick) this.tick = setInterval(() => this.changed.fire(), TICK_MS);
       if (!running && this.tick) {
         clearInterval(this.tick);
@@ -124,11 +131,21 @@ export class AgentsView implements vscode.TreeDataProvider<Node>, vscode.Disposa
     if (n.kind === 'chat') {
       const { chat } = n;
       const running = chat.lanes.filter((l) => l.status === 'running').length;
-      const item = new vscode.TreeItem(chat.title, vscode.TreeItemCollapsibleState.Expanded);
+      const collapsible = chat.lanes.length ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None;
+      const item = new vscode.TreeItem(chat.title, collapsible);
       item.id = `chat:${chat.tabId}`;
-      item.iconPath = new vscode.ThemeIcon(chat.running ? 'comment-discussion' : 'comment');
-      item.description = running ? `${running} running · ${chat.lanes.length} total` : `${chat.lanes.length} subtask${chat.lanes.length === 1 ? '' : 's'}`;
+      item.iconPath = chat.running
+        ? new vscode.ThemeIcon('loading~spin', new vscode.ThemeColor('charts.blue'))
+        : new vscode.ThemeIcon('comment-discussion');
+      item.description = chat.lanes.length
+        ? running
+          ? `${running} running · ${chat.lanes.length} subtask${chat.lanes.length === 1 ? '' : 's'}`
+          : `${chat.lanes.length} subtask${chat.lanes.length === 1 ? '' : 's'}`
+        : chat.running
+          ? 'Running'
+          : 'Idle';
       item.contextValue = 'chat';
+      item.command = { command: 'task-x.agents.showChat', title: 'Show Chat', arguments: [n] };
       return item;
     }
     const l = n.lane;
@@ -170,8 +187,10 @@ export class AgentsView implements vscode.TreeDataProvider<Node>, vscode.Disposa
   }
 
   private async stopAll(): Promise<void> {
+    const stops: Promise<void>[] = [];
     for (const chat of this.source.agentChats()) {
-      for (const l of chat.lanes) if (l.status === 'running' && l.stoppable !== false) await this.source.laneAction(chat.tabId, l.taskId, 'stop');
+      for (const l of chat.lanes) if (l.status === 'running' && l.stoppable !== false) stops.push(this.source.laneAction(chat.tabId, l.taskId, 'stop'));
     }
+    await Promise.allSettled(stops);
   }
 }

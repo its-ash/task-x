@@ -19,6 +19,7 @@ import { addDocs, removeDocs } from './docs.js';
 import { registerEditorCommands } from './editorCommands.js';
 import { exportHtml, manageApprovals, showActiveAgents, showTimeline } from './sessionTools.js';
 import { PortsView } from './ports.js';
+import { TerminalsView } from './terminalsView.js';
 import { SECTION, type ProviderRef, activeRef, deleteApiKey, hasApiKey, initChoice, isProviderRef, migrateSettings, modelFor, providerConfig, providerRefs, refLabel, refNeedsKey, sandboxOn, setProvider, settings, storeApiKey } from './config.js';
 import { ProviderDialog } from './providerDialog.js';
 import type { PluginInfo, TestReport } from './protocol.js';
@@ -107,17 +108,27 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // Settles once the current runtime has the workspace open (or opening it failed). Requests wait
   // for it, so the first prompt after a (re)start never reaches a runtime with no workspace.
   let workspaceReady: Promise<unknown> = Promise.resolve();
+  let workspaceOpenedFor: RuntimeProcess | undefined;
   const openWorkspace = (rt: RuntimeProcess) => {
-    const opened = sync.open(rt.client).catch((e) => {
-      out.error(`workspace indexing failed: ${describeError(e)}`);
-      return undefined;
-    });
-    workspaceReady = opened;
-    // Hooks and MCP load after the workspace but do not hold up requests.
-    void opened.finally(() => configureExtensions(rt));
-    return opened;
+    const opened = sync
+      .open(rt.client)
+      .then((res) => {
+        if (runtime === rt) workspaceOpenedFor = rt;
+        return res;
+      })
+      .catch((e) => {
+        out.error(`workspace indexing failed: ${describeError(e)}`);
+        return undefined;
+      });
+    // Configure safety hooks, plugins, and MCP before the first request runs on this runtime.
+    const ready = opened.then(() => configureExtensions(rt));
+    workspaceReady = ready;
+    return ready;
   };
 
+  // The Terminals view and ChatViewProvider follow each runtime that starts (assigned once created).
+  let terminals: TerminalsView | undefined;
+  let chatRef: ChatViewProvider | undefined;
   // The last time anything used the runtime; an idle runtime is stopped (see below).
   let lastUse = Date.now();
   const ensureRuntime = (): Promise<RuntimeProcess> => {
@@ -146,11 +157,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
         },
         onExit: (code, signal) => {
           out.warn(`runtime exited (code=${code}, signal=${signal})`);
-          if (runtime === rt) runtime = undefined;
+          if (runtime === rt) {
+            runtime = undefined;
+            workspaceOpenedFor = undefined;
+          }
+          terminals?.detach(rt.client);
+          chatRef?.cancelAll();
         },
       });
       out.info(`runtime ready: ${info.serverInfo.name} ${info.serverInfo.version}, protocol ${info.protocolVersion}`);
       runtime = rt;
+      chatRef?.wireClient(rt.client);
+      terminals?.attach(rt.client);
       void openWorkspace(rt);
       return rt;
     })().finally(() => (starting = undefined));
@@ -163,18 +181,35 @@ export function activate(ctx: vscode.ExtensionContext): void {
     // The open failed (or the runtime restarted without it): try once more before the request.
     // Only the first caller retries; the others wait on that same attempt.
     if (workspaceReady !== waited) await workspaceReady;
-    else if (WorkspaceSync.root() && !sync.summary && rt.running) {
-      workspaceReady = sync.open(rt.client).catch((e) => out.error(`workspace indexing failed: ${describeError(e)}`));
-      await workspaceReady;
+    else if (WorkspaceSync.root() && workspaceOpenedFor !== rt && rt.running) {
+      await openWorkspace(rt);
     }
     return rt.client;
   };
 
   const originals = new OriginalContent();
   const chat = new ChatViewProvider(ctx, client, () => ProviderDialog.show(ctx, client), originals, (level, msg) => logs.add(level, 'agent', msg));
+  chatRef = chat;
+  if (runtime?.running) chat.wireClient(runtime.client);
   const bg = new BackgroundTasks(ctx.secrets, client, chat, (level, msg) => logs.add(level, 'agent', msg));
   // Ports taken by what task-x started: polled from a runtime that runs, never starting one.
   const portsView = new PortsView(() => (runtime?.running ? runtime.client : undefined), client, (m) => out.info(m));
+  // The agent's commands, each one a terminal opened from the Terminals view.
+  terminals = new TerminalsView(client, (taskId) => chat.chatTitleForTask(taskId), chat.onDidChangeLanes, (m) => out.info(m));
+  if (runtime?.running) terminals.attach(runtime.client);
+  ctx.subscriptions.push(terminals);
+  const syncActivityBadge = () => {
+    const chats = chat.agentChats();
+    const agents = chats.filter((c) => c.running).length + chats.flatMap((c) => c.lanes).filter((l) => l.status === 'running').length;
+    chat.setActivityCount(agents, terminals?.runningCount ?? 0);
+  };
+  ctx.subscriptions.push(
+    chat.onDidChangeLanes(syncActivityBadge),
+    terminals.onDidChangeCount(syncActivityBadge),
+    vscode.commands.registerCommand('task-x.openActivity', () => vscode.commands.executeCommand('workbench.view.extension.task-x-activity')),
+  );
+  chat.onOpenActivity = () => void vscode.commands.executeCommand('workbench.view.extension.task-x-activity');
+  chat.onOpenTerminal = (taskId, cmd) => terminals?.openForTask(taskId, cmd) ?? false;
   chat.foreignApproval = (req) => bg.approve(req);
   chat.onBusyChange = (busy) => {
     lastUse = Date.now();
@@ -201,10 +236,12 @@ export function activate(ctx: vscode.ExtensionContext): void {
   // #5, #6, #8, #13, #16, #17: quick fixes, commit messages, terminal, tests, review comments, GitHub.
   const features = registerVscodeFeatures(ctx, chat, client);
   ctx.subscriptions.push(...features.disposables);
+  const findingsByTask = new Map<string, Set<string>>();
   chat.onSummary = (s) => {
     const root = WorkspaceSync.root();
     if (!root || !s.text.includes('```anvil-findings')) return;
-    findings.clear();
+    // Replace only this task's prior diagnostics so concurrent review agents do not wipe each other.
+    for (const prev of findingsByTask.get(s.taskId) ?? []) findings.delete(vscode.Uri.parse(prev));
     const byFile = new Map<string, vscode.Diagnostic[]>();
     const found = parseFindings(s.text);
     features.showFindings(root, found);
@@ -214,7 +251,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
       d.source = 'task-x review';
       byFile.set(f.path, [...(byFile.get(f.path) ?? []), d]);
     }
-    for (const [path, list] of byFile) findings.set(vscode.Uri.joinPath(vscode.Uri.file(root), ...path.split('/')), list);
+    const uris = new Set<string>();
+    for (const [path, list] of byFile) {
+      const uri = vscode.Uri.joinPath(vscode.Uri.file(root), ...path.split('/'));
+      uris.add(uri.toString());
+      findings.set(uri, list);
+    }
+    findingsByTask.set(s.taskId, uris);
     if (byFile.size) out.info(`review: ${[...byFile.values()].flat().length} findings in ${byFile.size} files`);
   };
   // Indexing status: a status bar item and the chat's index button; both open the project graph.
@@ -522,6 +565,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('task-x.showTasks', () => bg.show()),
     portsView,
     vscode.commands.registerCommand('task-x.showPorts', () => portsView.show()),
+    vscode.commands.registerCommand('task-x.agyUsage', () => chat.agy.show()),
+    vscode.commands.registerCommand('task-x.claudeUsage', () => chat.claudeUsage.show()),
     vscode.commands.registerCommand('task-x.bestOf', () => runBestOf(ctx, client, chat, bg)),
     vscode.commands.registerCommand('task-x.clearFindings', () => findings.clear()),
     indexItem,
@@ -534,7 +579,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       GraphPanel.show(ctx, client, sync, rel);
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('task-x.engine') || e.affectsConfiguration('task-x.claudeCode')) chat.refreshStatus();
+      if (e.affectsConfiguration('task-x.engine') || e.affectsConfiguration('task-x.claudeCode') || e.affectsConfiguration('task-x.agy') || e.affectsConfiguration('task-x.sandbox.enabled') || e.affectsConfiguration('task-x.agent.editMode')) chat.refreshStatus();
       if (e.affectsConfiguration(SECTION)) {
         if (e.affectsConfiguration(`${SECTION}.customProviders`) || providerRefs().some((k) => e.affectsConfiguration(`${SECTION}.${k}.baseUrl`))) chat.invalidateModels();
         refresh();

@@ -67,6 +67,8 @@ export interface WindowChoice {
   engine?: string;
   models?: Record<string, string>;
   claudeModel?: string;
+  /** The Antigravity CLI model (`agy models` id); '' is agy's default. */
+  agyModel?: string;
   /** Night mode: the model that writes the plan, and the free model that runs it in a loop. */
   nightPlanner?: NightModel;
   nightWorker?: NightModel;
@@ -104,12 +106,18 @@ export async function setWindowChoice(patch: WindowChoice): Promise<void> {
 export const chosenEngine = (): string | undefined => choice.engine;
 export const windowChoice = (): Readonly<WindowChoice> => choice;
 export const chosenClaudeModel = (): string | undefined => choice.claudeModel;
+export const chosenAgyModel = (): string | undefined => choice.agyModel;
 export const nightModels = (): { planner?: NightModel; worker?: NightModel } => ({ planner: choice.nightPlanner, worker: choice.nightWorker });
 export const toolModels = (): { refine?: NightModel; helper?: NightModel } => ({ refine: choice.refineModel, helper: choice.helperModel });
 /** `task-x.sandbox.enabled`: commands run in the OS sandbox (default on). */
 export const sandboxOn = (): boolean => cfg().get<boolean>('sandbox.enabled', true) !== false;
 export async function setSandbox(on: boolean): Promise<void> {
-  await cfg().update('sandbox.enabled', on, vscode.ConfigurationTarget.Global);
+  const c = cfg();
+  const cur = c.inspect<boolean>('sandbox.enabled');
+  // Update the narrowest scope that currently overrides the setting so workspace settings don't mask the toggle.
+  if (cur?.workspaceFolderValue !== undefined) await c.update('sandbox.enabled', on, vscode.ConfigurationTarget.WorkspaceFolder);
+  if (cur?.workspaceValue !== undefined) await c.update('sandbox.enabled', on, vscode.ConfigurationTarget.Workspace);
+  await c.update('sandbox.enabled', on, vscode.ConfigurationTarget.Global);
 }
 export const effort = (): Effort | undefined => (EFFORTS.includes(choice.effort as Effort) ? choice.effort : undefined);
 

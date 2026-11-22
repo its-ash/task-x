@@ -71,10 +71,7 @@ impl McpServer {
         } else {
             Vec::new()
         };
-        // Wake-ups belong to the runtime's task: they are offered only when there is one to ask.
-        if self.tools && self.approval.is_some() {
-            list.extend(crate::agent::wakeup::specs().into_iter().map(|t| json!({ "name": t.name, "description": t.description, "inputSchema": t.input_schema })));
-        }
+        // Wake-up tools are not offered: a task ends when Claude ends its turn (`wakeup::END_OF_TASK_NOTE`).
         if self.approval.is_some() {
             list.push(json!({
                 "name": APPROVE_TOOL,
@@ -100,8 +97,10 @@ impl McpServer {
             let answer = crate::claude_cli::request_approval(addr, token, &args).await;
             return json!({ "content": [{ "type": "text", "text": answer.to_string() }], "isError": false });
         }
-        // Wake-ups and background checks run in the runtime, which can wake Claude Code later.
-        if let Some((addr, token)) = self.approval.as_ref().filter(|_| self.tools && crate::agent::wakeup::handles(name)) {
+        // Waits run in the runtime, which ends one early when the user sends a message (a wait here
+        // would hold Claude Code, and the message, until it ends). The scheduler tools too.
+        let forwarded = crate::agent::wakeup::handles(name) || crate::tools::schedule::is_wait(name);
+        if let Some((addr, token)) = self.approval.as_ref().filter(|_| self.tools && forwarded) {
             let input = if args.is_null() { json!({}) } else { args };
             return match crate::claude_cli::request_tool(addr, token, name, &input).await {
                 Ok(v) => json!({ "content": [{ "type": "text", "text": v.to_string() }], "isError": false }),
@@ -240,7 +239,7 @@ mod tests {
         let woken = McpServer::open(root.clone(), true, Some(("127.0.0.1:1".into(), "t".into()))).unwrap();
         let list = rpc(&woken, 1, "tools/list", json!({})).await;
         let all: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(["schedule_wakeup", "list_wakeups", "cancel_wakeup"].iter().all(|n| all.contains(n)), "{all:?}");
+        assert!(all.contains(&"wait_until") && !["schedule_wakeup", "list_wakeups", "cancel_wakeup"].iter().any(|n| all.contains(n)), "{all:?}");
         let gone = rpc(&woken, 2, "tools/call", json!({ "name": "list_wakeups", "arguments": {} })).await;
         assert_eq!(gone["result"]["isError"], true, "the call goes to the runtime, which is not there");
         let only = McpServer::open(root.clone(), false, Some(("127.0.0.1:1".into(), "t".into()))).unwrap();
