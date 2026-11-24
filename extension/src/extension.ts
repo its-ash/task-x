@@ -585,7 +585,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.window.onDidChangeActiveTextEditor(editorChanged),
     vscode.window.onDidChangeTextEditorSelection(editorChanged),
     vscode.commands.registerCommand('task-x.showGraph', () => GraphPanel.show(ctx, client, sync)),
-    vscode.commands.registerCommand('task-x.openDiagram', () => {
+    vscode.commands.registerCommand('task-x.openDiagram', async (uri?: vscode.Uri) => {
+      if (uri instanceof vscode.Uri) {
+        try {
+          const text = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+          DiagramPanel.show(ctx, client, sendFromDiagram, text);
+          return;
+        } catch {
+          // Fall through to active editor.
+        }
+      }
       const ed = vscode.window.activeTextEditor;
       const selected = ed && !ed.selection.isEmpty ? ed.document.getText(ed.selection) : '';
       const fromDoc = ed && /\.(?:mmd|mermaid)$/i.test(ed.document.fileName) ? ed.document.getText() : '';

@@ -393,7 +393,7 @@ interface Run {
 /** Chat tabs that run a task at the same time; a request beyond this waits for a free slot. */
 const MAX_PARALLEL_RUNS = 4;
 /** How often the Chrome chip checks the task-x Chrome extension while a chat has Chrome mode on. */
-const CHROME_CHECK_MS = 15_000;
+const CHROME_CHECK_MS = 4_000;
 
 const blankTab = (items: Item[] = [], taskId?: string): ChatTab => ({ id: `t${Date.now().toString(36)}${randomBytes(3).toString('hex')}`, kind: 'chat', items, taskId });
 
@@ -663,6 +663,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.nightTodo = ctx.workspaceState.get<boolean>(NIGHT_TODO_KEY, false);
     this.nightItem = ctx.workspaceState.get<string>(NIGHT_ITEM_KEY);
     this.watchNight();
+    this.watchChrome();
+    void this.checkChrome();
     this.agy = new AgyCli(getClient);
     this.claudeUsage = new ClaudeUsage(ctx.globalState);
     if (findClaude()) void this.claudeUsage.refreshUsage();
@@ -1029,7 +1031,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const root = WorkspaceSync.root();
     const workspaceName = root ? path.basename(root) : '';
     if (this.view) this.view.description = workspaceName || undefined;
-    this.post({ type: 'status', workspaceName, provider: claude ? CLAUDE_LABEL : agy ? AGY_LABEL : refLabel(ref), model: this.tabModel(tab) || '(no model)', busy: this.runs.has(this.activeTab), sleeping: this.runs.get(this.activeTab)?.sleepingUntil ?? null, chrome: { on: !!this.reviewTab()?.chrome, ...this.chromeStatus }, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null, agent: windowChoice().agent ?? null });
+    const sharedTabs = this.sharedChromeTabs();
+    this.post({ type: 'status', workspaceName, provider: claude ? CLAUDE_LABEL : agy ? AGY_LABEL : refLabel(ref), model: this.tabModel(tab) || '(no model)', busy: this.runs.has(this.activeTab), sleeping: this.runs.get(this.activeTab)?.sleepingUntil ?? null, chrome: { on: sharedTabs.length > 0, ...this.chromeStatus, sharedTabs }, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null, agent: windowChoice().agent ?? null });
     void this.postModels();
   }
 
@@ -1242,31 +1245,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return this.items.findLast((i): i is Extract<Item, { kind: 'summary' }> => i.kind === 'summary');
   }
 
-  /** Asks the runtime whether the task-x Chrome extension answers, and updates the Chrome chip. */
+  private sharedChromeTabs(): { id: string; title: string; url: string }[] {
+    if (!this.chromeStatus.connected || this.chromeStatus.paused) return [];
+    return this.chromeStatus.sharedTabs ?? [];
+  }
+
+  private chromePromptNote(): string {
+    const tabs = this.sharedChromeTabs();
+    if (!tabs.length) return '';
+    const list = tabs.map((t) => `- [tabId: ${t.id}] "${t.title || t.url}" (${t.url})`).join('\n');
+    return `\n\n(The user shared Chrome tab(s) via the task-x Chrome extension:\n${list}\nThe user is talking about this page. Use the task-x MCP \`browser\` tool to inspect, read, click, type, screenshot, or change anything in this browser tab.)`;
+  }
+
+  /** Asks the runtime whether the task-x Chrome extension answers and which tabs are shared. */
   private async checkChrome(): Promise<ChromeStatus> {
-    let next: ChromeStatus = { connected: false, paused: false };
+    let next: ChromeStatus = { connected: false, paused: false, sharedTabs: [] };
     try {
       const client = await this.getClient();
       const s = await client.request<ChromeStatus & { error?: string }>('chrome/status', {}, { timeoutMs: 10_000 });
-      next = { connected: !!s.connected, paused: !!s.paused };
+      const sharedTabs = Array.isArray(s.sharedTabs)
+        ? s.sharedTabs.filter((t) => t && typeof t.id === 'string').map((t) => ({ id: t.id, title: String(t.title ?? ''), url: String(t.url ?? '') }))
+        : [];
+      next = { connected: !!s.connected, paused: !!s.paused, sharedTabs };
     } catch {
       // No runtime yet, or an older one without chrome/status: not connected.
     }
-    if (next.connected !== this.chromeStatus.connected || next.paused !== this.chromeStatus.paused) {
+    const prevKey = JSON.stringify(this.chromeStatus.sharedTabs ?? []);
+    const nextKey = JSON.stringify(next.sharedTabs ?? []);
+    if (next.connected !== this.chromeStatus.connected || next.paused !== this.chromeStatus.paused || prevKey !== nextKey) {
       this.chromeStatus = next;
       this.refreshStatus();
     }
     return next;
   }
 
-  /** Checks the Chrome extension every CHROME_CHECK_MS while some chat has Chrome mode on. */
+  /** Polls Chrome extension status so shared tabs auto-appear in the chat bar. */
   private watchChrome(): void {
-    const want = this.tabs.some((t) => t.kind === 'chat' && t.chrome);
-    if (want && !this.chromeWatch) this.chromeWatch = setInterval(() => void this.checkChrome(), CHROME_CHECK_MS);
-    if (!want && this.chromeWatch) {
-      clearInterval(this.chromeWatch);
-      this.chromeWatch = undefined;
-    }
+    if (!this.chromeWatch) this.chromeWatch = setInterval(() => void this.checkChrome(), CHROME_CHECK_MS);
   }
 
   /** Watches every run (see `watchRuns`). */
@@ -1751,6 +1766,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.night = m.enabled === true;
         await this.ctx.workspaceState.update(NIGHT_KEY, this.night);
         this.watchNight();
+    this.watchChrome();
+    void this.checkChrome();
         if (this.night) this.resumeNight();
         else {
           clearTimeout(this.nightTimer);
@@ -3131,7 +3148,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           ? await providerConfigWith(this.ctx.secrets, tabChoice.provider!, tabChoice.model)
           : undefined;
       // A chat tab is its own session: it cannot recall other tabs' tasks (project memory stays).
-      const params = { ...(await runParams(this.ctx.secrets, { prompt, mode, taskId, editor, provider, images, isolated: true })), ...(this.chat.chrome ? { chrome: true } : {}) };
+      const chromeNote = this.chromePromptNote();
+      const chromeOn = this.sharedChromeTabs().length > 0;
+      const params = { ...(await runParams(this.ctx.secrets, { prompt: prompt + chromeNote, mode, taskId, editor, provider, images, isolated: true })), ...(chromeOn ? { chrome: true } : {}) };
       const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
       // Bound to this run's tab: the event arrives outside the run's async context.
       off = client.onNotification(
@@ -3629,7 +3648,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         '\n\n(The `task-x` MCP server is connected for this workspace. Prefer its Rust tools for indexed search, symbol/dependency graph (`find_symbol`, `find_definition`, `find_references`, `get_dependencies`, `search_regex`, `get_file_tree`), project memory (`remember`, `recall`), and safe edits (`read_range`, `replace_text`).)';
     }
     if (opts.chrome) {
-      out += '\n\n(Chrome mode is enabled: use the `task-x` MCP `browser` tool to inspect, click, type, screenshot, and navigate in the user\'s Chrome browser.)';
+      out += this.chromePromptNote() || '\n\n(Chrome mode is enabled: use the `task-x` MCP `browser` tool to inspect, click, type, screenshot, and navigate in the user\'s Chrome browser.)';
     }
     return out;
   }
@@ -3653,6 +3672,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     let prompt = task;
     if (ed.selection) prompt += `\n\nSelected code in ${ed.selection.path} (lines ${ed.selection.startLine}-${ed.selection.endLine}):\n\`\`\`\n${ed.selection.text}\n\`\`\``;
     else if (ed.activeFile) prompt += `\n\n(Active file: ${ed.activeFile})`;
+    const chromeOn = this.sharedChromeTabs().length > 0;
+    if (chromeOn) prompt += this.chromePromptNote();
     prompt = await this.withSkills(client, prompt, [ed.selection?.path, ed.activeFile].filter((p): p is string => !!p));
     const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
     setOff(
@@ -3684,8 +3705,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // MCP servers turned off, and task-x tools turned off in the Tools chip (`mcp__task-x__<tool>`).
         disabledMcp: [...claudeDisabledMcp(this.ctx), ...(windowChoice().offTools ?? []).map((t) => `task-x__${t}`)],
         effort: effort(),
-        // Chrome mode: web work in the user's Chrome, every browser call asks.
-        ...(this.chat.chrome ? { chrome: true } : {}),
+        // Chrome mode: active automatically when Chrome tab(s) are shared via the extension.
+        ...(chromeOn ? { chrome: true } : {}),
         ...claudePermissions(mode),
       },
       { signal },
@@ -3717,7 +3738,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (ed.selection) prompt += `\n\nSelected code in ${ed.selection.path} (lines ${ed.selection.startLine}-${ed.selection.endLine}):\n\`\`\`\n${ed.selection.text}\n\`\`\``;
     else if (ed.activeFile) prompt += `\n\n(Active file: ${ed.activeFile})`;
     if (perms.sandbox === false) prompt += '\n\n(Terminal sandbox is disabled for this session; run commands directly without passing BypassSandbox.)';
-    prompt = this.withTaskXHints(prompt, { useTaskTools, chrome: !!this.chat.chrome });
+    const chromeOn = this.sharedChromeTabs().length > 0;
+    prompt = this.withTaskXHints(prompt, { useTaskTools, chrome: chromeOn });
     prompt = await this.withSkills(client, prompt, [ed.selection?.path, ed.activeFile].filter((p): p is string => !!p));
     const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
     setOff(
@@ -3740,7 +3762,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       conversationId: conversations[taskId],
       effort: effort(),
       useTaskTools,
-      ...(this.chat.chrome ? { chrome: true } : {}),
+      ...(chromeOn ? { chrome: true } : {}),
       images,
       ...perms,
     };
@@ -3818,7 +3840,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     <button type="button" id="settingsBtn" class="pick settings-pick"></button>
     <button type="button" id="effortBtn" class="pick effort-pick"></button>
     <button type="button" id="mcpBtn" class="pick mcp-pick"></button>
-    <button type="button" id="chromeBtn" class="pick chrome-pick" aria-pressed="false"></button>
+    <button type="button" id="chromeBtn" class="pick chrome-pick" aria-pressed="true" hidden></button>
     <span class="toolbar-end">
     <span id="ctxMeter" class="meter" role="meter" aria-valuemin="0" aria-valuemax="100" hidden></span>
     <button type="button" id="refineBtn" class="action" title="Refine: rewrite the prompt with the routed model (task-x.routing), else the active model. Ctrl+Z restores your text." aria-label="Refine prompt"><span class="codicon codicon-sparkle" aria-hidden="true"></span></button>

@@ -262,7 +262,13 @@ async function target(raw) {
 
 const HANDLERS = {
   async ping() {
-    return { version: VERSION, paused: state.paused };
+    const sharedIds = new Set(state.agentTabs);
+    const sharedTabs = sharedIds.size
+      ? (await chrome.tabs.query({}))
+          .filter((t) => sharedIds.has(t.id))
+          .map((t) => ({ id: String(t.id), title: t.title || '', url: t.url || '' }))
+      : [];
+    return { version: VERSION, paused: state.paused, sharedTabs };
   },
 
   async 'tabs.list'() {

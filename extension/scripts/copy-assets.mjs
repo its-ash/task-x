@@ -13,3 +13,4 @@ copy(join(root, 'node_modules', '@vscode', 'codicons', 'dist'), join(root, 'medi
 copy(join(root, 'node_modules', '@highlightjs', 'cdn-assets'), join(root, 'media', 'vendor'), ['highlight.min.js', 'LICENSE']);
 copy(join(root, 'node_modules', 'mermaid', 'dist'), join(root, 'media', 'vendor'), ['mermaid.min.js']);
 copyFileSync(join(root, 'node_modules', 'mermaid', 'LICENSE'), join(root, 'media', 'vendor', 'MERMAID-LICENSE'));
+copy(join(root, 'node_modules', 'elkjs', 'lib'), join(root, 'media', 'vendor'), ['elk.bundled.js']);

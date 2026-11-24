@@ -10,6 +10,7 @@ export interface FlowNode {
   shape: NodeShape;
   x: number;
   y: number;
+  w?: number;
   color?: string;
 }
 
@@ -27,10 +28,17 @@ export interface FlowGraph {
   edges: FlowEdge[];
 }
 
-const NODE_W = 180;
+const MIN_NODE_W = 168;
+const MAX_NODE_W = 280;
 const NODE_H = 56;
-const GAP_X = 72;
-const GAP_Y = 64;
+const GAP_X = 84;
+const GAP_Y = 72;
+
+export function nodeWidth(n: Pick<FlowNode, 'id' | 'label' | 'shape'>): number {
+  const len = (n.label || n.id).length;
+  const pad = n.shape === 'diamond' ? 76 : n.shape === 'subroutine' ? 56 : 44;
+  return Math.max(MIN_NODE_W, Math.min(MAX_NODE_W, Math.round(len * 7.4 + pad)));
+}
 
 const SHAPE_SYNTAX: Record<NodeShape, [string, string]> = {
   rect: ['[', ']'],
@@ -80,44 +88,47 @@ function parseNodeToken(token: string): { id: string; label?: string; shape?: No
 }
 
 export function layoutFlow(graph: FlowGraph): FlowGraph {
-  const nodes = graph.nodes.map((n) => ({ ...n }));
+  const nodes = graph.nodes.map((n) => ({ ...n, w: nodeWidth(n) }));
   const edges = graph.edges.map((e) => ({ ...e }));
   if (!nodes.length) return { direction: graph.direction, nodes, edges };
 
-  const indeg = new Map<string, number>();
-  const adj = new Map<string, string[]>();
-  for (const n of nodes) {
-    indeg.set(n.id, 0);
-    adj.set(n.id, []);
-  }
+  const nodeIds = new Set(nodes.map((n) => n.id));
+  const rawAdj = new Map<string, string[]>(nodes.map((n) => [n.id, []]));
+  const rawIndeg = new Map<string, number>(nodes.map((n) => [n.id, 0]));
   for (const e of edges) {
-    if (!adj.has(e.from) || !indeg.has(e.to) || e.from === e.to) continue;
-    adj.get(e.from)!.push(e.to);
-    indeg.set(e.to, (indeg.get(e.to) ?? 0) + 1);
+    if (!nodeIds.has(e.from) || !nodeIds.has(e.to) || e.from === e.to) continue;
+    rawAdj.get(e.from)!.push(e.to);
+    rawIndeg.set(e.to, (rawIndeg.get(e.to) ?? 0) + 1);
   }
 
-  const layer = new Map<string, number>();
-  const q: string[] = [];
-  for (const n of nodes) if ((indeg.get(n.id) ?? 0) === 0) q.push(n.id);
-  if (!q.length) q.push(nodes[0].id);
-
-  const visited = new Set<string>();
-  while (q.length) {
-    const id = q.shift()!;
-    if (visited.has(id)) continue;
-    visited.add(id);
-    const cur = layer.get(id) ?? 0;
-    layer.set(id, cur);
-    for (const next of adj.get(id) ?? []) {
-      const nextLayer = Math.max(layer.get(next) ?? 0, cur + 1);
-      layer.set(next, nextLayer);
-      const deg = (indeg.get(next) ?? 1) - 1;
-      indeg.set(next, deg);
-      if (deg <= 0 && !visited.has(next)) q.push(next);
+  // Step 1: Break cycles via DFS from sources (then lowest in-degree) so DAG edges always flow forward.
+  const state = new Map<string, 0 | 1 | 2>();
+  const dagEdges: { from: string; to: string }[] = [];
+  const dfs = (u: string) => {
+    state.set(u, 1);
+    for (const v of rawAdj.get(u) ?? []) {
+      const st = state.get(v) ?? 0;
+      if (st === 1) continue; // Back-edge (cycle): skip for layering.
+      dagEdges.push({ from: u, to: v });
+      if (st === 0) dfs(v);
     }
-  }
-  for (const n of nodes) {
-    if (!layer.has(n.id)) layer.set(n.id, 0);
+    state.set(u, 2);
+  };
+  const orderedSeeds = [...nodes].sort((a, b) => (rawIndeg.get(a.id) ?? 0) - (rawIndeg.get(b.id) ?? 0));
+  for (const n of orderedSeeds) if ((state.get(n.id) ?? 0) === 0) dfs(n.id);
+
+  // Step 2: Longest-path layering so every step appears strictly after all of its prerequisites.
+  const layer = new Map<string, number>(nodes.map((n) => [n.id, 0]));
+  for (let i = 0; i < nodes.length; i++) {
+    let changed = false;
+    for (const e of dagEdges) {
+      const next = (layer.get(e.from) ?? 0) + 1;
+      if (next > (layer.get(e.to) ?? 0)) {
+        layer.set(e.to, next);
+        changed = true;
+      }
+    }
+    if (!changed) break;
   }
 
   const groups = new Map<number, FlowNode[]>();
@@ -128,20 +139,64 @@ export function layoutFlow(graph: FlowGraph): FlowGraph {
     groups.set(l, list);
   }
 
+  const preds = new Map<string, string[]>(nodes.map((n) => [n.id, []]));
+  const succs = new Map<string, string[]>(nodes.map((n) => [n.id, []]));
+  for (const e of dagEdges) {
+    preds.get(e.to)!.push(e.from);
+    succs.get(e.from)!.push(e.to);
+  }
+
+  // Step 3: 4-pass bidirectional barycenter ordering to minimize edge crossings.
   const layers = [...groups.keys()].sort((a, b) => a - b);
+  const posInLayer = new Map<string, number>();
+  for (const l of layers) groups.get(l)!.forEach((n, i) => posInLayer.set(n.id, i));
+  const sortLayer = (l: number, neighbors: Map<string, string[]>) => {
+    const group = groups.get(l)!;
+    group.sort((a, b) => {
+      const avg = (id: string) => {
+        const ns = (neighbors.get(id) ?? []).filter((p) => posInLayer.has(p));
+        return ns.length ? ns.reduce((s, p) => s + posInLayer.get(p)!, 0) / ns.length : posInLayer.get(id)!;
+      };
+      return avg(a.id) - avg(b.id);
+    });
+    group.forEach((n, i) => posInLayer.set(n.id, i));
+  };
+  for (let pass = 0; pass < 4; pass++) {
+    for (let i = 1; i < layers.length; i++) sortLayer(layers[i], preds);
+    for (let i = layers.length - 2; i >= 0; i--) sortLayer(layers[i], succs);
+  }
+
+  // Step 4: Centered placement with breathable spacing.
   const horizontal = graph.direction === 'LR';
+  const layerSpans = layers.map((l) => {
+    const g = groups.get(l)!;
+    return horizontal
+      ? g.length * NODE_H + Math.max(0, g.length - 1) * GAP_Y
+      : g.reduce((s, n) => s + (n.w ?? MIN_NODE_W), 0) + Math.max(0, g.length - 1) * GAP_X;
+  });
+  const maxSpan = Math.max(0, ...layerSpans);
+  const layerDepths = layers.map((l) => {
+    const g = groups.get(l)!;
+    return horizontal ? Math.max(...g.map((n) => n.w ?? MIN_NODE_W)) : NODE_H;
+  });
+
+  let primary = 60;
   for (let li = 0; li < layers.length; li++) {
     const group = groups.get(layers[li])!;
-    for (let gi = 0; gi < group.length; gi++) {
-      const node = group[gi];
+    let cross = 60 + Math.round((maxSpan - layerSpans[li]) / 2);
+    for (const node of group) {
+      const w = node.w ?? MIN_NODE_W;
       if (horizontal) {
-        node.x = 60 + li * (NODE_W + GAP_X);
-        node.y = 60 + gi * (NODE_H + GAP_Y);
+        node.x = primary + Math.round((layerDepths[li] - w) / 2);
+        node.y = cross;
+        cross += NODE_H + GAP_Y;
       } else {
-        node.x = 60 + gi * (NODE_W + GAP_X);
-        node.y = 60 + li * (NODE_H + GAP_Y);
+        node.x = cross;
+        node.y = primary;
+        cross += w + GAP_X;
       }
     }
+    primary += layerDepths[li] + (horizontal ? GAP_X : GAP_Y);
   }
   return { direction: graph.direction, nodes, edges };
 }

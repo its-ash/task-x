@@ -432,20 +432,20 @@
     menu.append(row);
     return range;
   }
-  // ---------- Chrome chip: this tab's web work goes to the user's own Chrome ----------
-  // Green when Chrome mode is on and the task-x Chrome extension answers; grey otherwise.
-  chromeBtn.addEventListener('click', () => vscode.postMessage({ type: 'toggleChrome' }));
+  // ---------- Chrome chip: auto-appears only when Chrome tab(s) are shared via the extension ----------
   function renderChrome() {
-    const c = state.chrome || { on: false, connected: false, paused: false };
-    const look = !c.on ? 'off' : c.connected && !c.paused ? 'on' : 'offline';
-    chromeBtn.dataset.state = look;
-    chromeBtn.setAttribute('aria-pressed', String(!!c.on));
-    chromeBtn.replaceChildren(icon('globe'), el('span', 'text', 'Chrome'));
-    chromeBtn.title = look === 'on'
-      ? 'Chrome mode is on: this chat does web work in your Chrome. Every browser action asks you first. Click to turn it off.'
-      : look === 'offline'
-        ? `Chrome mode is on, but ${c.paused ? 'task-x is paused in Chrome (resume it from the task-x side panel)' : 'the task-x Chrome extension is not connected'}. Click to turn it off.`
-        : 'Chrome mode is off. Click to do this chat\'s web work in your own Chrome.';
+    const c = state.chrome || { on: false, connected: false, paused: false, sharedTabs: [] };
+    const tabs = Array.isArray(c.sharedTabs) ? c.sharedTabs : [];
+    const active = c.connected && !c.paused && tabs.length > 0;
+    chromeBtn.hidden = !active;
+    if (!active) return;
+    chromeBtn.dataset.state = 'on';
+    chromeBtn.setAttribute('aria-pressed', 'true');
+    const first = tabs[0];
+    const shortTitle = (first.title || first.url || 'Chrome tab').slice(0, 22);
+    const label = tabs.length === 1 ? shortTitle : `${tabs.length} Chrome tabs`;
+    chromeBtn.replaceChildren(icon('globe'), el('span', 'text', label));
+    chromeBtn.title = `Shared Chrome tab${tabs.length > 1 ? 's' : ''} (task-x extension):\n${tabs.map((t) => `${t.title || '(untitled)'} — ${t.url}`).join('\n')}`;
     chromeBtn.setAttribute('aria-label', chromeBtn.title);
   }
   effortBtn.setAttribute('aria-haspopup', 'dialog');

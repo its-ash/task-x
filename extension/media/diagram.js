@@ -2,9 +2,19 @@
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
   const NS = 'http://www.w3.org/2000/svg';
+  const MIN_NODE_W = 168;
+  const MAX_NODE_W = 280;
   const NODE_W = 168;
-  const NODE_H = 52;
+  const NODE_H = 56;
+  const GAP_X = 84;
+  const GAP_Y = 72;
   const GRID = 12;
+
+  function nodeW(n) {
+    const len = String(n?.label || n?.id || '').length;
+    const pad = n?.shape === 'diamond' ? 76 : n?.shape === 'subroutine' ? 56 : 44;
+    return Math.max(MIN_NODE_W, Math.min(MAX_NODE_W, Math.round(len * 7.4 + pad)));
+  }
 
   const svg = $('svg');
   const viewport = $('viewport');
@@ -167,46 +177,199 @@
     return autoLayout({ direction, nodes: [...nmap.values()], edges });
   }
 
+  const elk = typeof window.ELK === 'function' ? new window.ELK() : null;
+
+  async function elkLayout(g) {
+    if (!elk || !g.nodes.length) return autoLayout(g);
+    const nodes = g.nodes.map((n) => ({ ...n, w: nodeW(n) }));
+    const nodeIds = new Set(nodes.map((n) => n.id));
+    const edges = g.edges.map((e) => ({ ...e, points: null }));
+    const validEdges = edges.filter((e) => nodeIds.has(e.from) && nodeIds.has(e.to) && e.from !== e.to);
+    try {
+      const res = await elk.layout({
+        id: 'root',
+        layoutOptions: {
+          'elk.algorithm': 'layered',
+          'elk.direction': g.direction === 'TD' ? 'DOWN' : 'RIGHT',
+          'elk.edgeRouting': 'ORTHOGONAL',
+          'elk.spacing.nodeNode': '48',
+          'elk.layered.spacing.nodeNodeBetweenLayers': '76',
+          'elk.layered.spacing.edgeNodeBetweenLayers': '32',
+          'elk.layered.spacing.edgeEdgeBetweenLayers': '22',
+          'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
+          'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
+          'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
+          'elk.padding': '[top=48,left=48,bottom=48,right=48]',
+        },
+        children: nodes.map((n) => ({ id: n.id, width: nodeW(n), height: NODE_H })),
+        edges: validEdges.map((e) => ({
+          id: e.id,
+          sources: [e.from],
+          targets: [e.to],
+          ...(e.label ? { labels: [{ text: e.label, width: Math.min(200, Math.max(36, e.label.length * 6.8 + 16)), height: 22 }] } : {}),
+        })),
+      });
+      const posMap = new Map((res.children || []).map((c) => [c.id, c]));
+      nodes.forEach((n) => {
+        const c = posMap.get(n.id);
+        if (c && Number.isFinite(c.x) && Number.isFinite(c.y)) {
+          n.x = Math.round(c.x);
+          n.y = Math.round(c.y);
+        }
+      });
+      const edgeMap = new Map((res.edges || []).map((e) => [e.id, e]));
+      edges.forEach((e) => {
+        const re = edgeMap.get(e.id);
+        const sec = re?.sections?.[0];
+        if (sec?.startPoint && sec?.endPoint) {
+          e.points = [sec.startPoint, ...(sec.bendPoints || []), sec.endPoint].map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }));
+        }
+      });
+      return { direction: g.direction, nodes, edges };
+    } catch {
+      return autoLayout(g);
+    }
+  }
+
+  function roundedOrthoPath(pts) {
+    if (!pts || pts.length < 2) return '';
+    if (pts.length === 2) return `M ${pts[0].x} ${pts[0].y} L ${pts[1].x} ${pts[1].y}`;
+    let d = `M ${pts[0].x} ${pts[0].y}`;
+    for (let i = 1; i < pts.length - 1; i++) {
+      const p0 = pts[i - 1], p1 = pts[i], p2 = pts[i + 1];
+      const d1 = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+      const d2 = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const r = Math.min(8, d1 / 2, d2 / 2);
+      if (r < 1) { d += ` L ${p1.x} ${p1.y}`; continue; }
+      const x1 = p1.x - ((p1.x - p0.x) / d1) * r;
+      const y1 = p1.y - ((p1.y - p0.y) / d1) * r;
+      const x2 = p1.x + ((p2.x - p1.x) / d2) * r;
+      const y2 = p1.y + ((p2.y - p1.y) / d2) * r;
+      d += ` L ${x1.toFixed(1)} ${y1.toFixed(1)} Q ${p1.x} ${p1.y} ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+    }
+    const last = pts[pts.length - 1];
+    return `${d} L ${last.x} ${last.y}`;
+  }
+
+  function edgeLabelPoint(pts, p1, p2) {
+    if (pts && pts.length >= 2) {
+      let bestLen = -1, mx = (pts[0].x + pts[1].x) / 2, my = (pts[0].y + pts[1].y) / 2;
+      for (let i = 0; i < pts.length - 1; i++) {
+        const len = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+        if (len > bestLen) {
+          bestLen = len;
+          mx = (pts[i].x + pts[i + 1].x) / 2;
+          my = (pts[i].y + pts[i + 1].y) / 2;
+        }
+      }
+      return { x: mx, y: my };
+    }
+    return { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+  }
+
   function autoLayout(g) {
-    const nodes = g.nodes.map((n) => ({ ...n }));
+    const nodes = g.nodes.map((n) => ({ ...n, w: nodeW(n) }));
     const edges = g.edges.map((e) => ({ ...e }));
     if (!nodes.length) return { direction: g.direction, nodes, edges };
-    const indeg = new Map(nodes.map((n) => [n.id, 0]));
-    const adj = new Map(nodes.map((n) => [n.id, []]));
+
+    const ids = new Set(nodes.map((n) => n.id));
+    const rawAdj = new Map(nodes.map((n) => [n.id, []]));
+    const rawIndeg = new Map(nodes.map((n) => [n.id, 0]));
     for (const e of edges) {
-      if (!adj.has(e.from) || !indeg.has(e.to) || e.from === e.to) continue;
-      adj.get(e.from).push(e.to);
-      indeg.set(e.to, indeg.get(e.to) + 1);
+      if (!ids.has(e.from) || !ids.has(e.to) || e.from === e.to) continue;
+      rawAdj.get(e.from).push(e.to);
+      rawIndeg.set(e.to, rawIndeg.get(e.to) + 1);
     }
-    const layer = new Map();
-    const q = nodes.filter((n) => indeg.get(n.id) === 0).map((n) => n.id);
-    if (!q.length) q.push(nodes[0].id);
-    const seen = new Set();
-    while (q.length) {
-      const id = q.shift();
-      if (seen.has(id)) continue;
-      seen.add(id);
-      const cur = layer.get(id) ?? 0;
-      layer.set(id, cur);
-      for (const nx of adj.get(id)) {
-        layer.set(nx, Math.max(layer.get(nx) ?? 0, cur + 1));
-        const d = indeg.get(nx) - 1;
-        indeg.set(nx, d);
-        if (d <= 0 && !seen.has(nx)) q.push(nx);
+
+    // Break cycles via DFS from sources (then lowest in-degree) so step-by-step edges flow forward.
+    const visitState = new Map();
+    const dagEdges = [];
+    const dfs = (u) => {
+      visitState.set(u, 1);
+      for (const v of rawAdj.get(u)) {
+        const st = visitState.get(v) ?? 0;
+        if (st === 1) continue;
+        dagEdges.push({ from: u, to: v });
+        if (st === 0) dfs(v);
       }
+      visitState.set(u, 2);
+    };
+    const seeds = [...nodes].sort((a, b) => rawIndeg.get(a.id) - rawIndeg.get(b.id));
+    for (const n of seeds) if ((visitState.get(n.id) ?? 0) === 0) dfs(n.id);
+
+    // Longest-path layering so every step appears strictly after all prerequisites.
+    const layer = new Map(nodes.map((n) => [n.id, 0]));
+    for (let i = 0; i < nodes.length; i++) {
+      let changed = false;
+      for (const e of dagEdges) {
+        const next = layer.get(e.from) + 1;
+        if (next > layer.get(e.to)) {
+          layer.set(e.to, next);
+          changed = true;
+        }
+      }
+      if (!changed) break;
     }
+
     const groups = new Map();
     for (const n of nodes) {
       const l = layer.get(n.id) ?? 0;
       if (!groups.has(l)) groups.set(l, []);
       groups.get(l).push(n);
     }
-    const horiz = g.direction === 'LR';
-    [...groups.keys()].sort((a, b) => a - b).forEach((l, li) => {
-      groups.get(l).forEach((n, gi) => {
-        n.x = horiz ? 60 + li * (NODE_W + 76) : 60 + gi * (NODE_W + 64);
-        n.y = horiz ? 60 + gi * (NODE_H + 56) : 60 + li * (NODE_H + 68);
+
+    const preds = new Map(nodes.map((n) => [n.id, []]));
+    const succs = new Map(nodes.map((n) => [n.id, []]));
+    for (const e of dagEdges) {
+      preds.get(e.to).push(e.from);
+      succs.get(e.from).push(e.to);
+    }
+
+    // 4-pass bidirectional barycenter ordering to minimize edge crossings.
+    const layers = [...groups.keys()].sort((a, b) => a - b);
+    const posInLayer = new Map();
+    for (const l of layers) groups.get(l).forEach((n, i) => posInLayer.set(n.id, i));
+    const sortLayer = (l, neighbors) => {
+      const grp = groups.get(l);
+      grp.sort((a, b) => {
+        const avg = (id) => {
+          const ns = neighbors.get(id).filter((p) => posInLayer.has(p));
+          return ns.length ? ns.reduce((s, p) => s + posInLayer.get(p), 0) / ns.length : posInLayer.get(id);
+        };
+        return avg(a.id) - avg(b.id);
       });
+      grp.forEach((n, i) => posInLayer.set(n.id, i));
+    };
+    for (let pass = 0; pass < 4; pass++) {
+      for (let i = 1; i < layers.length; i++) sortLayer(layers[i], preds);
+      for (let i = layers.length - 2; i >= 0; i--) sortLayer(layers[i], succs);
+    }
+
+    const horiz = g.direction === 'LR';
+    const spans = layers.map((l) => {
+      const grp = groups.get(l);
+      return horiz
+        ? grp.length * NODE_H + Math.max(0, grp.length - 1) * GAP_Y
+        : grp.reduce((s, n) => s + nodeW(n), 0) + Math.max(0, grp.length - 1) * GAP_X;
+    });
+    const maxSpan = Math.max(0, ...spans);
+    const depths = layers.map((l) => (horiz ? Math.max(...groups.get(l).map(nodeW)) : NODE_H));
+    let primary = 60;
+    layers.forEach((l, li) => {
+      let cross = 60 + Math.round((maxSpan - spans[li]) / 2);
+      groups.get(l).forEach((n) => {
+        const w = nodeW(n);
+        if (horiz) {
+          n.x = primary + Math.round((depths[li] - w) / 2);
+          n.y = cross;
+          cross += NODE_H + GAP_Y;
+        } else {
+          n.x = cross;
+          n.y = primary;
+          cross += w + GAP_X;
+        }
+      });
+      primary += depths[li] + (horiz ? GAP_X : GAP_Y);
     });
     return { direction: g.direction, nodes, edges };
   }
@@ -228,7 +391,7 @@
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const n of graph.nodes) {
       minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
-      maxX = Math.max(maxX, n.x + NODE_W); maxY = Math.max(maxY, n.y + NODE_H);
+      maxX = Math.max(maxX, n.x + nodeW(n)); maxY = Math.max(maxY, n.y + NODE_H);
     }
     const pad = 48;
     const w = Math.max(1, maxX - minX + pad * 2);
@@ -242,32 +405,38 @@
     applyTransform();
   }
 
-  function nodeCenter(n) { return { x: n.x + NODE_W / 2, y: n.y + NODE_H / 2 }; }
+  function nodeCenter(n) { return { x: n.x + nodeW(n) / 2, y: n.y + NODE_H / 2 }; }
   function edgeAnchors(a, b) {
     const ca = nodeCenter(a), cb = nodeCenter(b);
-    const dx = cb.x - ca.x, dy = cb.y - ca.y;
-    if (Math.abs(dx) >= Math.abs(dy)) {
-      return dx >= 0
-        ? [{ x: a.x + NODE_W, y: ca.y }, { x: b.x, y: cb.y }, 'h']
-        : [{ x: a.x, y: ca.y }, { x: b.x + NODE_W, y: cb.y }, 'h'];
+    const wa = nodeW(a), wb = nodeW(b);
+    if (graph.direction === 'LR') {
+      if (cb.x >= ca.x - 12) return [{ x: a.x + wa, y: ca.y }, { x: b.x, y: cb.y }, 'h', false];
+      return [{ x: ca.x, y: a.y }, { x: cb.x, y: b.y }, 'h-back', true];
     }
-    return dy >= 0
-      ? [{ x: ca.x, y: a.y + NODE_H }, { x: cb.x, y: b.y }, 'v']
-      : [{ x: ca.x, y: a.y }, { x: cb.x, y: b.y + NODE_H }, 'v'];
+    if (cb.y >= ca.y - 12) return [{ x: ca.x, y: a.y + NODE_H }, { x: cb.x, y: b.y }, 'v', false];
+    return [{ x: a.x + wa, y: ca.y }, { x: b.x + wb, y: cb.y }, 'v-back', true];
   }
   function curvePath(p1, p2, axis) {
     if (axis === 'h') {
-      const c = Math.max(40, Math.abs(p2.x - p1.x) * 0.45);
-      const dir = p2.x >= p1.x ? 1 : -1;
-      return `M ${p1.x} ${p1.y} C ${p1.x + c * dir} ${p1.y}, ${p2.x - c * dir} ${p2.y}, ${p2.x} ${p2.y}`;
+      const c = Math.max(44, Math.abs(p2.x - p1.x) * 0.45);
+      return `M ${p1.x} ${p1.y} C ${p1.x + c} ${p1.y}, ${p2.x - c} ${p2.y}, ${p2.x} ${p2.y}`;
     }
-    const c = Math.max(36, Math.abs(p2.y - p1.y) * 0.45);
-    const dir = p2.y >= p1.y ? 1 : -1;
-    return `M ${p1.x} ${p1.y} C ${p1.x} ${p1.y + c * dir}, ${p2.x} ${p2.y - c * dir}, ${p2.x} ${p2.y}`;
+    if (axis === 'v') {
+      const c = Math.max(38, Math.abs(p2.y - p1.y) * 0.45);
+      return `M ${p1.x} ${p1.y} C ${p1.x} ${p1.y + c}, ${p2.x} ${p2.y - c}, ${p2.x} ${p2.y}`;
+    }
+    if (axis === 'h-back') {
+      const lift = Math.max(48, Math.min(110, Math.abs(p1.x - p2.x) * 0.25));
+      const top = Math.min(p1.y, p2.y) - lift;
+      return `M ${p1.x} ${p1.y} C ${p1.x} ${top}, ${p2.x} ${top}, ${p2.x} ${p2.y}`;
+    }
+    const push = Math.max(54, Math.min(120, Math.abs(p1.y - p2.y) * 0.25));
+    const right = Math.max(p1.x, p2.x) + push;
+    return `M ${p1.x} ${p1.y} C ${right} ${p1.y}, ${right} ${p2.y}, ${p2.x} ${p2.y}`;
   }
 
   function shapeElement(n) {
-    const w = NODE_W, h = NODE_H;
+    const w = nodeW(n), h = NODE_H;
     let el;
     switch (n.shape) {
       case 'round':
@@ -307,13 +476,13 @@
       const isSel = sel?.kind === 'edge' && sel.id === e.id;
       const g = svgEl('g', { class: `flow-edge ${e.style}${isSel ? ' selected' : ''}`, 'data-id': e.id });
       const [p1, p2, axis] = edgeAnchors(a, b);
-      const d = curvePath(p1, p2, axis);
+      const d = e.points?.length >= 2 ? roundedOrthoPath(e.points) : curvePath(p1, p2, axis);
       const hit = svgEl('path', { class: 'edge-hit', d });
       const path = svgEl('path', { class: 'edge-path', d });
       if (e.style !== 'open') path.setAttribute('marker-end', isSel ? 'url(#arrow-sel)' : 'url(#arrow)');
       g.append(hit, path);
 
-      const mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+      const { x: mx, y: my } = edgeLabelPoint(e.points, p1, p2);
       if (e.label) {
         const tw = Math.min(200, Math.max(36, e.label.length * 6.8 + 16));
         const bg = svgEl('rect', { class: 'edge-label-bg', x: mx - tw / 2, y: my - 11, width: tw, height: 22 });
@@ -329,18 +498,33 @@
 
     for (const n of graph.nodes) {
       const isSel = sel?.kind === 'node' && sel.id === n.id;
+      const w = nodeW(n);
       const g = svgEl('g', { class: `flow-node${isSel ? ' selected' : ''}`, transform: `translate(${n.x} ${n.y})`, 'data-id': n.id });
       g.append(shapeElement(n));
-      const label = svgEl('text', { class: 'node-text', x: NODE_W / 2, y: NODE_H / 2 });
-      const text = n.label || n.id;
-      label.textContent = text.length > 22 ? `${text.slice(0, 21)}…` : text;
+      const text = String(n.label || n.id);
+      const maxChars = Math.max(16, Math.floor((w - 28) / 7.2));
+      const label = svgEl('text', { class: 'node-text', x: w / 2, y: NODE_H / 2 });
+      if (text.length <= maxChars) {
+        label.textContent = text;
+      } else {
+        const cut = text.lastIndexOf(' ', maxChars);
+        const split = cut > 8 ? cut : maxChars;
+        const l1 = text.slice(0, split).trim();
+        let l2 = text.slice(split).trim();
+        if (l2.length > maxChars) l2 = `${l2.slice(0, maxChars - 1)}…`;
+        const t1 = svgEl('tspan', { x: w / 2, dy: '-0.42em' });
+        t1.textContent = l1;
+        const t2 = svgEl('tspan', { x: w / 2, dy: '1.2em' });
+        t2.textContent = l2;
+        label.append(t1, t2);
+      }
       g.append(label);
 
       const ports = [
-        { cx: NODE_W, cy: NODE_H / 2 },
+        { cx: w, cy: NODE_H / 2 },
         { cx: 0, cy: NODE_H / 2 },
-        { cx: NODE_W / 2, cy: NODE_H },
-        { cx: NODE_W / 2, cy: 0 },
+        { cx: w / 2, cy: NODE_H },
+        { cx: w / 2, cy: 0 },
       ];
       for (const pt of ports) {
         const c = svgEl('circle', { class: 'port', cx: pt.cx, cy: pt.cy, r: 5 });
@@ -379,20 +563,23 @@
   }
 
   function syncInspector() {
-    const empty = $('inspEmpty'), nForm = $('inspNode'), eForm = $('inspEdge');
+    const insp = $('inspector'), title = $('inspTitle'), empty = $('inspEmpty'), nForm = $('inspNode'), eForm = $('inspEdge');
+    insp.hidden = !sel;
     empty.hidden = !!sel;
     nForm.hidden = sel?.kind !== 'node';
     eForm.hidden = sel?.kind !== 'edge';
     if (sel?.kind === 'node') {
       const n = graph.nodes.find((x) => x.id === sel.id);
-      if (!n) return;
+      if (!n) { insp.hidden = true; return; }
+      title.textContent = 'Edit Card';
       $('nodeLabel').value = n.label;
       $('nodeId').value = n.id;
       $('nodeShape').value = n.shape;
       $('nodeColors').querySelectorAll('.swatch').forEach((s) => s.classList.toggle('active', (s.dataset.color || '') === (n.color || '')));
     } else if (sel?.kind === 'edge') {
       const e = graph.edges.find((x) => x.id === sel.id);
-      if (!e) return;
+      if (!e) { insp.hidden = true; return; }
+      title.textContent = 'Edit Connection';
       $('edgeLabel').value = e.label;
       $('edgeStyle').value = e.style;
     }
@@ -482,6 +669,7 @@
       const w = screenToWorld(e.clientX, e.clientY);
       n.x = snap(w.x - drag.dx);
       n.y = snap(w.y - drag.dy);
+      for (const ed of graph.edges) if (ed.from === n.id || ed.to === n.id) ed.points = null;
       render();
     } else if (drag.mode === 'connect') {
       const w = screenToWorld(e.clientX, e.clientY);
@@ -646,15 +834,50 @@
     if (prompt) vscode.postMessage({ type: 'askAgent', prompt });
     $('aiDialog').close();
   });
-  $('addNodeBtn').addEventListener('click', () => addNode('rect'));
-  $('layoutBtn').addEventListener('click', () => { pushUndo(); graph = autoLayout(graph); render(); fitToView(); });
-  $('dirBtn').addEventListener('click', () => {
+  $('closePaletteBtn').addEventListener('click', () => {
+    $('palette').hidden = true;
+    $('fabAdd').hidden = false;
+  });
+  $('fabAdd').addEventListener('click', () => {
+    $('palette').hidden = false;
+    $('fabAdd').hidden = true;
+  });
+  $('closeInspBtn').addEventListener('click', () => { sel = null; render(); });
+  $('inspDelBtn').addEventListener('click', deleteSelected);
+  $('addNodeBtn').addEventListener('click', () => {
+    $('palette').hidden = false;
+    $('fabAdd').hidden = true;
+    addNode('rect');
+  });
+  $('layoutBtn').addEventListener('click', async () => {
+    pushUndo();
+    graph = await elkLayout(graph);
+    render();
+    fitToView();
+    setStatus('Auto-arranged with ELK');
+  });
+  $('dirBtn').addEventListener('click', async () => {
     pushUndo();
     graph.direction = graph.direction === 'LR' ? 'TD' : 'LR';
-    graph = autoLayout(graph);
+    graph = await elkLayout(graph);
     render();
     fitToView();
   });
+  const defaultTheme = () => (document.body.classList.contains('vscode-light') || document.body.classList.contains('vscode-high-contrast-light') ? 'light' : 'dark');
+  const applyTheme = (name) => {
+    const t = name === 'light' ? 'light' : 'dark';
+    document.body.dataset.theme = t;
+    document.querySelectorAll('.theme-opt').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.theme === t)));
+    vscode.setState({ ...(vscode.getState() || {}), theme: t });
+  };
+  document.querySelectorAll('.theme-opt').forEach((b) => {
+    b.addEventListener('click', () => {
+      applyTheme(b.dataset.theme);
+      setStatus(`Theme: ${b.dataset.theme === 'light' ? 'Light' : 'Dark'}`);
+    });
+  });
+  const savedTheme = vscode.getState()?.theme;
+  applyTheme(savedTheme === 'light' || savedTheme === 'dark' ? savedTheme : defaultTheme());
   $('undoBtn').addEventListener('click', () => {
     if (!undoStack.length) return;
     redoStack.push(cloneGraph());
@@ -679,9 +902,9 @@
     if (!d.hidden) mermaidText.value = toMermaid(graph);
   });
   $('closeCodeBtn').addEventListener('click', () => { $('codeDrawer').hidden = true; });
-  $('applyCodeBtn').addEventListener('click', () => {
+  $('applyCodeBtn').addEventListener('click', async () => {
     pushUndo();
-    graph = parseMermaidLocal(mermaidText.value);
+    graph = await elkLayout(parseMermaidLocal(mermaidText.value));
     sel = null;
     render();
     fitToView();
@@ -689,6 +912,7 @@
   });
   $('copyBtn').addEventListener('click', () => vscode.postMessage({ type: 'copyText', text: toMermaid(graph) }));
   $('chatBtn').addEventListener('click', () => vscode.postMessage({ type: 'sendToChat', code: toMermaid(graph) }));
+  $('openBtn').addEventListener('click', () => vscode.postMessage({ type: 'openMermaid' }));
   $('saveBtn').addEventListener('click', () => vscode.postMessage({ type: 'saveMermaid', code: toMermaid(graph) }));
   $('svgBtn').addEventListener('click', () => {
     const clone = svg.cloneNode(true);
@@ -709,10 +933,10 @@
     }
   });
 
-  window.addEventListener('message', (ev) => {
+  window.addEventListener('message', async (ev) => {
     const m = ev.data;
     if (m.type === 'load' && m.graph) {
-      graph = m.graph;
+      graph = await elkLayout(m.graph);
       undoStack = [];
       redoStack = [];
       sel = null;

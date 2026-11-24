@@ -296,11 +296,18 @@ export interface EditsScope {
  * take `chrome: true` (Chrome mode) to do the task's web work in that Chrome, asking before every
  * browser call.
  */
+export interface SharedChromeTab {
+  id: string;
+  title: string;
+  url: string;
+}
+
 export interface ChromeStatus {
   connected: boolean;
   paused: boolean;
   version?: string;
   error?: string;
+  sharedTabs?: SharedChromeTab[];
 }
 
 /**

@@ -11,6 +11,7 @@ type Inbound =
   | { type: 'ready' }
   | { type: 'autoFlow'; level?: 'module' | 'file'; direction?: FlowDirection; focus?: string }
   | { type: 'askAgent'; prompt: string }
+  | { type: 'openMermaid' }
   | { type: 'saveMermaid'; code: string }
   | { type: 'exportSvg'; svg: string }
   | { type: 'sendToChat'; code: string }
@@ -26,6 +27,7 @@ const DEFAULT_FLOW = `flowchart LR
 export class DiagramPanel {
   private static current: DiagramPanel | undefined;
   private pendingCode: string | undefined;
+  private currentFile: vscode.Uri | undefined;
 
   private constructor(
     private readonly panel: vscode.WebviewPanel,
@@ -67,6 +69,20 @@ export class DiagramPanel {
   loadCode(code: string): void {
     const graph = parseMermaid(code);
     this.post({ type: 'load', graph, code: serializeMermaid(graph) });
+  }
+
+  private async openFile(uri: vscode.Uri): Promise<void> {
+    try {
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      let text = Buffer.from(bytes).toString('utf8');
+      const fenced = /```(?:mermaid|mmd)\s*\r?\n([\s\S]*?)```/i.exec(text);
+      if (fenced) text = fenced[1];
+      this.currentFile = uri;
+      this.loadCode(text);
+      this.post({ type: 'status', text: `Opened ${vscode.workspace.asRelativePath(uri)}`, busy: false });
+    } catch (e) {
+      this.post({ type: 'status', text: `Could not open file: ${describeError(e)}`, busy: false });
+    }
   }
 
   private post(msg: object): void {
@@ -136,10 +152,20 @@ export class DiagramPanel {
           this.post({ type: 'status', text: 'Copied to clipboard', busy: false });
         }
         break;
+      case 'openMermaid': {
+        const picked = await vscode.window.showOpenDialog({
+          canSelectMany: false,
+          filters: { Mermaid: ['mmd', 'mermaid', 'md'] },
+          openLabel: 'Open Flow Diagram',
+        });
+        if (!picked?.[0]) return;
+        await this.openFile(picked[0]);
+        break;
+      }
       case 'dropFiles': {
         const raw = Array.isArray(m.items) ? m.items.filter((s): s is string => typeof s === 'string' && !!s.trim()) : [];
         if (!raw.length) return;
-        const files = raw.map((entry) => {
+        const toUri = (entry: string): { uri: vscode.Uri; fsPath: string } => {
           const s = entry.trim();
           let fsPath = s;
           if (/^file:\/\//i.test(s) || /^[a-z][a-z0-9+.-]*:\/\//i.test(s)) {
@@ -150,7 +176,17 @@ export class DiagramPanel {
               // Keep raw string.
             }
           }
-          const uri = vscode.Uri.file(fsPath);
+          return { uri: vscode.Uri.file(fsPath), fsPath };
+        };
+        if (raw.length === 1) {
+          const { uri, fsPath } = toUri(raw[0]);
+          if (/\.(?:mmd|mermaid)$/i.test(fsPath)) {
+            await this.openFile(uri);
+            return;
+          }
+        }
+        const files = raw.map((entry) => {
+          const { uri, fsPath } = toUri(entry);
           const rel = vscode.workspace.asRelativePath(uri, false);
           const displayPath = rel && !path.isAbsolute(rel) ? rel : fsPath;
           return { path: displayPath, name: path.basename(fsPath) || displayPath };
@@ -161,13 +197,14 @@ export class DiagramPanel {
       case 'saveMermaid': {
         if (typeof m.code !== 'string') return;
         const root = WorkspaceSync.root();
-        const defaultUri = root ? vscode.Uri.joinPath(vscode.Uri.file(root), 'flow.mmd') : undefined;
+        const defaultUri = this.currentFile ?? (root ? vscode.Uri.joinPath(vscode.Uri.file(root), 'flow.mmd') : undefined);
         const uri = await vscode.window.showSaveDialog({
           defaultUri,
           filters: { Mermaid: ['mmd', 'mermaid'], Markdown: ['md'] },
           saveLabel: 'Save Flow Diagram',
         });
         if (!uri) return;
+        this.currentFile = uri;
         const content = uri.fsPath.endsWith('.md') ? `\`\`\`mermaid\n${m.code.trim()}\n\`\`\`\n` : `${m.code.trim()}\n`;
         await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
         this.post({ type: 'status', text: `Saved ${vscode.workspace.asRelativePath(uri)}`, busy: false });
@@ -217,9 +254,13 @@ export class DiagramPanel {
   </div>
   <span class="sep"></span>
   <div class="bar-group">
-    <button type="button" id="addNodeBtn" class="btn secondary" title="Add new node (or double-click canvas)"><span class="codicon codicon-add" aria-hidden="true"></span><span>Node</span></button>
-    <button type="button" id="layoutBtn" class="btn icon" title="Auto-layout nodes"><span class="codicon codicon-layout" aria-hidden="true"></span></button>
-    <button type="button" id="dirBtn" class="btn secondary" title="Toggle direction (LR / TD)">LR</button>
+    <button type="button" id="addNodeBtn" class="btn secondary" title="Add new card (or double-click canvas)"><span class="codicon codicon-add" aria-hidden="true"></span><span>Card</span></button>
+    <button type="button" id="layoutBtn" class="btn icon" title="Auto-arrange step-by-step layout"><span class="codicon codicon-layout" aria-hidden="true"></span></button>
+    <button type="button" id="dirBtn" class="btn secondary" title="Toggle flow direction (LR / TD)">LR</button>
+    <div class="theme-switch" role="group" aria-label="Theme">
+      <button type="button" class="theme-opt" data-theme="dark" aria-pressed="true"><span class="codicon codicon-color-mode" aria-hidden="true"></span><span>Dark</span></button>
+      <button type="button" class="theme-opt" data-theme="light" aria-pressed="false"><span>Light</span></button>
+    </div>
     <button type="button" id="undoBtn" class="btn icon" title="Undo (Cmd/Ctrl+Z)" disabled><span class="codicon codicon-discard" aria-hidden="true"></span></button>
     <button type="button" id="redoBtn" class="btn icon" title="Redo (Cmd/Ctrl+Shift+Z)" disabled><span class="codicon codicon-redo" aria-hidden="true"></span></button>
     <button type="button" id="delBtn" class="btn icon" title="Delete selected (Del)" disabled><span class="codicon codicon-trash" aria-hidden="true"></span></button>
@@ -234,24 +275,13 @@ export class DiagramPanel {
     <button type="button" id="codeToggleBtn" class="btn secondary" title="Toggle Mermaid code panel"><span class="codicon codicon-code" aria-hidden="true"></span><span>Mermaid</span></button>
     <button type="button" id="copyBtn" class="btn icon" title="Copy Mermaid code"><span class="codicon codicon-copy" aria-hidden="true"></span></button>
     <button type="button" id="chatBtn" class="btn icon" title="Insert Mermaid into Chat"><span class="codicon codicon-send" aria-hidden="true"></span></button>
+    <button type="button" id="openBtn" class="btn icon" title="Open .mmd / .mermaid file"><span class="codicon codicon-folder-opened" aria-hidden="true"></span></button>
     <button type="button" id="saveBtn" class="btn icon" title="Save .mmd / .md file"><span class="codicon codicon-save" aria-hidden="true"></span></button>
     <button type="button" id="svgBtn" class="btn icon" title="Export SVG"><span class="codicon codicon-export" aria-hidden="true"></span></button>
   </div>
 </header>
 
 <div class="workspace">
-  <aside class="palette" aria-label="Node shapes">
-    <div class="pane-title">Drag or Click</div>
-    <button type="button" class="pal-item" draggable="true" data-shape="rect" title="Process rectangle"><span class="pal-glyph rect"></span><span>Process</span></button>
-    <button type="button" class="pal-item" draggable="true" data-shape="round" title="Rounded step"><span class="pal-glyph round"></span><span>Step</span></button>
-    <button type="button" class="pal-item" draggable="true" data-shape="stadium" title="Start / End"><span class="pal-glyph stadium"></span><span>Start / End</span></button>
-    <button type="button" class="pal-item" draggable="true" data-shape="diamond" title="Decision branch"><span class="pal-glyph diamond"></span><span>Decision</span></button>
-    <button type="button" class="pal-item" draggable="true" data-shape="cylinder" title="Database / Store"><span class="pal-glyph cylinder"></span><span>Database</span></button>
-    <button type="button" class="pal-item" draggable="true" data-shape="subroutine" title="Subroutine / Module"><span class="pal-glyph subroutine"></span><span>Module</span></button>
-    <button type="button" class="pal-item" draggable="true" data-shape="trapezoid" title="Input / Output"><span class="pal-glyph trapezoid"></span><span>I/O</span></button>
-    <div class="pal-hint">Drag a node's blue dot onto another node to connect. Double-click to edit text. Drop any file onto the canvas to create a step with its path.</div>
-  </aside>
-
   <main class="canvas-wrap" id="canvasWrap">
     <svg id="svg" class="canvas" xmlns="http://www.w3.org/2000/svg">
       <defs>
@@ -274,48 +304,71 @@ export class DiagramPanel {
     </svg>
     <input id="inlineEdit" class="inline-edit" type="text" hidden aria-label="Edit text">
     <div id="statusBar" class="status-bar" role="status" aria-live="polite"></div>
-  </main>
 
-  <aside class="inspector" id="inspector" aria-label="Properties">
-    <div class="pane-title">Inspector</div>
-    <div id="inspEmpty" class="insp-empty">Select a node or edge to edit its text, shape, style, or color.</div>
-    <form id="inspNode" class="insp-form" hidden>
-      <label class="field"><span>Label</span><input id="nodeLabel" type="text" placeholder="Node text"></label>
-      <label class="field"><span>ID</span><input id="nodeId" type="text" placeholder="Node_1"></label>
-      <label class="field"><span>Shape</span>
-        <select id="nodeShape">
-          <option value="rect">Process [ ]</option>
-          <option value="round">Step ( )</option>
-          <option value="stadium">Start / End ([ ])</option>
-          <option value="diamond">Decision { }</option>
-          <option value="cylinder">Database [( )]</option>
-          <option value="subroutine">Module [[ ]]</option>
-          <option value="trapezoid">I/O [/ /]</option>
-        </select>
-      </label>
-      <label class="field"><span>Accent</span>
-        <div class="swatches" id="nodeColors">
-          <button type="button" class="swatch none" data-color="" title="Default"></button>
-          <button type="button" class="swatch" data-color="#4ea8ff" style="--c:#4ea8ff" title="Blue"></button>
-          <button type="button" class="swatch" data-color="#76daa1" style="--c:#76daa1" title="Green"></button>
-          <button type="button" class="swatch" data-color="#edc21f" style="--c:#edc21f" title="Amber"></button>
-          <button type="button" class="swatch" data-color="#ff8a65" style="--c:#ff8a65" title="Orange"></button>
-          <button type="button" class="swatch" data-color="#d291ff" style="--c:#d291ff" title="Purple"></button>
-        </div>
-      </label>
-    </form>
-    <form id="inspEdge" class="insp-form" hidden>
-      <label class="field"><span>Edge Label</span><input id="edgeLabel" type="text" placeholder="Optional label"></label>
-      <label class="field"><span>Line Style</span>
-        <select id="edgeStyle">
-          <option value="solid">Solid (--&gt;)</option>
-          <option value="dashed">Dashed (-.->)</option>
-          <option value="thick">Thick (==&gt;)</option>
-          <option value="open">Open line (---)</option>
-        </select>
-      </label>
-    </form>
-  </aside>
+    <button type="button" id="fabAdd" class="fab-add" title="Add new card" aria-label="Add new card" hidden><span class="codicon codicon-add" aria-hidden="true"></span><span>Add Card</span></button>
+    <aside class="floating-card palette" id="palette" aria-label="Add card">
+      <div class="float-head">
+        <span class="pane-title">Add Card</span>
+        <button type="button" id="closePaletteBtn" class="btn icon small-icon" title="Hide Add Card panel" aria-label="Hide Add Card panel"><span class="codicon codicon-close" aria-hidden="true"></span></button>
+      </div>
+      <div class="pal-list">
+        <button type="button" class="pal-item" draggable="true" data-shape="rect" title="Process rectangle"><span class="pal-glyph rect"></span><span>Process</span></button>
+        <button type="button" class="pal-item" draggable="true" data-shape="round" title="Rounded step"><span class="pal-glyph round"></span><span>Step</span></button>
+        <button type="button" class="pal-item" draggable="true" data-shape="stadium" title="Start / End"><span class="pal-glyph stadium"></span><span>Start / End</span></button>
+        <button type="button" class="pal-item" draggable="true" data-shape="diamond" title="Decision branch"><span class="pal-glyph diamond"></span><span>Decision</span></button>
+        <button type="button" class="pal-item" draggable="true" data-shape="cylinder" title="Database / Store"><span class="pal-glyph cylinder"></span><span>Database</span></button>
+        <button type="button" class="pal-item" draggable="true" data-shape="subroutine" title="Subroutine / Module"><span class="pal-glyph subroutine"></span><span>Module</span></button>
+        <button type="button" class="pal-item" draggable="true" data-shape="trapezoid" title="Input / Output"><span class="pal-glyph trapezoid"></span><span>I/O</span></button>
+      </div>
+      <div class="pal-hint">Drag a shape or drop any file (.mmd opens it; other files create a step).</div>
+    </aside>
+
+    <aside class="floating-card inspector" id="inspector" aria-label="Edit card" hidden>
+      <div class="float-head">
+        <span class="pane-title" id="inspTitle">Edit Card</span>
+        <span class="spacer"></span>
+        <button type="button" id="inspDelBtn" class="btn icon small-icon danger" title="Delete selected" aria-label="Delete selected"><span class="codicon codicon-trash" aria-hidden="true"></span></button>
+        <button type="button" id="closeInspBtn" class="btn icon small-icon" title="Close" aria-label="Close"><span class="codicon codicon-close" aria-hidden="true"></span></button>
+      </div>
+      <div id="inspEmpty" class="insp-empty" hidden>Select a node or edge to edit.</div>
+      <form id="inspNode" class="insp-form" hidden>
+        <label class="field"><span>Label</span><input id="nodeLabel" type="text" placeholder="Card text"></label>
+        <label class="field"><span>ID</span><input id="nodeId" type="text" placeholder="Node_1"></label>
+        <label class="field"><span>Shape</span>
+          <select id="nodeShape">
+            <option value="rect">Process [ ]</option>
+            <option value="round">Step ( )</option>
+            <option value="stadium">Start / End ([ ])</option>
+            <option value="diamond">Decision { }</option>
+            <option value="cylinder">Database [( )]</option>
+            <option value="subroutine">Module [[ ]]</option>
+            <option value="trapezoid">I/O [/ /]</option>
+          </select>
+        </label>
+        <label class="field"><span>Accent</span>
+          <div class="swatches" id="nodeColors">
+            <button type="button" class="swatch none" data-color="" title="Default"></button>
+            <button type="button" class="swatch" data-color="#4ea8ff" style="--c:#4ea8ff" title="Blue"></button>
+            <button type="button" class="swatch" data-color="#76daa1" style="--c:#76daa1" title="Green"></button>
+            <button type="button" class="swatch" data-color="#edc21f" style="--c:#edc21f" title="Amber"></button>
+            <button type="button" class="swatch" data-color="#ff8a65" style="--c:#ff8a65" title="Orange"></button>
+            <button type="button" class="swatch" data-color="#d291ff" style="--c:#d291ff" title="Purple"></button>
+          </div>
+        </label>
+      </form>
+      <form id="inspEdge" class="insp-form" hidden>
+        <label class="field"><span>Edge Label</span><input id="edgeLabel" type="text" placeholder="Optional label"></label>
+        <label class="field"><span>Line Style</span>
+          <select id="edgeStyle">
+            <option value="solid">Solid (--&gt;)</option>
+            <option value="dashed">Dashed (-.->)</option>
+            <option value="thick">Thick (==&gt;)</option>
+            <option value="open">Open line (---)</option>
+          </select>
+        </label>
+      </form>
+    </aside>
+  </main>
 </div>
 
 <section class="code-drawer" id="codeDrawer" hidden aria-label="Mermaid source">
@@ -339,6 +392,7 @@ export class DiagramPanel {
   </form>
 </dialog>
 
+<script nonce="${nonce}" src="${uri('vendor/elk.bundled.js')}"></script>
 <script nonce="${nonce}" src="${uri('diagram.js')}"></script>
 </body>
 </html>`;

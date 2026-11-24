@@ -967,10 +967,22 @@
           "group": "3@3"
         }
       ],
+      "editor/title": [
+        {
+          "command": "task-x.openDiagram",
+          "when": "resourceExtname == .mmd || resourceExtname == .mermaid",
+          "group": "navigation@1"
+        }
+      ],
       "explorer/context": [
         {
           "command": "task-x.showFileGraph",
           "group": "navigation@9"
+        },
+        {
+          "command": "task-x.openDiagram",
+          "when": "resourceExtname == .mmd || resourceExtname == .mermaid",
+          "group": "navigation@10"
         }
       ]
     },
@@ -1508,6 +1520,7 @@
     "@types/node": "^24.19.2",
     "@types/vscode": "~1.100.0",
     "@vscode/codicons": "^0.0.46-24",
+    "elkjs": "^0.12.1",
     "mermaid": "^12.3.0",
     "typescript": "^7.0.2"
   }

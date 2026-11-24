@@ -327,7 +327,12 @@ async fn status_of(conn: Option<Conn>) -> Value {
         return json!({ "connected": false, "error": "the task-x Chrome extension is not running or not connected" });
     };
     match conn.call("ping", json!({}), Duration::from_secs(3)).await {
-        Ok(v) => json!({ "connected": true, "paused": v["paused"].as_bool().unwrap_or(false), "version": v["version"] }),
+        Ok(v) => json!({
+            "connected": true,
+            "paused": v["paused"].as_bool().unwrap_or(false),
+            "version": v["version"],
+            "sharedTabs": v["sharedTabs"].as_array().cloned().unwrap_or_default(),
+        }),
         Err(e) => json!({ "connected": false, "error": e }),
     }
 }
