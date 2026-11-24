@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "task-x-runtime"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "futures-util",
  "globset",

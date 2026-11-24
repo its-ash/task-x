@@ -1,0 +1,37 @@
+flowchart TD
+    Chat["Chat Tab (chatView.ts)"]
+    Agents["Agents Tab (agentsView.ts)"]
+    Terms["Terminals Tab (terminalsView.ts)"]
+    Limits["Limits Tab (limitsView.ts)"]
+    RPC["JSON-RPC Server (server.rs)"]
+    Index["Workspace Index & Symbol Graph"]
+    Edits["Edit Log & Timeline Snapshots"]
+    Procs["Process Tracker (procs.rs / ProcTracker)"]
+    McpSrv["task-x MCP Server (--mcp-server)"]
+    Builtin["Built-in Providers (OpenAI, Anthropic, Ollama, Custom)"]
+    Claude["Claude Code CLI (claude_cli.rs)"]
+    Agy["Antigravity / Gemini CLI (agy_cli.rs)"]
+    Chrome["Chrome Extension Bridge (~/.task-x/chrome.sock)"]
+    ExtMcp["External MCP Servers (Claude, VS Code, Copilot, Gemini, Google GenMedia)"]
+    Usage["Live Quota Polling (agy /usage, claude /usage)"]
+    Chat -->|"agent/run, claude/run, agy/run"| RPC
+    Chat -->|"deletePrompt -> agent/rewind"| RPC
+    RPC --> Builtin
+    RPC --> Claude
+    RPC --> Agy
+    Builtin -->|"Native Rust tools"| Index
+    Builtin -->|"Native Rust tools"| Edits
+    Builtin -->|"Native browser tool"| Chrome
+    Claude -->|"--mcp-config (task-x.useTaskXTools)"| McpSrv
+    Agy -->|"mcp_config.json (auto-registered)"| McpSrv
+    McpSrv --> Index
+    McpSrv --> Edits
+    McpSrv --> Chrome
+    RPC --> ExtMcp
+    Claude -->|"rateLimit, subagents, tools"| Procs
+    Agy -->|"step_update + subagent transcript.jsonl"| Procs
+    Builtin -->|"agent/event, subagentStarted"| Procs
+    Procs -->|"procs/started, procs/output, procs/ended"| Terms
+    RPC -->|"subagentStarted, subagent, subagentFinished"| Agents
+    RPC -->|"textDelta, fileChanged, done"| Chat
+    Usage -->|"5h + 7d limits & reset times"| Limits

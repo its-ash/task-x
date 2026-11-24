@@ -1079,30 +1079,45 @@
     const head = mermaidHeader(code).split(/\s/)[0].replace(/-v2$/, '');
     return DIAGRAM_LABELS[head] || 'Diagram';
   }
+  function sanitizeMermaid(src) {
+    return src.replace(/(\b[\w-]+)\[(?![(["/\\])([^\]\n"]*[()][^\]\n"]*)\]/g, (_, nodeId, label) => `${nodeId}["${label.replace(/"/g, '#quot;')}"]`);
+  }
   function matchInlineDiagram(lines, start) {
     const line = lines[start];
     const open = line.indexOf('`');
-    if (open < 0 || line.slice(open).startsWith('```')) return null;
-    const rest = line.slice(open + 1);
-    if (rest.includes('`') || !MERMAID_HEADER.test(rest.trim())) return null;
-    const body = [rest];
-    let closed = false;
-    let end = start;
-    let after = '';
-    for (let k = start + 1; k < lines.length; k++) {
-      const idx = lines[k].indexOf('`');
-      if (idx >= 0) {
-        if (idx > 0) body.push(lines[k].slice(0, idx));
-        after = lines[k].slice(idx + 1).trim();
-        closed = true;
-        end = k;
-        break;
+    if (open >= 0 && !line.slice(open).startsWith('```')) {
+      const rest = line.slice(open + 1);
+      if (!rest.includes('`') && MERMAID_HEADER.test(rest.trim())) {
+        const body = [rest];
+        let closed = false;
+        let end = start;
+        let after = '';
+        for (let k = start + 1; k < lines.length; k++) {
+          const idx = lines[k].indexOf('`');
+          if (idx >= 0) {
+            if (idx > 0) body.push(lines[k].slice(0, idx));
+            after = lines[k].slice(idx + 1).trim();
+            closed = true;
+            end = k;
+            break;
+          }
+          body.push(lines[k]);
+          end = k;
+        }
+        if (closed || body.length >= 2) return { before: line.slice(0, open).trim(), code: body.join('\n'), after, closed, end };
       }
-      body.push(lines[k]);
-      end = k;
     }
-    if (!closed && body.length < 2) return null;
-    return { before: line.slice(0, open).trim(), code: body.join('\n'), after, closed, end };
+    if (MERMAID_HEADER.test(line.trim())) {
+      const body = [line];
+      let end = start;
+      for (let k = start + 1; k < lines.length; k++) {
+        if (!lines[k].trim() || /^(`{3,}|~{3,})/.test(lines[k])) break;
+        body.push(lines[k]);
+        end = k;
+      }
+      if (body.length >= 2) return { before: '', code: body.join('\n'), after: '', closed: true, end };
+    }
+    return null;
   }
   function currentThemeKey() {
     const b = document.body;
@@ -1117,12 +1132,27 @@
     const cs = getComputedStyle(document.body);
     const css = (v, fallback) => cs.getPropertyValue(v).trim() || fallback;
     const dark = key === 'dark';
-    const bg = css('--bg', dark ? '#1e1e1e' : '#ffffff');
-    const surface = css('--surface-high', dark ? '#2a2a2a' : '#f3f3f3');
-    const fg = css('--on-surface', dark ? '#e5e5e5' : '#1f1f1f');
-    const muted = css('--on-surface-variant', dark ? '#a3a3a3' : '#616161');
-    const border = css('--border', dark ? '#454545' : '#d4d4d4');
-    const accent = css('--accent', dark ? '#9fcaff' : '#0061a4');
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 1;
+    const ctx2d = canvas.getContext('2d', { willReadFrequently: true });
+    const color = (v, fallback) => {
+      const raw = cs.getPropertyValue(v).trim();
+      const val = raw && typeof CSS !== 'undefined' && CSS.supports('color', raw) ? raw : fallback;
+      if (!ctx2d) return fallback;
+      ctx2d.clearRect(0, 0, 1, 1);
+      ctx2d.fillStyle = dark ? '#1e1e1e' : '#ffffff';
+      ctx2d.fillRect(0, 0, 1, 1);
+      ctx2d.fillStyle = val;
+      ctx2d.fillRect(0, 0, 1, 1);
+      const [r, g, b] = ctx2d.getImageData(0, 0, 1, 1).data;
+      return `#${((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1)}`;
+    };
+    const bg = color('--bg', dark ? '#1e1e1e' : '#ffffff');
+    const surface = color('--surface-high', dark ? '#2a2a2a' : '#f3f3f3');
+    const fg = color('--on-surface', dark ? '#e5e5e5' : '#1f1f1f');
+    const muted = color('--on-surface-variant', dark ? '#a3a3a3' : '#616161');
+    const border = color('--border', dark ? '#454545' : '#d4d4d4');
+    const accent = color('--accent', dark ? '#9fcaff' : '#0061a4');
     const font = css('--vscode-font-family', 'system-ui, sans-serif');
     m.initialize({
       startOnLoad: false,
@@ -1136,17 +1166,17 @@
         primaryColor: surface,
         primaryTextColor: fg,
         primaryBorderColor: border,
-        secondaryColor: css('--surface', surface),
+        secondaryColor: color('--surface', surface),
         secondaryTextColor: fg,
         secondaryBorderColor: border,
-        tertiaryColor: css('--surface-highest', surface),
+        tertiaryColor: color('--surface-highest', surface),
         tertiaryTextColor: fg,
         tertiaryBorderColor: border,
         lineColor: muted,
         textColor: fg,
         mainBkg: surface,
         nodeBorder: border,
-        clusterBkg: css('--surface', surface),
+        clusterBkg: color('--surface', surface),
         clusterBorder: border,
         titleColor: fg,
         edgeLabelBackground: bg,
@@ -1160,10 +1190,10 @@
         labelBoxBorderColor: border,
         labelTextColor: fg,
         loopTextColor: fg,
-        noteBkgColor: css('--accent-container', surface),
-        noteTextColor: css('--on-accent-container', fg),
+        noteBkgColor: color('--accent-container', surface),
+        noteTextColor: color('--on-accent-container', fg),
         noteBorderColor: accent,
-        activationBkgColor: css('--surface-highest', surface),
+        activationBkgColor: color('--surface-highest', surface),
         activationBorderColor: accent,
         sequenceNumberColor: bg,
       },
@@ -1304,8 +1334,15 @@
     body.append(el('span', 'diagram-status', 'Rendering diagram…'));
     initMermaid();
     const id = `mmd-${++diagramSeq}`;
+    const renderDiagram = () =>
+      window.mermaid.render(id, trimmed).catch((err) => {
+        document.getElementById(`d${id}`)?.remove();
+        const fixed = sanitizeMermaid(trimmed);
+        if (fixed === trimmed) throw err;
+        return window.mermaid.render(`${id}-s`, fixed);
+      });
     Promise.resolve()
-      .then(() => window.mermaid.render(id, trimmed))
+      .then(renderDiagram)
       .then(({ svg }) => {
         cacheDiagram(key, { svg });
         if (!wrap.isConnected) return;
@@ -1313,6 +1350,7 @@
       })
       .catch((e) => {
         document.getElementById(`d${id}`)?.remove();
+        document.getElementById(`d${id}-s`)?.remove();
         const msg = e instanceof Error ? e.message.split('\n')[0] : String(e);
         cacheDiagram(key, { error: msg });
         if (wrap.isConnected) showError(msg);
