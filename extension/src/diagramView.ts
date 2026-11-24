@@ -13,7 +13,7 @@ type Inbound =
   | { type: 'askAgent'; prompt: string }
   | { type: 'openMermaid' }
   | { type: 'refreshFile' }
-  | { type: 'saveMermaid'; code: string }
+  | { type: 'saveMermaid'; code: string; saveAs?: boolean }
   | { type: 'exportSvg'; svg: string }
   | { type: 'sendToChat'; code: string }
   | { type: 'copyText'; text: string }
@@ -214,17 +214,21 @@ export class DiagramPanel {
       }
       case 'saveMermaid': {
         if (typeof m.code !== 'string') return;
-        const root = WorkspaceSync.root();
-        const defaultUri = this.currentFile ?? (root ? vscode.Uri.joinPath(vscode.Uri.file(root), 'flow.mmd') : undefined);
-        const uri = await vscode.window.showSaveDialog({
-          defaultUri,
-          filters: { Mermaid: ['mmd', 'mermaid'], Markdown: ['md'] },
-          saveLabel: 'Save Flow Diagram',
-        });
-        if (!uri) return;
-        this.setCurrentFile(uri);
+        let uri = !m.saveAs ? this.currentFile : undefined;
+        if (!uri) {
+          const root = WorkspaceSync.root();
+          const defaultUri = this.currentFile ?? (root ? vscode.Uri.joinPath(vscode.Uri.file(root), 'flow.mmd') : undefined);
+          uri = await vscode.window.showSaveDialog({
+            defaultUri,
+            filters: { Mermaid: ['mmd', 'mermaid'], Markdown: ['md'] },
+            saveLabel: 'Save Flow Diagram',
+          });
+          if (!uri) return;
+          this.setCurrentFile(uri);
+        }
         const content = uri.fsPath.endsWith('.md') ? `\`\`\`mermaid\n${m.code.trim()}\n\`\`\`\n` : `${m.code.trim()}\n`;
         await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+        this.post({ type: 'saved' });
         this.post({ type: 'status', text: `Saved ${vscode.workspace.asRelativePath(uri)}`, busy: false });
         break;
       }
@@ -291,7 +295,7 @@ export class DiagramPanel {
     <button type="button" id="chatBtn" class="btn icon" title="Insert Mermaid into Chat"><span class="codicon codicon-send" aria-hidden="true"></span></button>
     <button type="button" id="openBtn" class="btn icon" title="Open .mmd / .mermaid file"><span class="codicon codicon-folder-opened" aria-hidden="true"></span></button>
     <button type="button" id="refreshBtn" class="btn icon" title="Refresh from opened file"><span class="codicon codicon-refresh" aria-hidden="true"></span></button>
-    <button type="button" id="saveBtn" class="btn icon" title="Save .mmd / .md file"><span class="codicon codicon-save" aria-hidden="true"></span></button>
+    <button type="button" id="saveBtn" class="btn icon" title="Save file (Cmd/Ctrl+S)"><span class="codicon codicon-save" aria-hidden="true"></span></button>
     <button type="button" id="svgBtn" class="btn icon" title="Export SVG"><span class="codicon codicon-export" aria-hidden="true"></span></button>
   </div>
 </header>
@@ -326,7 +330,7 @@ export class DiagramPanel {
         <button type="button" class="pal-item" draggable="true" data-shape="subroutine" title="Subroutine / Module"><span class="pal-glyph subroutine"></span><span>Module</span></button>
         <button type="button" class="pal-item" draggable="true" data-shape="trapezoid" title="Input / Output"><span class="pal-glyph trapezoid"></span><span>I/O</span></button>
       </div>
-      <div class="pal-hint">Click or drop a shape to add a card. Click any card to edit it. Drop a .mmd file to open it, or any other file to add a step.</div>
+      <div class="pal-hint">Click or drop a shape to add a card. Double-click a card to rename, Shift+click another card to link, or click an arrow to edit it.</div>
     </aside>
 
     <aside class="floating-card inspector" id="inspector" aria-label="Edit card" hidden>
@@ -336,9 +340,9 @@ export class DiagramPanel {
         <button type="button" id="inspDelBtn" class="btn icon small-icon danger" title="Delete selected" aria-label="Delete selected"><span class="codicon codicon-trash" aria-hidden="true"></span></button>
         <button type="button" id="closeInspBtn" class="btn icon small-icon" title="Close" aria-label="Close"><span class="codicon codicon-close" aria-hidden="true"></span></button>
       </div>
-      <div id="inspEmpty" class="insp-empty" hidden>Click any card to edit it.</div>
+      <div id="inspEmpty" class="insp-empty" hidden>Click any card or arrow to edit it.</div>
       <form id="inspNode" class="insp-form" hidden>
-        <label class="field"><span>Label</span><input id="nodeLabel" type="text" placeholder="Card text"></label>
+        <label class="field"><span>Label</span><textarea id="nodeLabel" rows="2" placeholder="Card text"></textarea></label>
         <label class="field"><span>ID</span><input id="nodeId" type="text" placeholder="Node_1"></label>
         <label class="field"><span>Shape</span>
           <select id="nodeShape">
@@ -361,13 +365,40 @@ export class DiagramPanel {
             <button type="button" class="swatch" data-color="#d291ff" style="--c:#d291ff" title="Purple"></button>
           </div>
         </label>
+        <div class="insp-actions">
+          <button type="button" id="addNextBtn" class="btn small secondary"><span class="codicon codicon-add" aria-hidden="true"></span><span>Next Step</span></button>
+          <button type="button" id="dupNodeBtn" class="btn small secondary"><span class="codicon codicon-copy" aria-hidden="true"></span><span>Duplicate</span></button>
+        </div>
         <div class="field">
           <span>Connect to card</span>
           <div class="connect-row">
             <select id="connectTarget" aria-label="Target card"></select>
+            <select id="connectArrow" class="arrow-sel" aria-label="Arrow style">
+              <option value="-->">Solid</option>
+              <option value="-.->">Dashed</option>
+              <option value="==>">Thick</option>
+            </select>
             <button type="button" id="connectBtn" class="btn small primary">Link</button>
           </div>
           <input id="connectLabel" type="text" placeholder="Optional edge label">
+        </div>
+        <div class="field" id="nodeEdgesWrap" hidden>
+          <span>Connections</span>
+          <div id="nodeEdges" class="edge-list"></div>
+        </div>
+      </form>
+      <form id="inspEdge" class="insp-form" hidden>
+        <div class="edge-route" id="edgeRoute"></div>
+        <label class="field"><span>Label</span><input id="edgeLabel" type="text" placeholder="Edge label"></label>
+        <label class="field"><span>Style</span>
+          <select id="edgeStyle">
+            <option value="-->">Solid (--&gt;)</option>
+            <option value="-.->">Dashed (-.-&gt;)</option>
+            <option value="==>">Thick (==&gt;)</option>
+          </select>
+        </label>
+        <div class="insp-actions">
+          <button type="button" id="edgeReverseBtn" class="btn small secondary"><span class="codicon codicon-arrow-swap" aria-hidden="true"></span><span>Reverse</span></button>
         </div>
       </form>
     </aside>

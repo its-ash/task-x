@@ -21,6 +21,8 @@
   let code = '';
   let renderedSvg = '';
   let selNodeId = null;
+  let selEdge = null;
+  let dirty = false;
   let pan = { x: 40, y: 40, scale: 1 };
   let panDrag = null;
   let undoStack = [];
@@ -31,7 +33,9 @@
 
   const setStatus = (text) => { statusBar.textContent = text || ''; };
   const sanitizeId = (raw, fallback) => String(raw || '').replace(/[^a-zA-Z0-9_]/g, '_').replace(/^(\d)/, '_$1') || fallback;
-  const escapeLabel = (text) => String(text || '').replace(/"/g, '#quot;').replace(/\r?\n/g, ' ').trim();
+  const escapeLabel = (text) => String(text || '').replace(/"/g, '#quot;').replace(/\r?\n/g, '<br/>').trim();
+  const decodeLabel = (text) => String(text || '').replace(/<br\s*\/?>/gi, '\n').replace(/#quot;|&quot;/g, '"');
+  const markDirty = (val = true) => { dirty = val; $('saveBtn')?.classList.toggle('dirty', dirty); };
 
   function sanitizeMermaid(src) {
     return src.replace(/(\b[\w-]+)\[(?![(["/\\])([^\]\n"]*[()][^\]\n"]*)\]/g, (_, id, label) => `${id}["${label.replace(/"/g, '#quot;')}"]`);
@@ -41,13 +45,14 @@
     undoStack.push(code);
     if (undoStack.length > 60) undoStack.shift();
     redoStack = [];
+    markDirty(true);
     syncButtons();
   }
 
   function syncButtons() {
     $('undoBtn').disabled = undoStack.length === 0;
     $('redoBtn').disabled = redoStack.length === 0;
-    $('delBtn').disabled = !selNodeId;
+    $('delBtn').disabled = !selNodeId && !selEdge;
   }
 
   function currentTheme() {
@@ -139,14 +144,39 @@
     return d === 'LR' || d === 'RL' ? 'LR' : 'TD';
   }
 
+  const EDGE_RE = /^(\s*)([a-zA-Z_][\w-]*)([^\n]*?)\s+(-->|-\.->|==>|--o|--x|<-->|---)\s*(?:\|([^|]*)\|\s*)?([a-zA-Z_][\w-]*)(.*)$/;
+
+  function unquote(t) {
+    const s = String(t || '').trim();
+    const inner = (s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")) ? s.slice(1, -1) : s;
+    return decodeLabel(inner);
+  }
+
+  function parseEdgesFromCode(src) {
+    const edges = [];
+    const lines = src.replace(/\r\n?/g, '\n').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (!trimmed || trimmed.startsWith('%%') || /^(?:flowchart|graph|subgraph|end|style|classDef|class|linkStyle|click|direction)\b/i.test(trimmed)) continue;
+      const m = EDGE_RE.exec(lines[i]);
+      if (!m) continue;
+      edges.push({
+        index: edges.length,
+        lineIndex: i,
+        indent: m[1],
+        from: m[2],
+        fromSuffix: m[3],
+        arrow: m[4],
+        label: m[5] ? unquote(m[5]) : '',
+        to: m[6],
+        toSuffix: m[7],
+      });
+    }
+    return edges;
+  }
+
   function parseNodesFromCode(src) {
     const map = new Map();
-    const unq = (t) => {
-      const s = t.trim();
-      return (s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))
-        ? s.slice(1, -1).replace(/#quot;|&quot;/g, '"')
-        : s.replace(/#quot;|&quot;/g, '"');
-    };
     const pats = [
       [/\b([a-zA-Z_][\w-]*)\s*\(\[([^\]]+)\]\)/g, 'stadium'],
       [/\b([a-zA-Z_][\w-]*)\s*\[\(([^)]+)\)\]/g, 'cylinder'],
@@ -164,9 +194,13 @@
         let m;
         while ((m = re.exec(line))) {
           const id = m[1];
-          if (!map.has(id)) map.set(id, { id, label: unq(m[2]), shape, color: '' });
+          if (!map.has(id)) map.set(id, { id, label: unquote(m[2]), shape, color: '' });
         }
       }
+    }
+    for (const e of parseEdgesFromCode(src)) {
+      if (!map.has(e.from)) map.set(e.from, { id: e.from, label: e.from, shape: 'rect', color: '' });
+      if (!map.has(e.to)) map.set(e.to, { id: e.to, label: e.to, shape: 'rect', color: '' });
     }
     const styleRe = /^\s*style\s+([a-zA-Z_][\w-]*)\s+.*stroke:\s*(#[0-9a-fA-F]{3,8})/gm;
     let sm;
@@ -229,24 +263,50 @@
 
   function highlightSelected() {
     host.querySelectorAll('svg .node.mmd-selected').forEach((n) => n.classList.remove('mmd-selected'));
-    if (!selNodeId) return;
-    host.querySelectorAll('svg .node').forEach((n) => {
-      if (extractNodeIdFromDom(n) === selNodeId) n.classList.add('mmd-selected');
-    });
+    host.querySelectorAll('svg .edge-selected').forEach((n) => n.classList.remove('edge-selected'));
+    if (selNodeId) {
+      host.querySelectorAll('svg .node').forEach((n) => {
+        if (extractNodeIdFromDom(n) === selNodeId) n.classList.add('mmd-selected');
+      });
+    }
+    if (selEdge) {
+      const paths = [...host.querySelectorAll('svg .edgePaths path.flowchart-link')];
+      const labels = [...host.querySelectorAll('svg .edgeLabels .edgeLabel')];
+      if (paths[selEdge.index]) paths[selEdge.index].classList.add('edge-selected');
+      if (labels[selEdge.index]) labels[selEdge.index].classList.add('edge-selected');
+    }
   }
 
   function syncInspector() {
     const insp = $('inspector');
     const nForm = $('inspNode');
+    const eForm = $('inspEdge');
     const nodes = parseNodesFromCode(code);
+    const edges = parseEdgesFromCode(code);
     const node = selNodeId ? nodes.get(selNodeId) : null;
-    if (!node) {
+    if (selEdge) {
+      const liveEdge = edges.find((e) => e.lineIndex === selEdge.lineIndex) || edges[selEdge.index] || null;
+      selEdge = liveEdge;
+    }
+    if (!node && !selEdge) {
       insp.hidden = true;
       nForm.hidden = true;
+      eForm.hidden = true;
       syncButtons();
       return;
     }
     insp.hidden = false;
+    if (selEdge) {
+      nForm.hidden = true;
+      eForm.hidden = false;
+      $('inspTitle').textContent = 'Edit Connection';
+      $('edgeRoute').textContent = `${selEdge.from} ${selEdge.arrow} ${selEdge.to}`;
+      $('edgeLabel').value = selEdge.label;
+      $('edgeStyle').value = ['-->', '-.->', '==>'].includes(selEdge.arrow) ? selEdge.arrow : '-->';
+      syncButtons();
+      return;
+    }
+    eForm.hidden = true;
     nForm.hidden = false;
     $('inspTitle').textContent = 'Edit Card';
     $('nodeLabel').value = node.label;
@@ -259,11 +319,77 @@
       if (id === node.id) continue;
       const opt = document.createElement('option');
       opt.value = id;
-      opt.textContent = info.label && info.label !== id ? `${info.label} (${id})` : id;
+      const single = info.label.replace(/\n/g, ' ');
+      opt.textContent = single && single !== id ? `${single} (${id})` : id;
       targetSel.append(opt);
     }
     $('connectBtn').disabled = targetSel.options.length === 0;
+    const related = edges.filter((e) => e.from === node.id || e.to === node.id);
+    const edgesWrap = $('nodeEdgesWrap');
+    const edgesBox = $('nodeEdges');
+    edgesBox.replaceChildren();
+    edgesWrap.hidden = related.length === 0;
+    for (const edge of related) {
+      const row = document.createElement('div');
+      row.className = 'edge-item';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'edge-pick';
+      const dir = edge.from === node.id ? `→ ${edge.to}` : `← ${edge.from}`;
+      btn.textContent = edge.label ? `${dir} (${edge.label})` : dir;
+      btn.title = 'Edit connection';
+      btn.addEventListener('click', () => {
+        selNodeId = null;
+        selEdge = edge;
+        highlightSelected();
+        syncInspector();
+      });
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'btn icon small-icon danger';
+      del.title = 'Remove connection';
+      del.innerHTML = '<span class="codicon codicon-close" aria-hidden="true"></span>';
+      del.addEventListener('click', () => deleteEdgeInCode(edge));
+      row.append(btn, del);
+      edgesBox.append(row);
+    }
     syncButtons();
+  }
+
+  function openInlineEdit(nodeEl, nid) {
+    canvasWrap.querySelector('.inline-edit')?.remove();
+    const nodes = parseNodesFromCode(code);
+    const node = nodes.get(nid);
+    if (!node) return;
+    const rect = nodeEl.getBoundingClientRect();
+    const wrapRect = canvasWrap.getBoundingClientRect();
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'inline-edit';
+    input.value = node.label.replace(/\n/g, ' / ');
+    input.style.left = `${Math.max(12, rect.left - wrapRect.left + rect.width / 2 - 90)}px`;
+    input.style.top = `${Math.max(12, rect.top - wrapRect.top + rect.height / 2 - 16)}px`;
+    input.style.width = `${Math.max(180, Math.min(320, rect.width + 24))}px`;
+    let committed = false;
+    const commit = (save) => {
+      if (committed) return;
+      committed = true;
+      const val = input.value.trim();
+      input.remove();
+      if (save && val && val !== node.label) {
+        pushUndo();
+        updateNodeInCode(nid, val, node.shape);
+        setStatus(`Renamed ${nid}`);
+      }
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+    });
+    input.addEventListener('blur', () => commit(true));
+    canvasWrap.append(input);
+    input.focus();
+    input.select();
   }
 
   async function renderDiagram(shouldFit = false) {
@@ -300,15 +426,51 @@
           svgEl.setAttribute('height', String(Math.ceil(vb[3])));
         }
         host.replaceChildren(svgEl);
+        const edges = parseEdgesFromCode(code);
         host.querySelectorAll('svg .node').forEach((nodeEl) => {
           nodeEl.addEventListener('click', (ev) => {
             ev.stopPropagation();
             const nid = extractNodeIdFromDom(nodeEl);
             if (!nid) return;
+            if (ev.shiftKey && selNodeId && selNodeId !== nid) {
+              pushUndo();
+              code = `${code.trimEnd()}\n    ${selNodeId} --> ${nid}`;
+              setStatus(`Connected ${selNodeId} -> ${nid}`);
+              selNodeId = nid;
+              selEdge = null;
+              void renderDiagram(false);
+              return;
+            }
             selNodeId = nid;
+            selEdge = null;
             highlightSelected();
             syncInspector();
           });
+          nodeEl.addEventListener('dblclick', (ev) => {
+            ev.stopPropagation();
+            const nid = extractNodeIdFromDom(nodeEl);
+            if (!nid) return;
+            selNodeId = nid;
+            selEdge = null;
+            highlightSelected();
+            syncInspector();
+            openInlineEdit(nodeEl, nid);
+          });
+        });
+        const selectEdgeByIdx = (idx, ev) => {
+          ev.stopPropagation();
+          const edge = edges[idx];
+          if (!edge) return;
+          selNodeId = null;
+          selEdge = edge;
+          highlightSelected();
+          syncInspector();
+        };
+        host.querySelectorAll('svg .edgePaths path.flowchart-link').forEach((p, idx) => {
+          p.addEventListener('click', (ev) => selectEdgeByIdx(idx, ev));
+        });
+        host.querySelectorAll('svg .edgeLabels .edgeLabel').forEach((lbl, idx) => {
+          lbl.addEventListener('click', (ev) => selectEdgeByIdx(idx, ev));
         });
         highlightSelected();
         if (shouldFit) requestAnimationFrame(fitToView);
@@ -332,6 +494,18 @@
     let updated = code;
     if (defRe.test(updated)) {
       updated = updated.replace(defRe, replacement);
+    } else {
+      const lines = updated.replace(/\r\n?/g, '\n').split('\n');
+      const bareRe = new RegExp(`\\b${esc}\\b`);
+      for (let i = 0; i < lines.length; i++) {
+        const t = lines[i].trim();
+        if (!t || t.startsWith('%%') || /^(?:flowchart|graph|subgraph|end|style|classDef|class|linkStyle|click|direction)\b/i.test(t)) continue;
+        if (bareRe.test(lines[i])) {
+          lines[i] = lines[i].replace(bareRe, replacement);
+          break;
+        }
+      }
+      updated = lines.join('\n');
     }
     if (nextId !== targetId) {
       updated = updated.replace(new RegExp(`\\b${esc}\\b`, 'g'), nextId);
@@ -346,7 +520,38 @@
     void renderDiagram(false);
   }
 
-  function addCard(shape = 'rect', customLabel, customId) {
+  function updateEdgeInCode(edge, nextLabel, nextArrow, reverse = false) {
+    if (!edge) return;
+    const lines = code.replace(/\r\n?/g, '\n').split('\n');
+    const line = lines[edge.lineIndex];
+    if (line === undefined) return;
+    const m = EDGE_RE.exec(line);
+    if (!m) return;
+    pushUndo();
+    const arrow = nextArrow || m[4];
+    const lbl = escapeLabel(nextLabel);
+    const labelPart = lbl ? `|"${lbl}"|` : '';
+    const left = reverse ? `${m[6]}${m[7]}` : `${m[2]}${m[3]}`;
+    const right = reverse ? `${m[2]}${m[3]}` : `${m[6]}${m[7]}`;
+    lines[edge.lineIndex] = `${m[1]}${left} ${arrow}${labelPart} ${right}`;
+    code = lines.join('\n');
+    void renderDiagram(false);
+    setStatus(reverse ? 'Reversed connection' : 'Updated connection');
+  }
+
+  function deleteEdgeInCode(edge) {
+    if (!edge) return;
+    const lines = code.replace(/\r\n?/g, '\n').split('\n');
+    if (edge.lineIndex < 0 || edge.lineIndex >= lines.length) return;
+    pushUndo();
+    lines.splice(edge.lineIndex, 1);
+    code = lines.join('\n').replace(/\n{3,}/g, '\n\n');
+    if (selEdge && selEdge.lineIndex === edge.lineIndex) selEdge = null;
+    void renderDiagram(false);
+    setStatus('Removed connection');
+  }
+
+  function addCard(shape = 'rect', customLabel, customId, color = '') {
     pushUndo();
     const existing = parseNodesFromCode(code);
     const base = sanitizeId(customId || `Step_${nodeSeq++}`, 'Step');
@@ -358,12 +563,18 @@
     if (!code.trim()) code = 'flowchart TD';
     const def = `${id}${o}"${escapeLabel(label)}"${c}`;
     code = `${code.trimEnd()}\n    ${selNodeId ? `${selNodeId} --> ${def}` : def}`;
+    if (color) code += `\n    style ${id} stroke:${color},stroke-width:2px`;
     selNodeId = id;
+    selEdge = null;
     void renderDiagram(true);
     setStatus(`Added card: ${label}`);
   }
 
   function deleteSelected() {
+    if (selEdge) {
+      deleteEdgeInCode(selEdge);
+      return;
+    }
     if (!selNodeId) return;
     pushUndo();
     const esc = selNodeId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -375,18 +586,24 @@
       .replace(/\n{3,}/g, '\n\n');
     selNodeId = null;
     void renderDiagram(false);
+    setStatus('Deleted card');
   }
 
   // Pan & zoom on stage
   stage.addEventListener('pointerdown', (e) => {
-    if (e.target.closest('.node')) return;
-    if (selNodeId) {
+    if (e.target.closest('.node, .edgeLabel, path.flowchart-link')) return;
+    if (selNodeId || selEdge) {
       selNodeId = null;
+      selEdge = null;
       highlightSelected();
       syncInspector();
     }
     stage.classList.add('panning');
     panDrag = { sx: e.clientX, sy: e.clientY, px: pan.x, py: pan.y };
+  });
+  stage.addEventListener('dblclick', (e) => {
+    if (e.target.closest('.node, .edgeLabel, path.flowchart-link')) return;
+    addCard('rect');
   });
   window.addEventListener('pointermove', (e) => {
     if (!panDrag) return;
@@ -490,17 +707,42 @@
     const target = $('connectTarget').value;
     if (!selNodeId || !target) return;
     pushUndo();
+    const arrow = $('connectArrow')?.value || '-->';
     const lbl = escapeLabel($('connectLabel').value);
-    code = `${code.trimEnd()}\n    ${selNodeId} ${lbl ? `-->|"${lbl}"|` : '-->'} ${target}`;
+    code = `${code.trimEnd()}\n    ${selNodeId} ${lbl ? `${arrow}|"${lbl}"|` : arrow} ${target}`;
     $('connectLabel').value = '';
     void renderDiagram(false);
     setStatus(`Connected ${selNodeId} -> ${target}`);
+  });
+  $('addNextBtn').addEventListener('click', () => {
+    if (!selNodeId) return;
+    addCard('rect');
+  });
+  $('dupNodeBtn').addEventListener('click', () => {
+    if (!selNodeId) return;
+    const node = parseNodesFromCode(code).get(selNodeId);
+    if (!node) return;
+    const prev = selNodeId;
+    selNodeId = null;
+    addCard(node.shape, node.label, `${prev}_copy`, node.color);
+  });
+  $('edgeLabel').addEventListener('change', (e) => {
+    if (!selEdge) return;
+    updateEdgeInCode(selEdge, e.target.value, $('edgeStyle').value);
+  });
+  $('edgeStyle').addEventListener('change', (e) => {
+    if (!selEdge) return;
+    updateEdgeInCode(selEdge, $('edgeLabel').value, e.target.value);
+  });
+  $('edgeReverseBtn').addEventListener('click', () => {
+    if (!selEdge) return;
+    updateEdgeInCode(selEdge, $('edgeLabel').value, $('edgeStyle').value, true);
   });
 
   // Floating panel toggles & toolbar actions
   $('closePaletteBtn').addEventListener('click', () => { $('palette').hidden = true; $('fabAdd').hidden = false; });
   $('fabAdd').addEventListener('click', () => { $('palette').hidden = false; $('fabAdd').hidden = true; });
-  $('closeInspBtn').addEventListener('click', () => { selNodeId = null; highlightSelected(); syncInspector(); });
+  $('closeInspBtn').addEventListener('click', () => { selNodeId = null; selEdge = null; highlightSelected(); syncInspector(); });
   $('inspDelBtn').addEventListener('click', deleteSelected);
   $('addNodeBtn').addEventListener('click', () => { $('palette').hidden = false; $('fabAdd').hidden = true; addCard('rect'); });
 
@@ -589,19 +831,26 @@
   $('openBtn').addEventListener('click', () => vscode.postMessage({ type: 'openMermaid' }));
   $('emptyOpenBtn')?.addEventListener('click', () => vscode.postMessage({ type: 'openMermaid' }));
   $('refreshBtn').addEventListener('click', () => vscode.postMessage({ type: 'refreshFile' }));
-  $('saveBtn').addEventListener('click', () => vscode.postMessage({ type: 'saveMermaid', code }));
+  $('saveBtn').addEventListener('click', (e) => vscode.postMessage({ type: 'saveMermaid', code, saveAs: e.shiftKey }));
   $('svgBtn').addEventListener('click', () => {
     if (renderedSvg) vscode.postMessage({ type: 'exportSvg', svg: renderedSvg });
   });
 
   window.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      vscode.postMessage({ type: 'saveMermaid', code, saveAs: e.shiftKey });
+      return;
+    }
     if (e.target.matches('input, textarea, select')) return;
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
       e.preventDefault();
       if (e.shiftKey) $('redoBtn').click();
       else $('undoBtn').click();
     } else if (e.key === 'Delete' || e.key === 'Backspace') {
-      if (selNodeId) { e.preventDefault(); deleteSelected(); }
+      if (selNodeId || selEdge) { e.preventDefault(); deleteSelected(); }
+    } else if (e.key === 'Escape') {
+      if (selNodeId || selEdge) { selNodeId = null; selEdge = null; highlightSelected(); syncInspector(); }
     }
   });
 
@@ -612,7 +861,11 @@
       undoStack = [];
       redoStack = [];
       selNodeId = null;
+      selEdge = null;
+      markDirty(false);
       void renderDiagram(true);
+    } else if (m.type === 'saved') {
+      markDirty(false);
     } else if (m.type === 'addFileSteps' && Array.isArray(m.files) && m.files.length) {
       pushUndo();
       if (!code.trim()) code = 'flowchart TD';

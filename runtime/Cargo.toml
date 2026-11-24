@@ -1,6 +1,6 @@
 [package]
 name = "task-x-runtime"
-version = "0.1.55"
+version = "0.1.56"
 edition = "2024"
 rust-version = "1.85"
 description = "Model-agnostic coding agent runtime: CLI, JSON-RPC server, and MCP server"
