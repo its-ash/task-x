@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import * as vscode from 'vscode';
 import { describeError } from './chatView.js';
@@ -13,7 +14,8 @@ type Inbound =
   | { type: 'saveMermaid'; code: string }
   | { type: 'exportSvg'; svg: string }
   | { type: 'sendToChat'; code: string }
-  | { type: 'copyText'; text: string };
+  | { type: 'copyText'; text: string }
+  | { type: 'dropFiles'; items: string[]; wx: number; wy: number };
 
 const DEFAULT_FLOW = `flowchart LR
     Start(["Start"]) --> Process["Process Step"]
@@ -134,6 +136,28 @@ export class DiagramPanel {
           this.post({ type: 'status', text: 'Copied to clipboard', busy: false });
         }
         break;
+      case 'dropFiles': {
+        const raw = Array.isArray(m.items) ? m.items.filter((s): s is string => typeof s === 'string' && !!s.trim()) : [];
+        if (!raw.length) return;
+        const files = raw.map((entry) => {
+          const s = entry.trim();
+          let fsPath = s;
+          if (/^file:\/\//i.test(s) || /^[a-z][a-z0-9+.-]*:\/\//i.test(s)) {
+            try {
+              const u = vscode.Uri.parse(s);
+              fsPath = u.scheme === 'file' ? u.fsPath : u.path || s;
+            } catch {
+              // Keep raw string.
+            }
+          }
+          const uri = vscode.Uri.file(fsPath);
+          const rel = vscode.workspace.asRelativePath(uri, false);
+          const displayPath = rel && !path.isAbsolute(rel) ? rel : fsPath;
+          return { path: displayPath, name: path.basename(fsPath) || displayPath };
+        });
+        this.post({ type: 'addFileSteps', files, wx: m.wx, wy: m.wy });
+        break;
+      }
       case 'saveMermaid': {
         if (typeof m.code !== 'string') return;
         const root = WorkspaceSync.root();
@@ -225,7 +249,7 @@ export class DiagramPanel {
     <button type="button" class="pal-item" draggable="true" data-shape="cylinder" title="Database / Store"><span class="pal-glyph cylinder"></span><span>Database</span></button>
     <button type="button" class="pal-item" draggable="true" data-shape="subroutine" title="Subroutine / Module"><span class="pal-glyph subroutine"></span><span>Module</span></button>
     <button type="button" class="pal-item" draggable="true" data-shape="trapezoid" title="Input / Output"><span class="pal-glyph trapezoid"></span><span>I/O</span></button>
-    <div class="pal-hint">Drag a node's blue dot onto another node to connect. Double-click to edit text.</div>
+    <div class="pal-hint">Drag a node's blue dot onto another node to connect. Double-click to edit text. Drop any file onto the canvas to create a step with its path.</div>
   </aside>
 
   <main class="canvas-wrap" id="canvasWrap">

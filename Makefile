@@ -110,31 +110,48 @@ bump:
 		echo "Version $(VERSION) is released; now $$v"; \
 	fi
 
-# Raises the version (bump), builds the runtime, pushes main, and publishes the binary for this
-# machine on a new GitHub release v<version>. `bump` runs first, so the build sees the new version.
-deploy: bump build
+# Raises the version (bump), builds the runtime and extension, pushes main, and publishes both the
+# binary for this machine and the VS Code extension (.vsix) on a new GitHub release v<version>.
+deploy: bump ext
 	cp $(RUNTIME)/target/release/$(BIN) $(RUNTIME)/target/release/$(ASSET)
+	cp $(VSIX) $(EXT)/task-x.vsix
 	git checkout main
 	git add -A
 	git diff --cached --quiet || { msg="$$(node scripts/commit-msg.mjs)" && git commit -m "$$msg"; }
 	git push origin main
-	gh release create v$(VERSION) $(RUNTIME)/target/release/$(ASSET) --repo $(REPO) --target main --title "task-x $(VERSION)" --latest \
-		--notes "Download $(ASSET), make it executable (chmod +x), and put it on your PATH as $(BIN). Or, in a clone of the repository: make add"
+	gh release create v$(VERSION) $(RUNTIME)/target/release/$(ASSET) $(EXT)/task-x.vsix --repo $(REPO) --target main --title "task-x $(VERSION)" --latest \
+		--notes "Download $(ASSET) and task-x.vsix, or in a clone of the repository run: make add"
+	rm -f $(EXT)/task-x.vsix
 	@echo "Published https://github.com/$(REPO)/releases/tag/v$(VERSION)"
 
-# Downloads the runtime for this machine from the latest GitHub release and installs it as
-# $(PREFIX)/bin/$(BIN). Uses gh when it is installed (works for private repositories), else curl.
+# Downloads the runtime and VS Code extension (.vsix) from the latest GitHub release and installs
+# both. Uses gh when it is installed (works for private repositories), else curl.
 add:
 	@set -e; tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
-	echo "Downloading $(ASSET) from the latest release of $(REPO)"; \
+	echo "Downloading $(ASSET) and task-x.vsix from the latest release of $(REPO)"; \
 	if command -v gh >/dev/null 2>&1; then \
 		gh release download --repo $(REPO) --pattern $(ASSET) --dir "$$tmp"; \
+		gh release download --repo $(REPO) --pattern '*.vsix' --dir "$$tmp" 2>/dev/null || true; \
 	else \
 		curl -fSL --progress-bar -o "$$tmp/$(ASSET)" "https://github.com/$(REPO)/releases/latest/download/$(ASSET)"; \
+		curl -fSL -o "$$tmp/task-x.vsix" "https://github.com/$(REPO)/releases/latest/download/task-x.vsix" 2>/dev/null || rm -f "$$tmp/task-x.vsix"; \
 	fi; \
 	mkdir -p $(PREFIX)/bin; \
 	rm -f $(PREFIX)/bin/$(BIN); \
 	cp "$$tmp/$(ASSET)" $(PREFIX)/bin/$(BIN); \
 	chmod +x $(PREFIX)/bin/$(BIN); \
-	echo "Installed $(PREFIX)/bin/$(BIN)."
+	echo "Installed $(PREFIX)/bin/$(BIN)."; \
+	vsix="$$(ls "$$tmp"/*.vsix 2>/dev/null | head -n 1)"; \
+	if [ -n "$$vsix" ]; then \
+		if command -v $(CODE) >/dev/null 2>&1; then \
+			out=$$(mktemp); $(CODE) --install-extension "$$vsix" --force > "$$out" 2>&1; status=$$?; \
+			grep -vE '^\(node:[0-9]+\) \[DEP0169\]|^\(Use `Code --trace-deprecation' "$$out" >&2 || true; rm -f "$$out"; \
+			[ $$status -eq 0 ] || exit $$status; \
+			echo "Installed $$(basename "$$vsix"). Reload VS Code windows to use it."; \
+		else \
+			echo "$(CODE) is not on your PATH; install $$vsix manually in VS Code."; \
+		fi; \
+	else \
+		echo "No .vsix asset in the latest release; run 'make deploy' to publish one or 'make install' to build locally."; \
+	fi
 	@$(MAKE) --no-print-directory link-vscode

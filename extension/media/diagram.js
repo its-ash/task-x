@@ -524,17 +524,68 @@
     applyTransform();
   }, { passive: false });
 
-  // Palette drag & drop + click
+  // Palette drag & drop + click + external file drop
   document.querySelectorAll('.pal-item').forEach((item) => {
     item.addEventListener('click', () => addNode(item.dataset.shape));
-    item.addEventListener('dragstart', (e) => e.dataTransfer.setData('text/plain', item.dataset.shape));
+    item.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('application/x-taskx-shape', item.dataset.shape);
+      e.dataTransfer.setData('text/plain', item.dataset.shape);
+    });
   });
-  $('canvasWrap').addEventListener('dragover', (e) => e.preventDefault());
-  $('canvasWrap').addEventListener('drop', (e) => {
+  function extractDroppedFiles(dt) {
+    if (!dt) return [];
+    const out = [];
+    const seen = new Set();
+    const push = (v) => {
+      const s = String(v || '').trim();
+      if (s && !s.startsWith('#') && !seen.has(s)) { seen.add(s); out.push(s); }
+    };
+    const uriList = dt.getData('text/uri-list') || dt.getData('application/vnd.code.uri-list') || '';
+    for (const line of uriList.split(/\r?\n/)) push(line);
+    const resUrls = dt.getData('resourceurls');
+    if (resUrls) {
+      try {
+        const arr = JSON.parse(resUrls);
+        if (Array.isArray(arr)) arr.forEach(push);
+      } catch {
+        // Ignore malformed resourceurls.
+      }
+    }
+    if (!out.length && dt.files?.length) {
+      for (const f of dt.files) push(f.path || f.name);
+    }
+    if (!out.length) {
+      const text = (dt.getData('text/plain') || '').trim();
+      if (text && !SHAPE_SYNTAX[text] && (/^(?:file:\/\/|\/|[a-zA-Z]:[\\/])/.test(text) || /[\\/][^\\/\n]+\.[a-zA-Z0-9]+$/.test(text))) {
+        for (const line of text.split(/\r?\n/)) push(line);
+      }
+    }
+    return out;
+  }
+  const canvasWrap = $('canvasWrap');
+  canvasWrap.addEventListener('dragover', (e) => {
     e.preventDefault();
-    const shape = e.dataTransfer.getData('text/plain') || 'rect';
+    canvasWrap.classList.add('drop-active');
+  });
+  canvasWrap.addEventListener('dragleave', (e) => {
+    if (e.target === canvasWrap) canvasWrap.classList.remove('drop-active');
+  });
+  canvasWrap.addEventListener('drop', (e) => {
+    e.preventDefault();
+    canvasWrap.classList.remove('drop-active');
     const w = screenToWorld(e.clientX, e.clientY);
-    addNode(shape, w.x, w.y);
+    const shape = e.dataTransfer.getData('application/x-taskx-shape');
+    if (shape) {
+      addNode(shape, w.x, w.y);
+      return;
+    }
+    const files = extractDroppedFiles(e.dataTransfer);
+    if (files.length) {
+      vscode.postMessage({ type: 'dropFiles', items: files, wx: w.x, wy: w.y });
+      return;
+    }
+    const fallbackShape = e.dataTransfer.getData('text/plain');
+    if (fallbackShape && SHAPE_SYNTAX[fallbackShape]) addNode(fallbackShape, w.x, w.y);
   });
 
   // Inspector bindings
@@ -667,6 +718,22 @@
       sel = null;
       render();
       requestAnimationFrame(fitToView);
+    } else if (m.type === 'addFileSteps' && Array.isArray(m.files) && m.files.length) {
+      pushUndo();
+      let lastId = null;
+      m.files.forEach((f, idx) => {
+        const base = sanitizeId(f.name || f.path, `File_${seq}`);
+        let id = base;
+        let k = 2;
+        while (graph.nodes.some((n) => n.id === id)) id = `${base}_${k++}`;
+        const x = snap((m.wx ?? 120) - NODE_W / 2);
+        const y = snap((m.wy ?? 120) - NODE_H / 2 + idx * (NODE_H + 24));
+        graph.nodes.push({ id, label: f.path, shape: 'round', x, y });
+        lastId = id;
+      });
+      if (lastId) sel = { kind: 'node', id: lastId };
+      render();
+      setStatus(m.files.length === 1 ? `Added file step: ${m.files[0].path}` : `Added ${m.files.length} file steps`);
     } else if (m.type === 'status') {
       setStatus(m.text);
     }
