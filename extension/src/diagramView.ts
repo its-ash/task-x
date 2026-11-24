@@ -75,8 +75,9 @@ export class DiagramPanel {
   }
 
   loadCode(code: string): void {
-    const graph = parseMermaid(code);
-    this.post({ type: 'load', graph, code: serializeMermaid(graph) });
+    const trimmed = code.trim();
+    const graph = parseMermaid(trimmed);
+    this.post({ type: 'load', graph, code: trimmed || serializeMermaid(graph) });
   }
 
   private async openFile(uri: vscode.Uri): Promise<void> {
@@ -287,27 +288,9 @@ export class DiagramPanel {
 
 <div class="workspace">
   <main class="canvas-wrap" id="canvasWrap">
-    <svg id="svg" class="canvas" xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
-          <circle cx="1" cy="1" r="1" class="grid-dot"></circle>
-        </pattern>
-        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-          <path d="M 0 1 L 10 5 L 0 9 z" class="arrow-head"></path>
-        </marker>
-        <marker id="arrow-sel" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-          <path d="M 0 1 L 10 5 L 0 9 z" class="arrow-head selected"></path>
-        </marker>
-      </defs>
-      <rect class="grid-bg" x="-4000" y="-4000" width="8000" height="8000" fill="url(#grid)"></rect>
-      <g id="viewport">
-        <g id="groupsLayer"></g>
-        <g id="edgesLayer"></g>
-        <g id="draftLayer"></g>
-        <g id="nodesLayer"></g>
-      </g>
-    </svg>
-    <input id="inlineEdit" class="inline-edit" type="text" hidden aria-label="Edit text">
+    <div id="stage" class="stage">
+      <div id="mermaidHost" class="mermaid-host"></div>
+    </div>
     <div id="statusBar" class="status-bar" role="status" aria-live="polite"></div>
 
     <button type="button" id="fabAdd" class="fab-add" title="Add new card" aria-label="Add new card" hidden><span class="codicon codicon-add" aria-hidden="true"></span><span>Add Card</span></button>
@@ -325,7 +308,7 @@ export class DiagramPanel {
         <button type="button" class="pal-item" draggable="true" data-shape="subroutine" title="Subroutine / Module"><span class="pal-glyph subroutine"></span><span>Module</span></button>
         <button type="button" class="pal-item" draggable="true" data-shape="trapezoid" title="Input / Output"><span class="pal-glyph trapezoid"></span><span>I/O</span></button>
       </div>
-      <div class="pal-hint">Drag a shape or drop any file (.mmd opens it; other files create a step).</div>
+      <div class="pal-hint">Click or drop a shape to add a card. Click any card to edit it. Drop a .mmd file to open it, or any other file to add a step.</div>
     </aside>
 
     <aside class="floating-card inspector" id="inspector" aria-label="Edit card" hidden>
@@ -335,7 +318,7 @@ export class DiagramPanel {
         <button type="button" id="inspDelBtn" class="btn icon small-icon danger" title="Delete selected" aria-label="Delete selected"><span class="codicon codicon-trash" aria-hidden="true"></span></button>
         <button type="button" id="closeInspBtn" class="btn icon small-icon" title="Close" aria-label="Close"><span class="codicon codicon-close" aria-hidden="true"></span></button>
       </div>
-      <div id="inspEmpty" class="insp-empty" hidden>Select a node or edge to edit.</div>
+      <div id="inspEmpty" class="insp-empty" hidden>Click any card to edit it.</div>
       <form id="inspNode" class="insp-form" hidden>
         <label class="field"><span>Label</span><input id="nodeLabel" type="text" placeholder="Card text"></label>
         <label class="field"><span>ID</span><input id="nodeId" type="text" placeholder="Node_1"></label>
@@ -360,17 +343,14 @@ export class DiagramPanel {
             <button type="button" class="swatch" data-color="#d291ff" style="--c:#d291ff" title="Purple"></button>
           </div>
         </label>
-      </form>
-      <form id="inspEdge" class="insp-form" hidden>
-        <label class="field"><span>Edge Label</span><input id="edgeLabel" type="text" placeholder="Optional label"></label>
-        <label class="field"><span>Line Style</span>
-          <select id="edgeStyle">
-            <option value="solid">Solid (--&gt;)</option>
-            <option value="dashed">Dashed (-.->)</option>
-            <option value="thick">Thick (==&gt;)</option>
-            <option value="open">Open line (---)</option>
-          </select>
-        </label>
+        <div class="field">
+          <span>Connect to card</span>
+          <div class="connect-row">
+            <select id="connectTarget" aria-label="Target card"></select>
+            <button type="button" id="connectBtn" class="btn small primary">Link</button>
+          </div>
+          <input id="connectLabel" type="text" placeholder="Optional edge label">
+        </div>
       </form>
     </aside>
   </main>
@@ -397,7 +377,7 @@ export class DiagramPanel {
   </form>
 </dialog>
 
-<script nonce="${nonce}" src="${uri('vendor/elk.bundled.js')}"></script>
+<script nonce="${nonce}" src="${uri('vendor/mermaid.min.js')}"></script>
 <script nonce="${nonce}" src="${uri('diagram.js')}"></script>
 </body>
 </html>`;
