@@ -25,6 +25,11 @@
   let dirty = false;
   let pan = { x: 40, y: 40, scale: 1 };
   let panDrag = null;
+  let nodeDrag = null;
+  let suppressNextClick = false;
+  let nodeOffsets = new Map();
+  let labelEditTimer = null;
+  let edgeEditTimer = null;
   let undoStack = [];
   let redoStack = [];
   let renderSeq = 0;
@@ -132,7 +137,7 @@
         sequenceNumberColor: bg,
       },
       sequence: { useMaxWidth: false, showSequenceNumbers: false, wrap: true },
-      flowchart: { useMaxWidth: false, htmlLabels: true, curve: 'basis', nodeSpacing: 48, rankSpacing: 64 },
+      flowchart: { useMaxWidth: false, htmlLabels: true, wrappingWidth: 220, padding: 18, curve: 'basis', nodeSpacing: 52, rankSpacing: 68 },
     });
     return true;
   }
@@ -178,13 +183,13 @@
   function parseNodesFromCode(src) {
     const map = new Map();
     const pats = [
-      [/\b([a-zA-Z_][\w-]*)\s*\(\[([^\]]+)\]\)/g, 'stadium'],
-      [/\b([a-zA-Z_][\w-]*)\s*\[\(([^)]+)\)\]/g, 'cylinder'],
-      [/\b([a-zA-Z_][\w-]*)\s*\[\[([^\]]+)\]\]/g, 'subroutine'],
-      [/\b([a-zA-Z_][\w-]*)\s*\[\/([^/\]]+)\/\]/g, 'trapezoid'],
-      [/\b([a-zA-Z_][\w-]*)\s*\{([^}]+)\}/g, 'diamond'],
-      [/\b([a-zA-Z_][\w-]*)\s*\(([^()]+)\)/g, 'round'],
-      [/\b([a-zA-Z_][\w-]*)\s*\[([^\]]+)\]/g, 'rect'],
+      [/\b([a-zA-Z_][\w-]*)\s*\(\[((?:"[^"]*"|[^\]"])+)\]\)/g, 'stadium'],
+      [/\b([a-zA-Z_][\w-]*)\s*\[\(((?:"[^"]*"|[^)"])+)\)\]/g, 'cylinder'],
+      [/\b([a-zA-Z_][\w-]*)\s*\[\[((?:"[^"]*"|[^\]"])+)\]\]/g, 'subroutine'],
+      [/\b([a-zA-Z_][\w-]*)\s*\[\/((?:"[^"]*"|[^/\]"])+)\/\]/g, 'trapezoid'],
+      [/\b([a-zA-Z_][\w-]*)\s*\{((?:"[^"]*"|[^}"])+)\}/g, 'diamond'],
+      [/\b([a-zA-Z_][\w-]*)\s*\(((?:"[^"]*"|[^()"])+)\)/g, 'round'],
+      [/\b([a-zA-Z_][\w-]*)\s*\[((?:"[^"]*"|[^\]"])+)\]/g, 'rect'],
     ];
     for (const raw of src.replace(/\r\n?/g, '\n').split('\n')) {
       const line = raw.trim();
@@ -212,8 +217,10 @@
   }
 
   function extractNodeIdFromDom(el) {
-    const raw = el?.getAttribute('data-id') || el?.id || '';
-    const m = /^flowchart-([^-]+(?:-[^-]+)*)-\d+$/.exec(raw);
+    const dataId = el?.getAttribute('data-id');
+    if (dataId && !/^flowchart-/.test(dataId)) return dataId;
+    const raw = dataId || el?.id || '';
+    const m = /^flowchart-(.+)-\d+$/.exec(raw);
     if (m) return m[1];
     return raw.replace(/^flowchart-/, '').replace(/-\d+$/, '');
   }
@@ -261,6 +268,151 @@
     applyTransform();
   }
 
+  function parseTranslate(el) {
+    const tr = el?.getAttribute('transform') || '';
+    const m = /translate\(\s*([-\d.]+)(?:[\s,]+([-\d.]+))?\s*\)/.exec(tr);
+    return m ? { x: parseFloat(m[1]) || 0, y: parseFloat(m[2]) || 0 } : { x: 0, y: 0 };
+  }
+
+  function fixCroppedLabels(svgEl) {
+    if (!svgEl) return;
+    svgEl.querySelectorAll('.node').forEach((nodeEl) => {
+      const fo = nodeEl.querySelector('foreignObject');
+      if (!fo) return;
+      const content = fo.querySelector('.nodeLabel, span, div, p') || fo.firstElementChild;
+      if (!content) return;
+      fo.querySelectorAll('div, span, p').forEach((el) => {
+        el.style.whiteSpace = 'normal';
+        el.style.overflowWrap = 'break-word';
+        el.style.wordBreak = 'break-word';
+        el.style.lineHeight = '1.35';
+      });
+      const foW = parseFloat(fo.getAttribute('width') || '0');
+      const foH = parseFloat(fo.getAttribute('height') || '0');
+      const needW = Math.ceil(Math.max(foW, content.scrollWidth + 8));
+      const needH = Math.ceil(Math.max(foH, content.scrollHeight + 6));
+      if (needW <= foW + 1 && needH <= foH + 1) return;
+      const foX = parseFloat(fo.getAttribute('x') || String(-foW / 2));
+      const foY = parseFloat(fo.getAttribute('y') || String(-foH / 2));
+      const cx = foX + foW / 2;
+      const cy = foY + foH / 2;
+      fo.setAttribute('width', String(needW));
+      fo.setAttribute('height', String(needH));
+      fo.setAttribute('x', String(Math.round(cx - needW / 2)));
+      fo.setAttribute('y', String(Math.round(cy - needH / 2)));
+      const labelG = fo.closest('g.label');
+      if (labelG && labelG.getAttribute('transform')) {
+        labelG.setAttribute('transform', `translate(${Math.round(-needW / 2)}, ${Math.round(-needH / 2)})`);
+        fo.setAttribute('x', '0');
+        fo.setAttribute('y', '0');
+      }
+      const shape = nodeEl.querySelector('rect.basic, rect.label-container, polygon.label-container, path.label-container');
+      if (!shape) return;
+      const padX = 28;
+      const padY = 18;
+      const tag = shape.tagName.toLowerCase();
+      if (tag === 'rect') {
+        const curW = parseFloat(shape.getAttribute('width') || '0');
+        const curH = parseFloat(shape.getAttribute('height') || '0');
+        const targetW = Math.max(curW, needW + padX);
+        const targetH = Math.max(curH, needH + padY);
+        shape.setAttribute('width', String(Math.ceil(targetW)));
+        shape.setAttribute('height', String(Math.ceil(targetH)));
+        shape.setAttribute('x', String(Math.round(-targetW / 2)));
+        shape.setAttribute('y', String(Math.round(-targetH / 2)));
+      } else if (tag === 'polygon' || tag === 'path') {
+        try {
+          const bb = shape.getBBox();
+          if (bb.width > 0 && bb.height > 0) {
+            const sx = Math.max(1, (needW + padX + (tag === 'polygon' ? 24 : 0)) / bb.width);
+            const sy = Math.max(1, (needH + padY + (tag === 'polygon' ? 24 : 0)) / bb.height);
+            if (sx > 1.02 || sy > 1.02) {
+              const bx = bb.x + bb.width / 2;
+              const by = bb.y + bb.height / 2;
+              shape.setAttribute('transform', `translate(${bx},${by}) scale(${sx.toFixed(3)},${sy.toFixed(3)}) translate(${-bx},${-by})`);
+            }
+          }
+        } catch {}
+      }
+    });
+    svgEl.querySelectorAll('.edgeLabels .edgeLabel foreignObject').forEach((fo) => {
+      const content = fo.querySelector('.edgeLabel, span, div, p') || fo.firstElementChild;
+      if (!content) return;
+      const foW = parseFloat(fo.getAttribute('width') || '0');
+      const foH = parseFloat(fo.getAttribute('height') || '0');
+      const needW = Math.ceil(Math.max(foW, content.scrollWidth + 8));
+      const needH = Math.ceil(Math.max(foH, content.scrollHeight + 4));
+      if (needW > foW + 1) fo.setAttribute('width', String(needW));
+      if (needH > foH + 1) fo.setAttribute('height', String(needH));
+    });
+  }
+
+  function anchorOnBox(box, target) {
+    const dx = target.x - box.x;
+    const dy = target.y - box.y;
+    const hw = Math.max(10, box.w / 2);
+    const hh = Math.max(10, box.h / 2);
+    if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) return { x: box.x, y: box.y };
+    const t = Math.min(hw / Math.max(0.01, Math.abs(dx)), hh / Math.max(0.01, Math.abs(dy)));
+    return { x: box.x + dx * t, y: box.y + dy * t };
+  }
+
+  function applyNodeOffsets(svgEl, edgesList) {
+    if (!svgEl) return;
+    const boxes = new Map();
+    svgEl.querySelectorAll('.node').forEach((nodeEl) => {
+      const nid = extractNodeIdFromDom(nodeEl);
+      if (!nid) return;
+      if (nodeEl.dataset.baseX === undefined) {
+        const base = parseTranslate(nodeEl);
+        nodeEl.dataset.baseX = String(base.x);
+        nodeEl.dataset.baseY = String(base.y);
+      }
+      const bx = parseFloat(nodeEl.dataset.baseX);
+      const by = parseFloat(nodeEl.dataset.baseY);
+      const off = nodeOffsets.get(nid) || { dx: 0, dy: 0 };
+      const nx = bx + off.dx;
+      const ny = by + off.dy;
+      if (off.dx !== 0 || off.dy !== 0) nodeEl.setAttribute('transform', `translate(${nx}, ${ny})`);
+      let w = 120, h = 44;
+      try {
+        const bb = nodeEl.getBBox();
+        if (bb.width > 0) w = bb.width;
+        if (bb.height > 0) h = bb.height;
+      } catch {}
+      boxes.set(nid, { x: nx, y: ny, w, h });
+    });
+    if (!nodeOffsets.size) return;
+    const edges = edgesList || parseEdgesFromCode(code);
+    const paths = [...svgEl.querySelectorAll('.edgePaths path.flowchart-link')];
+    const labels = [...svgEl.querySelectorAll('.edgeLabels .edgeLabel')];
+    const isLR = getDirection(code) === 'LR';
+    edges.forEach((edge, idx) => {
+      const fromOff = nodeOffsets.get(edge.from);
+      const toOff = nodeOffsets.get(edge.to);
+      if ((!fromOff || (fromOff.dx === 0 && fromOff.dy === 0)) && (!toOff || (toOff.dx === 0 && toOff.dy === 0))) return;
+      const fromBox = boxes.get(edge.from);
+      const toBox = boxes.get(edge.to);
+      const path = paths[idx];
+      if (!fromBox || !toBox || !path) return;
+      const p1 = anchorOnBox(fromBox, toBox);
+      const p2 = anchorOnBox(toBox, fromBox);
+      const dx = p2.x - p1.x;
+      const dy = p2.y - p1.y;
+      const c1x = isLR ? p1.x + dx * 0.45 : p1.x;
+      const c1y = isLR ? p1.y : p1.y + dy * 0.45;
+      const c2x = isLR ? p2.x - dx * 0.45 : p2.x;
+      const c2y = isLR ? p2.y : p2.y - dy * 0.45;
+      path.setAttribute('d', `M${p1.x.toFixed(1)},${p1.y.toFixed(1)}C${c1x.toFixed(1)},${c1y.toFixed(1)},${c2x.toFixed(1)},${c2y.toFixed(1)},${p2.x.toFixed(1)},${p2.y.toFixed(1)}`);
+      const lbl = labels[idx];
+      if (lbl) {
+        const mx = (p1.x + p2.x) / 2;
+        const my = (p1.y + p2.y) / 2;
+        lbl.setAttribute('transform', `translate(${mx.toFixed(1)}, ${my.toFixed(1)})`);
+      }
+    });
+  }
+
   function highlightSelected() {
     host.querySelectorAll('svg .node.mmd-selected').forEach((n) => n.classList.remove('mmd-selected'));
     host.querySelectorAll('svg .edge-selected').forEach((n) => n.classList.remove('edge-selected'));
@@ -283,7 +435,11 @@
     const eForm = $('inspEdge');
     const nodes = parseNodesFromCode(code);
     const edges = parseEdgesFromCode(code);
-    const node = selNodeId ? nodes.get(selNodeId) : null;
+    let node = selNodeId ? nodes.get(selNodeId) : null;
+    if (selNodeId && !node) {
+      const domEl = [...host.querySelectorAll('svg .node, svg g[data-id]')].find((n) => extractNodeIdFromDom(n) === selNodeId);
+      node = { id: selNodeId, label: (domEl?.textContent || selNodeId).trim(), shape: 'rect', color: '' };
+    }
     if (selEdge) {
       const liveEdge = edges.find((e) => e.lineIndex === selEdge.lineIndex) || edges[selEdge.index] || null;
       selEdge = liveEdge;
@@ -301,7 +457,8 @@
       eForm.hidden = false;
       $('inspTitle').textContent = 'Edit Connection';
       $('edgeRoute').textContent = `${selEdge.from} ${selEdge.arrow} ${selEdge.to}`;
-      $('edgeLabel').value = selEdge.label;
+      $('edgeLabel').dataset.edgeLine = String(selEdge.lineIndex);
+      if (document.activeElement !== $('edgeLabel')) $('edgeLabel').value = selEdge.label;
       $('edgeStyle').value = ['-->', '-.->', '==>'].includes(selEdge.arrow) ? selEdge.arrow : '-->';
       syncButtons();
       return;
@@ -309,8 +466,10 @@
     eForm.hidden = true;
     nForm.hidden = false;
     $('inspTitle').textContent = 'Edit Card';
-    $('nodeLabel').value = node.label;
-    $('nodeId').value = node.id;
+    $('nodeLabel').dataset.editingId = node.id;
+    $('nodeId').dataset.editingId = node.id;
+    if (document.activeElement !== $('nodeLabel')) $('nodeLabel').value = node.label;
+    if (document.activeElement !== $('nodeId')) $('nodeId').value = node.id;
     $('nodeShape').value = node.shape;
     $('nodeColors').querySelectorAll('.swatch').forEach((s) => s.classList.toggle('active', (s.dataset.color || '') === (node.color || '')));
     const targetSel = $('connectTarget');
@@ -359,17 +518,17 @@
   function openInlineEdit(nodeEl, nid) {
     canvasWrap.querySelector('.inline-edit')?.remove();
     const nodes = parseNodesFromCode(code);
-    const node = nodes.get(nid);
-    if (!node) return;
+    const node = nodes.get(nid) || { id: nid, label: (nodeEl?.textContent || nid).trim(), shape: 'rect', color: '' };
     const rect = nodeEl.getBoundingClientRect();
     const wrapRect = canvasWrap.getBoundingClientRect();
-    const input = document.createElement('input');
-    input.type = 'text';
+    const input = document.createElement('textarea');
     input.className = 'inline-edit';
-    input.value = node.label.replace(/\n/g, ' / ');
-    input.style.left = `${Math.max(12, rect.left - wrapRect.left + rect.width / 2 - 90)}px`;
-    input.style.top = `${Math.max(12, rect.top - wrapRect.top + rect.height / 2 - 16)}px`;
-    input.style.width = `${Math.max(180, Math.min(320, rect.width + 24))}px`;
+    input.rows = Math.max(1, Math.min(4, node.label.split('\n').length));
+    input.value = node.label;
+    const w = Math.max(200, Math.min(340, rect.width + 32));
+    input.style.left = `${Math.max(12, Math.min(wrapRect.width - w - 12, rect.left - wrapRect.left + rect.width / 2 - w / 2))}px`;
+    input.style.top = `${Math.max(12, rect.top - wrapRect.top + rect.height / 2 - 22)}px`;
+    input.style.width = `${w}px`;
     let committed = false;
     const commit = (save) => {
       if (committed) return;
@@ -379,11 +538,12 @@
       if (save && val && val !== node.label) {
         pushUndo();
         updateNodeInCode(nid, val, node.shape);
-        setStatus(`Renamed ${nid}`);
+        setStatus(`Updated ${nid}`);
       }
     };
+    input.addEventListener('pointerdown', (e) => e.stopPropagation());
     input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commit(true); }
       else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
     });
     input.addEventListener('blur', () => commit(true));
@@ -426,34 +586,44 @@
           svgEl.setAttribute('height', String(Math.ceil(vb[3])));
         }
         host.replaceChildren(svgEl);
+        try { fixCroppedLabels(svgEl); } catch {}
         const edges = parseEdgesFromCode(code);
-        host.querySelectorAll('svg .node').forEach((nodeEl) => {
-          nodeEl.addEventListener('click', (ev) => {
+        try { applyNodeOffsets(svgEl, edges); } catch {}
+        const selectNode = (nid, shiftKey) => {
+          if (!nid) return;
+          if (shiftKey && selNodeId && selNodeId !== nid) {
+            pushUndo();
+            code = `${code.trimEnd()}\n    ${selNodeId} --> ${nid}`;
+            setStatus(`Connected ${selNodeId} -> ${nid}`);
+            selNodeId = nid;
+            selEdge = null;
+            void renderDiagram(false);
+            return;
+          }
+          selNodeId = nid;
+          selEdge = null;
+          highlightSelected();
+          syncInspector();
+        };
+        host.querySelectorAll('svg .node, svg g[data-id][id^="flowchart-"]').forEach((nodeEl) => {
+          nodeEl.addEventListener('pointerdown', (ev) => {
+            if (ev.button !== 0 || ev.shiftKey) return;
             ev.stopPropagation();
             const nid = extractNodeIdFromDom(nodeEl);
             if (!nid) return;
-            if (ev.shiftKey && selNodeId && selNodeId !== nid) {
-              pushUndo();
-              code = `${code.trimEnd()}\n    ${selNodeId} --> ${nid}`;
-              setStatus(`Connected ${selNodeId} -> ${nid}`);
-              selNodeId = nid;
-              selEdge = null;
-              void renderDiagram(false);
-              return;
-            }
-            selNodeId = nid;
-            selEdge = null;
-            highlightSelected();
-            syncInspector();
+            const orig = nodeOffsets.get(nid) || { dx: 0, dy: 0 };
+            nodeDrag = { nid, nodeEl, svgEl, edges, startX: ev.clientX, startY: ev.clientY, origDx: orig.dx, origDy: orig.dy, moved: false, selectNode };
+          });
+          nodeEl.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            if (suppressNextClick) { suppressNextClick = false; return; }
+            selectNode(extractNodeIdFromDom(nodeEl), ev.shiftKey);
           });
           nodeEl.addEventListener('dblclick', (ev) => {
             ev.stopPropagation();
             const nid = extractNodeIdFromDom(nodeEl);
             if (!nid) return;
-            selNodeId = nid;
-            selEdge = null;
-            highlightSelected();
-            syncInspector();
+            selectNode(nid, false);
             openInlineEdit(nodeEl, nid);
           });
         });
@@ -490,7 +660,7 @@
     const [o, c] = SHAPE_SYNTAX[nextShape] || SHAPE_SYNTAX.rect;
     const replacement = `${nextId}${o}"${escapeLabel(nextLabel || nextId)}"${c}`;
     const esc = targetId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const defRe = new RegExp(`\\b${esc}\\s*(?:\\(\\[[^\\]]+\\]\\)|\\[\\([^)]+\\)\\]|\\[\\[[^\\]]+\\]\\]|\\[\\/[^/\\]]+\\/\\]|\\{[^}]+\\}|\\([^()]+\\)|\\[[^\\]]+\\])`);
+    const defRe = new RegExp(`\\b${esc}\\s*(?:\\(\\[(?:"[^"]*"|[^\\]"])+\\]\\)|\\[\\((?:"[^"]*"|[^)"])+\\)\\]|\\[\\[(?:"[^"]*"|[^\\]"])+\\]\\]|\\[\\/(?:"[^"]*"|[^/\\]"])+\\/\\]|\\{(?:"[^"]*"|[^}"])+\\}|\\((?:"[^"]*"|[^()"])+\\)|\\[(?:"[^"]*"|[^\\]"])+\\])`);
     let updated = code;
     if (defRe.test(updated)) {
       updated = updated.replace(defRe, replacement);
@@ -606,12 +776,39 @@
     addCard('rect');
   });
   window.addEventListener('pointermove', (e) => {
+    if (nodeDrag) {
+      const dist = Math.hypot(e.clientX - nodeDrag.startX, e.clientY - nodeDrag.startY);
+      if (!nodeDrag.moved && dist > 6) {
+        nodeDrag.moved = true;
+        nodeDrag.nodeEl.classList.add('dragging');
+      }
+      if (nodeDrag.moved) {
+        const dx = nodeDrag.origDx + (e.clientX - nodeDrag.startX) / pan.scale;
+        const dy = nodeDrag.origDy + (e.clientY - nodeDrag.startY) / pan.scale;
+        nodeOffsets.set(nodeDrag.nid, { dx, dy });
+        applyNodeOffsets(nodeDrag.svgEl, nodeDrag.edges);
+      }
+      return;
+    }
     if (!panDrag) return;
     pan.x = panDrag.px + (e.clientX - panDrag.sx);
     pan.y = panDrag.py + (e.clientY - panDrag.sy);
     applyTransform();
   });
   window.addEventListener('pointerup', () => {
+    if (nodeDrag) {
+      const d = nodeDrag;
+      nodeDrag = null;
+      d.nodeEl.classList.remove('dragging');
+      if (d.moved) {
+        suppressNextClick = true;
+        setTimeout(() => { suppressNextClick = false; }, 80);
+        setStatus(`Moved ${d.nid}`);
+      } else {
+        d.selectNode?.(d.nid, false);
+      }
+      return;
+    }
     if (!panDrag) return;
     panDrag = null;
     stage.classList.remove('panning');
@@ -680,28 +877,46 @@
   });
 
   // Floating Edit Card bindings
+  const commitNodeLabel = (el, pushHistory) => {
+    const tid = el.dataset.editingId || selNodeId;
+    if (!tid) return;
+    const node = parseNodesFromCode(code).get(tid);
+    if (!node || el.value === node.label) return;
+    if (pushHistory) pushUndo();
+    updateNodeInCode(tid, el.value, $('nodeShape').value);
+  };
+  $('nodeLabel').addEventListener('input', (e) => {
+    clearTimeout(labelEditTimer);
+    labelEditTimer = setTimeout(() => commitNodeLabel(e.target, true), 320);
+  });
   $('nodeLabel').addEventListener('change', (e) => {
-    if (!selNodeId) return;
-    pushUndo();
-    updateNodeInCode(selNodeId, e.target.value, $('nodeShape').value);
+    clearTimeout(labelEditTimer);
+    commitNodeLabel(e.target, true);
   });
   $('nodeId').addEventListener('change', (e) => {
-    if (!selNodeId) return;
-    const next = sanitizeId(e.target.value, selNodeId);
-    if (next === selNodeId) return;
+    const tid = e.target.dataset.editingId || selNodeId;
+    if (!tid) return;
+    const next = sanitizeId(e.target.value, tid);
+    if (next === tid) return;
     pushUndo();
-    updateNodeInCode(selNodeId, $('nodeLabel').value, $('nodeShape').value, next);
+    if (nodeOffsets.has(tid)) {
+      nodeOffsets.set(next, nodeOffsets.get(tid));
+      nodeOffsets.delete(tid);
+    }
+    updateNodeInCode(tid, $('nodeLabel').value, $('nodeShape').value, next);
   });
   $('nodeShape').addEventListener('change', (e) => {
-    if (!selNodeId) return;
+    const tid = $('nodeId').dataset.editingId || selNodeId;
+    if (!tid) return;
     pushUndo();
-    updateNodeInCode(selNodeId, $('nodeLabel').value, e.target.value);
+    updateNodeInCode(tid, $('nodeLabel').value, e.target.value);
   });
   $('nodeColors').addEventListener('click', (e) => {
     const b = e.target.closest('.swatch');
-    if (!b || !selNodeId) return;
+    const tid = $('nodeId').dataset.editingId || selNodeId;
+    if (!b || !tid) return;
     pushUndo();
-    updateNodeInCode(selNodeId, $('nodeLabel').value, $('nodeShape').value, selNodeId, b.dataset.color || '');
+    updateNodeInCode(tid, $('nodeLabel').value, $('nodeShape').value, tid, b.dataset.color || '');
   });
   $('connectBtn').addEventListener('click', () => {
     const target = $('connectTarget').value;
@@ -726,9 +941,19 @@
     selNodeId = null;
     addCard(node.shape, node.label, `${prev}_copy`, node.color);
   });
+  const commitEdgeLabel = (el) => {
+    const lineIdx = Number(el.dataset.edgeLine);
+    const target = selEdge || parseEdgesFromCode(code).find((ed) => ed.lineIndex === lineIdx);
+    if (!target || el.value === target.label) return;
+    updateEdgeInCode(target, el.value, $('edgeStyle').value);
+  };
+  $('edgeLabel').addEventListener('input', (e) => {
+    clearTimeout(edgeEditTimer);
+    edgeEditTimer = setTimeout(() => commitEdgeLabel(e.target), 320);
+  });
   $('edgeLabel').addEventListener('change', (e) => {
-    if (!selEdge) return;
-    updateEdgeInCode(selEdge, e.target.value, $('edgeStyle').value);
+    clearTimeout(edgeEditTimer);
+    commitEdgeLabel(e.target);
   });
   $('edgeStyle').addEventListener('change', (e) => {
     if (!selEdge) return;
@@ -751,11 +976,13 @@
       vscode.postMessage({ type: 'autoFlow', level: 'module', direction: 'LR' });
       return;
     }
+    nodeOffsets.clear();
     useElk = !useElk;
     void renderDiagram(true);
     setStatus(`Mermaid layout: ${useElk ? 'ELK' : 'Dagre'}`);
   });
   $('layoutBtn').addEventListener('click', () => {
+    nodeOffsets.clear();
     useElk = !useElk;
     void renderDiagram(true);
     setStatus(`Mermaid layout: ${useElk ? 'ELK' : 'Dagre'}`);
@@ -847,6 +1074,11 @@
       e.preventDefault();
       if (e.shiftKey) $('redoBtn').click();
       else $('undoBtn').click();
+    } else if (e.key === 'F2' || (e.key === 'Enter' && selNodeId)) {
+      if (selNodeId) {
+        const el = [...host.querySelectorAll('svg .node')].find((n) => extractNodeIdFromDom(n) === selNodeId);
+        if (el) { e.preventDefault(); openInlineEdit(el, selNodeId); }
+      }
     } else if (e.key === 'Delete' || e.key === 'Backspace') {
       if (selNodeId || selEdge) { e.preventDefault(); deleteSelected(); }
     } else if (e.key === 'Escape') {
@@ -862,6 +1094,7 @@
       redoStack = [];
       selNodeId = null;
       selEdge = null;
+      nodeOffsets.clear();
       markDirty(false);
       void renderDiagram(true);
     } else if (m.type === 'saved') {

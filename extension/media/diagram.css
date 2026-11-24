@@ -112,7 +112,10 @@ body { display: flex; flex-direction: column; }
 .stage.panning { cursor: grabbing; }
 .mermaid-host { position: absolute; left: 0; top: 0; transform-origin: 0 0; padding: 48px; }
 .mermaid-host svg { display: block; overflow: visible; }
-.mermaid-host svg .node { cursor: pointer; }
+.mermaid-host svg foreignObject { overflow: visible; }
+.mermaid-host svg .nodeLabel { white-space: normal !important; overflow-wrap: break-word; word-break: break-word; line-height: 1.35; }
+.mermaid-host svg .node { cursor: grab; }
+.mermaid-host svg .node.dragging { cursor: grabbing; opacity: 0.92; }
 .mermaid-host svg .node:hover rect,
 .mermaid-host svg .node:hover polygon,
 .mermaid-host svg .node:hover path,
@@ -137,7 +140,7 @@ body { display: flex; flex-direction: column; }
 .edge-pick { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--on-surface); font: inherit; font-size: 11px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; padding: 2px 0; }
 .edge-pick:hover { color: var(--accent); }
 
-.inline-edit { position: absolute; z-index: 10; min-width: 132px; padding: 5px 10px; border: 2px solid var(--accent); border-radius: var(--r-sm); background: var(--surface-highest); color: var(--on-surface); font: inherit; font-size: 12px; text-align: center; outline: none; box-shadow: var(--shadow-lg); }
+.inline-edit { position: absolute; z-index: 10; min-width: 180px; padding: 7px 10px; border: 2px solid var(--accent); border-radius: var(--r-sm); background: var(--surface-highest); color: var(--on-surface); font: inherit; font-size: 12px; line-height: 1.4; text-align: center; outline: none; resize: none; box-shadow: var(--shadow-lg); }
 .status-bar { position: absolute; left: 14px; bottom: 14px; padding: 5px 12px; border: 1px solid var(--border); border-radius: var(--r-pill); background: color-mix(in oklch, var(--surface) 90%, transparent); backdrop-filter: blur(10px); color: var(--on-surface-variant); font-size: 11px; font-weight: 500; pointer-events: none; box-shadow: var(--shadow-sm); }
 .status-bar:empty { display: none; }
 
@@ -148,7 +151,7 @@ body { display: flex; flex-direction: column; }
 .empty-title { font-size: 14px; font-weight: 600; color: var(--on-surface); }
 .empty-sub { font-size: 12px; line-height: 1.5; color: var(--on-surface-variant); margin-bottom: 4px; }
 
-.inspector { top: 14px; right: 14px; width: 268px; }
+.inspector { top: 14px; right: 14px; width: 268px; z-index: 20; }
 .insp-empty { padding: 12px; color: var(--muted); line-height: 1.5; }
 .insp-form { display: flex; flex-direction: column; gap: 11px; padding: 12px; }
 .insp-form[hidden] { display: none; }
