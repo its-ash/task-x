@@ -254,10 +254,6 @@ export class DiagramPanel {
 <header class="bar">
   <div class="bar-group">
     <button type="button" id="autoBtn" class="btn primary" title="Refine and auto-arrange the opened flow diagram (or generate from workspace when empty)"><span class="codicon codicon-sparkle" aria-hidden="true"></span><span>Auto Flow</span></button>
-    <select id="autoLevel" class="select" aria-label="Auto flow scope">
-      <option value="module">Modules</option>
-      <option value="file">Files</option>
-    </select>
     <button type="button" id="aiBtn" class="btn secondary" title="Ask AI agent to generate a Mermaid flow diagram"><span class="codicon codicon-comment-discussion" aria-hidden="true"></span><span>Ask Agent</span></button>
   </div>
   <span class="sep"></span>
@@ -305,6 +301,7 @@ export class DiagramPanel {
       </defs>
       <rect class="grid-bg" x="-4000" y="-4000" width="8000" height="8000" fill="url(#grid)"></rect>
       <g id="viewport">
+        <g id="groupsLayer"></g>
         <g id="edgesLayer"></g>
         <g id="draftLayer"></g>
         <g id="nodesLayer"></g>

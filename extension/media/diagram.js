@@ -18,6 +18,7 @@
 
   const svg = $('svg');
   const viewport = $('viewport');
+  const groupsLayer = $('groupsLayer');
   const edgesLayer = $('edgesLayer');
   const draftLayer = $('draftLayer');
   const nodesLayer = $('nodesLayer');
@@ -76,15 +77,32 @@
     const lines = [`flowchart ${dir}`];
     const used = new Map();
     const seen = new Set();
-    g.nodes.forEach((n, i) => {
+    const emitNode = (n, i, indent) => {
       let id = sanitizeId(n.id, `N${i + 1}`);
       let k = 2;
       while (seen.has(id)) id = `${sanitizeId(n.id, `N${i + 1}`)}_${k++}`;
       seen.add(id);
       used.set(n.id, id);
       const [o, c] = SHAPE_SYNTAX[n.shape] || SHAPE_SYNTAX.rect;
-      lines.push(`    ${id}${o}"${escapeLabel(n.label || id)}"${c}`);
-    });
+      lines.push(`${indent}${id}${o}"${escapeLabel(n.label || id)}"${c}`);
+    };
+    if (g.groups?.length) {
+      const grouped = new Set();
+      for (const grp of g.groups) {
+        const members = g.nodes.filter((n) => n.group === grp.id);
+        if (!members.length) continue;
+        const gid = sanitizeId(grp.id, 'Group');
+        lines.push(`    subgraph ${gid}["${escapeLabel(grp.label || gid)}"]`);
+        for (const n of members) {
+          grouped.add(n.id);
+          emitNode(n, g.nodes.indexOf(n), '        ');
+        }
+        lines.push('    end');
+      }
+      g.nodes.forEach((n, i) => { if (!grouped.has(n.id)) emitNode(n, i, '    '); });
+    } else {
+      g.nodes.forEach((n, i) => emitNode(n, i, '    '));
+    }
     for (const e of g.edges) {
       const from = used.get(e.from);
       const to = used.get(e.to);
@@ -128,6 +146,8 @@
     const dm = /^(?:flowchart|graph)\s+(TD|TB|BT|LR|RL)\b/i.exec(first);
     const direction = dm && (dm[1].toUpperCase() === 'TD' || dm[1].toUpperCase() === 'TB' || dm[1].toUpperCase() === 'BT') ? 'TD' : 'LR';
     const nmap = new Map();
+    const gmap = new Map();
+    const gstack = [];
     const edges = [];
     const unq = (t) => { const s = t.trim(); return (s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")) ? s.slice(1, -1).replace(/&quot;/g, '"') : s; };
     const parseTok = (tok) => {
@@ -146,35 +166,66 @@
       return b ? { id: b[1] } : null;
     };
     const upsert = (t) => {
+      const curGroup = gstack[gstack.length - 1];
       const cur = nmap.get(t.id);
-      if (cur) { if (t.label) cur.label = t.label; if (t.shape) cur.shape = t.shape; return; }
-      nmap.set(t.id, { id: t.id, label: t.label || t.id, shape: t.shape || 'rect', x: 0, y: 0 });
+      if (cur) {
+        if (t.label) cur.label = t.label;
+        if (t.shape) cur.shape = t.shape;
+        if (curGroup && !cur.group) cur.group = curGroup;
+        return;
+      }
+      nmap.set(t.id, { id: t.id, label: t.label || t.id, shape: t.shape || 'rect', x: 0, y: 0, ...(curGroup ? { group: curGroup } : {}) });
     };
-    const edgeRe = /^(.+?)\s*(-->|-\.->|==>|---|--[^>]+-->|-\.[^>]+-\.->|==[^>]+==>)\s*(?:\|([^|]*)\|\s*)?(.+)$/;
-    let ei = 0;
+    const arrowRe = /\s*(-->|-\.->|==>|---|--[^-\n>]+-->|-\.[^.\n>]+-\.->|==[^=\n>]+==>)\s*(?:\|([^|]*)\|\s*)?/;
+    const parseList = (p) => p.split(/\s*&\s*/).map(parseTok).filter(Boolean);
+    let ei = 0, gi = 1;
     for (const raw of lines) {
       const l = raw.trim().replace(/;$/, '');
-      if (!l || l.startsWith('%%') || /^(?:flowchart|graph|subgraph|end|classDef|class|style|linkStyle|click|direction)\b/i.test(l)) continue;
-      const em = edgeRe.exec(l);
-      if (em) {
-        const a = parseTok(em[1]), b = parseTok(em[4]);
-        if (a && b) {
-          upsert(a); upsert(b);
-          const arr = em[2];
-          let label = (em[3] || '').trim();
-          let style = 'solid';
-          if (arr.includes('-.')) { style = 'dashed'; if (!label) label = arr.replace(/^-\.\s*/, '').replace(/\s*-\.->$/, '').trim(); }
-          else if (arr.includes('==')) { style = 'thick'; if (!label) label = arr.replace(/^==\s*/, '').replace(/\s*==>$/, '').trim(); }
-          else if (arr === '---') style = 'open';
-          else if (!label && arr.length > 3) label = arr.replace(/^--\s*/, '').replace(/\s*-->$/, '').trim();
-          edges.push({ id: `e${++ei}`, from: a.id, to: b.id, label: unq(label), style });
-          continue;
-        }
+      if (!l || l.startsWith('%%')) continue;
+      const sm = /^subgraph\s+(.+)$/i.exec(l);
+      if (sm) {
+        const rest = sm[1].trim();
+        const bm = /^([a-zA-Z_][\w-]*)\s*\[([\s\S]+)\]$/.exec(rest);
+        const id = bm ? bm[1] : sanitizeId(unq(rest), `Group_${gi++}`);
+        const label = bm ? unq(bm[2]) : unq(rest);
+        if (!gmap.has(id)) gmap.set(id, { id, label });
+        gstack.push(id);
+        continue;
       }
+      if (/^end$/i.test(l)) { gstack.pop(); continue; }
+      if (/^(?:flowchart|graph|classDef|class|style|linkStyle|click|direction)\b/i.test(l)) continue;
+      let rest = l, prev = null, matched = false;
+      while (true) {
+        const em = arrowRe.exec(rest);
+        if (!em) break;
+        const leftStr = rest.slice(0, em.index).trim();
+        const arr = em[1];
+        let label = (em[2] || '').trim();
+        let style = 'solid';
+        if (arr.includes('-.')) { style = 'dashed'; if (!label) label = arr.replace(/^-\.\s*/, '').replace(/\s*-\.->$/, '').trim(); }
+        else if (arr.includes('==')) { style = 'thick'; if (!label) label = arr.replace(/^==\s*/, '').replace(/\s*==>$/, '').trim(); }
+        else if (arr === '---') style = 'open';
+        else if (!label && arr.length > 3) label = arr.replace(/^--\s*/, '').replace(/\s*-->$/, '').trim();
+        const leftList = prev || parseList(leftStr);
+        rest = rest.slice(em.index + em[0].length).trim();
+        const nextM = arrowRe.exec(rest);
+        const rightStr = nextM ? rest.slice(0, nextM.index).trim() : rest;
+        const rightList = parseList(rightStr);
+        if (!leftList.length || !rightList.length) break;
+        matched = true;
+        leftList.forEach(upsert);
+        rightList.forEach(upsert);
+        for (const a of leftList) for (const b of rightList) edges.push({ id: `e${++ei}`, from: a.id, to: b.id, label: unq(label), style });
+        prev = rightList;
+        if (!nextM) break;
+        rest = rest.slice(nextM.index);
+      }
+      if (matched) continue;
       const single = parseTok(l);
       if (single) upsert(single);
     }
-    return autoLayout({ direction, nodes: [...nmap.values()], edges });
+    const groups = [...gmap.values()];
+    return autoLayout({ direction, nodes: [...nmap.values()], edges, ...(groups.length ? { groups } : {}) });
   }
 
   const elk = typeof window.ELK === 'function' ? new window.ELK() : null;
@@ -225,7 +276,9 @@
   async function elkLayout(g) {
     if (!elk || !g.nodes.length) return autoLayout(g);
     const nodes = g.nodes.map((n) => ({ ...n, w: nodeW(n) }));
+    const groups = (g.groups || []).map((grp) => ({ ...grp }));
     const nodeIds = new Set(nodes.map((n) => n.id));
+    const groupIds = new Set(groups.map((grp) => grp.id));
     const edges = g.edges.map((e) => ({ ...e, points: null }));
     const elkEdges = [];
     const edgeIdxByElkId = new Map();
@@ -240,6 +293,30 @@
         ...(e.label ? { labels: [{ text: e.label, width: Math.min(200, Math.max(36, e.label.length * 6.8 + 16)), height: 22 }] } : {}),
       });
     });
+
+    const hasGroups = groups.some((grp) => nodes.some((n) => n.group === grp.id));
+    const elkChildren = [];
+    if (hasGroups) {
+      const usedInGroup = new Set();
+      for (const grp of groups) {
+        const members = nodes.filter((n) => n.group === grp.id);
+        if (!members.length) continue;
+        members.forEach((n) => usedInGroup.add(n.id));
+        elkChildren.push({
+          id: `__grp_${grp.id}`,
+          layoutOptions: {
+            'elk.padding': '[top=38,left=20,bottom=20,right=20]',
+            'elk.spacing.nodeNode': '36',
+            'elk.layered.spacing.nodeNodeBetweenLayers': '64',
+          },
+          children: members.map((n) => ({ id: n.id, width: nodeW(n), height: NODE_H })),
+        });
+      }
+      nodes.filter((n) => !usedInGroup.has(n.id)).forEach((n) => elkChildren.push({ id: n.id, width: nodeW(n), height: NODE_H }));
+    } else {
+      nodes.forEach((n) => elkChildren.push({ id: n.id, width: nodeW(n), height: NODE_H }));
+    }
+
     try {
       const res = await elk.layout({
         id: 'root',
@@ -247,6 +324,7 @@
           'elk.algorithm': 'layered',
           'elk.direction': g.direction === 'TD' ? 'DOWN' : 'RIGHT',
           'elk.edgeRouting': 'ORTHOGONAL',
+          'elk.hierarchyHandling': 'INCLUDE_CHILDREN',
           'elk.separateConnectedComponents': 'true',
           'elk.spacing.componentComponent': '72',
           'elk.spacing.nodeNode': '64',
@@ -258,26 +336,46 @@
           'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
           'elk.padding': '[top=48,left=48,bottom=48,right=48]',
         },
-        children: nodes.map((n) => ({ id: n.id, width: nodeW(n), height: NODE_H })),
+        children: elkChildren,
         edges: elkEdges,
       });
-      const posMap = new Map((res.children || []).map((c) => [c.id, c]));
+      const posMap = new Map();
+      const collect = (list, ox, oy) => {
+        for (const c of list || []) {
+          const ax = ox + (Number.isFinite(c.x) ? c.x : 0);
+          const ay = oy + (Number.isFinite(c.y) ? c.y : 0);
+          posMap.set(c.id, { x: ax, y: ay, w: c.width, h: c.height });
+          if (c.children?.length) collect(c.children, ax, ay);
+        }
+      };
+      collect(res.children, 0, 0);
       nodes.forEach((n) => {
         const c = posMap.get(n.id);
-        if (c && Number.isFinite(c.x) && Number.isFinite(c.y)) {
+        if (c) {
           n.x = Math.round(c.x);
           n.y = Math.round(c.y);
         }
       });
-      (res.edges || []).forEach((re) => {
-        const idx = edgeIdxByElkId.get(re.id);
-        const sec = re?.sections?.[0];
-        if (idx != null && sec?.startPoint && sec?.endPoint) {
-          edges[idx].points = [sec.startPoint, ...(sec.bendPoints || []), sec.endPoint].map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }));
+      const collectEdges = (container, ox, oy) => {
+        for (const re of container.edges || []) {
+          const idx = edgeIdxByElkId.get(re.id);
+          const sec = re?.sections?.[0];
+          if (idx != null && sec?.startPoint && sec?.endPoint) {
+            edges[idx].points = [sec.startPoint, ...(sec.bendPoints || []), sec.endPoint].map((p) => ({
+              x: Math.round(p.x + ox),
+              y: Math.round(p.y + oy),
+            }));
+          }
         }
-      });
+        for (const c of container.children || []) {
+          if (c.edges?.length || c.children?.length) {
+            collectEdges(c, ox + (Number.isFinite(c.x) ? c.x : 0), oy + (Number.isFinite(c.y) ? c.y : 0));
+          }
+        }
+      };
+      collectEdges(res, 0, 0);
       resolveOverlaps(nodes, edges, g.direction);
-      return { direction: g.direction, nodes, edges };
+      return { direction: g.direction, nodes, edges, ...(groupIds.size ? { groups } : {}) };
     } catch {
       return autoLayout(g);
     }
@@ -519,9 +617,26 @@
 
   function render() {
     applyTransform();
+    groupsLayer.replaceChildren();
     edgesLayer.replaceChildren();
     nodesLayer.replaceChildren();
     const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+
+    for (const grp of graph.groups || []) {
+      const members = graph.nodes.filter((n) => n.group === grp.id);
+      if (!members.length) continue;
+      const padX = 18, padTop = 34, padBot = 18;
+      const minX = Math.min(...members.map((n) => n.x)) - padX;
+      const minY = Math.min(...members.map((n) => n.y)) - padTop;
+      const maxX = Math.max(...members.map((n) => n.x + nodeW(n))) + padX;
+      const maxY = Math.max(...members.map((n) => n.y + NODE_H)) + padBot;
+      const g = svgEl('g', { class: 'flow-group', 'data-id': grp.id });
+      g.append(svgEl('rect', { class: 'group-box', x: minX, y: minY, width: Math.max(120, maxX - minX), height: Math.max(80, maxY - minY) }));
+      const title = svgEl('text', { class: 'group-title', x: minX + 12, y: minY + 20 });
+      title.textContent = grp.label || grp.id;
+      g.append(title);
+      groupsLayer.append(g);
+    }
 
     for (const e of graph.edges) {
       const a = byId.get(e.from), b = byId.get(e.to);
@@ -885,7 +1000,7 @@
       setStatus('Refined current flow with ELK');
       return;
     }
-    vscode.postMessage({ type: 'autoFlow', level: $('autoLevel').value, direction: graph.direction });
+    vscode.postMessage({ type: 'autoFlow', level: 'module', direction: graph.direction });
   });
   $('aiBtn').addEventListener('click', () => { $('aiPrompt').value = ''; $('aiDialog').showModal(); $('aiPrompt').focus(); });
   $('aiCancel').addEventListener('click', () => $('aiDialog').close());

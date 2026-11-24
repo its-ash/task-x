@@ -12,6 +12,16 @@ export interface FlowNode {
   y: number;
   w?: number;
   color?: string;
+  group?: string;
+}
+
+export interface FlowGroup {
+  id: string;
+  label: string;
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
 }
 
 export interface FlowEdge {
@@ -26,6 +36,7 @@ export interface FlowGraph {
   direction: FlowDirection;
   nodes: FlowNode[];
   edges: FlowEdge[];
+  groups?: FlowGroup[];
 }
 
 const MIN_NODE_W = 168;
@@ -234,7 +245,7 @@ export function layoutFlow(graph: FlowGraph): FlowGraph {
     const dy = minY < 48 ? 48 - minY : 0;
     for (const n of nodes) { n.x = Math.round(n.x + dx); n.y = Math.round(n.y + dy); }
   }
-  return { direction: graph.direction, nodes, edges };
+  return { direction: graph.direction, nodes, edges, ...(graph.groups?.length ? { groups: graph.groups } : {}) };
 }
 
 function parseSequence(lines: string[]): FlowGraph {
@@ -288,55 +299,107 @@ export function parseMermaid(src: string): FlowGraph {
   }
 
   const nodesMap = new Map<string, FlowNode>();
+  const groupsMap = new Map<string, FlowGroup>();
+  const groupStack: string[] = [];
   const edges: FlowEdge[] = [];
   const upsert = (tok: { id: string; label?: string; shape?: NodeShape }) => {
+    const curGroup = groupStack[groupStack.length - 1];
     const cur = nodesMap.get(tok.id);
     if (cur) {
       if (tok.label) cur.label = tok.label;
       if (tok.shape) cur.shape = tok.shape;
+      if (curGroup && !cur.group) cur.group = curGroup;
       return;
     }
-    nodesMap.set(tok.id, { id: tok.id, label: tok.label || tok.id, shape: tok.shape || 'rect', x: 0, y: 0 });
+    nodesMap.set(tok.id, {
+      id: tok.id,
+      label: tok.label || tok.id,
+      shape: tok.shape || 'rect',
+      x: 0,
+      y: 0,
+      ...(curGroup ? { group: curGroup } : {}),
+    });
   };
 
   let edgeIdx = 0;
-  const edgeRe = /^(.+?)\s*(-->|-\.->|==>|---|--[^>]+-->|-\.[^>]+-\.->|==[^>]+==>)\s*(?:\|([^|]*)\|\s*)?(.+)$/;
+  let groupSeq = 1;
+  const arrowSplitRe = /\s*(-->|-\.->|==>|---|--[^-\n>]+-->|-\.[^.\n>]+-\.->|==[^=\n>]+==>)\s*(?:\|([^|]*)\|\s*)?/;
+
+  const parseEndpointList = (part: string): { id: string; label?: string; shape?: NodeShape }[] =>
+    part
+      .split(/\s*&\s*/)
+      .map((p) => parseNodeToken(p))
+      .filter((t): t is { id: string; label?: string; shape?: NodeShape } => !!t);
 
   for (const raw of lines) {
     const line = raw.trim().replace(/;$/, '');
-    if (!line || line.startsWith('%%') || /^(?:flowchart|graph|subgraph|end|classDef|class|style|linkStyle|click|direction)\b/i.test(line)) {
+    if (!line || line.startsWith('%%')) continue;
+    const subMatch = /^subgraph\s+(.+)$/i.exec(line);
+    if (subMatch) {
+      const rest = subMatch[1].trim();
+      const bracketed = /^([a-zA-Z_][\w-]*)\s*\[([\s\S]+)\]$/.exec(rest);
+      const id = bracketed ? bracketed[1] : sanitizeId(unquote(rest), `Group_${groupSeq++}`);
+      const label = bracketed ? unquote(bracketed[2]) : unquote(rest);
+      if (!groupsMap.has(id)) groupsMap.set(id, { id, label });
+      groupStack.push(id);
       continue;
     }
-    const em = edgeRe.exec(line);
-    if (em) {
-      const left = parseNodeToken(em[1]);
-      const right = parseNodeToken(em[4]);
-      if (left && right) {
-        upsert(left);
-        upsert(right);
-        const rawArrow = em[2];
-        let label = (em[3] ?? '').trim();
-        let style: EdgeStyle = 'solid';
-        if (rawArrow.includes('-.')) {
-          style = 'dashed';
-          if (!label) label = rawArrow.replace(/^-\.\s*/, '').replace(/\s*-\.->$/, '').trim();
-        } else if (rawArrow.includes('==')) {
-          style = 'thick';
-          if (!label) label = rawArrow.replace(/^==\s*/, '').replace(/\s*==>$/, '').trim();
-        } else if (rawArrow === '---') {
-          style = 'open';
-        } else if (!label && rawArrow.length > 3) {
-          label = rawArrow.replace(/^--\s*/, '').replace(/\s*-->$/, '').trim();
-        }
-        edges.push({ id: `e${++edgeIdx}`, from: left.id, to: right.id, label: unquote(label), style });
-        continue;
-      }
+    if (/^end$/i.test(line)) {
+      groupStack.pop();
+      continue;
     }
+    if (/^(?:flowchart|graph|classDef|class|style|linkStyle|click|direction)\b/i.test(line)) {
+      continue;
+    }
+
+    // Parse chained edges (`A --> B --> C`) and `&` fan-in/fan-out (`A & B --> C`).
+    let rest = line;
+    let prev: { id: string; label?: string; shape?: NodeShape }[] | null = null;
+    let matchedAnyEdge = false;
+    while (true) {
+      const m = arrowSplitRe.exec(rest);
+      if (!m || m.index === undefined) break;
+      const leftStr = rest.slice(0, m.index).trim();
+      const rawArrow = m[1];
+      let label = (m[2] ?? '').trim();
+      let style: EdgeStyle = 'solid';
+      if (rawArrow.includes('-.')) {
+        style = 'dashed';
+        if (!label) label = rawArrow.replace(/^-\.\s*/, '').replace(/\s*-\.->$/, '').trim();
+      } else if (rawArrow.includes('==')) {
+        style = 'thick';
+        if (!label) label = rawArrow.replace(/^==\s*/, '').replace(/\s*==>$/, '').trim();
+      } else if (rawArrow === '---') {
+        style = 'open';
+      } else if (!label && rawArrow.length > 3) {
+        label = rawArrow.replace(/^--\s*/, '').replace(/\s*-->$/, '').trim();
+      }
+      const leftList = prev ?? parseEndpointList(leftStr);
+      rest = rest.slice(m.index + m[0].length).trim();
+      const nextArrow = arrowSplitRe.exec(rest);
+      const rightStr = nextArrow && nextArrow.index !== undefined ? rest.slice(0, nextArrow.index).trim() : rest;
+      const rightList = parseEndpointList(rightStr);
+      if (!leftList.length || !rightList.length) break;
+      matchedAnyEdge = true;
+      for (const a of leftList) upsert(a);
+      for (const b of rightList) upsert(b);
+      for (const a of leftList) {
+        for (const b of rightList) {
+          edges.push({ id: `e${++edgeIdx}`, from: a.id, to: b.id, label: unquote(label), style });
+        }
+      }
+      prev = rightList;
+      if (!nextArrow || nextArrow.index === undefined) break;
+      rest = rest.slice(nextArrow.index);
+    }
+    if (matchedAnyEdge) continue;
+
     const single = parseNodeToken(line);
     if (single) upsert(single);
   }
 
-  return layoutFlow({ direction, nodes: [...nodesMap.values()], edges });
+  const groups = [...groupsMap.values()];
+  return layoutFlow({ direction, nodes: [...nodesMap.values()], edges, ...(groups.length ? { groups } : {}) });
 }
 
 export function serializeMermaid(graph: FlowGraph): string {
@@ -345,8 +408,7 @@ export function serializeMermaid(graph: FlowGraph): string {
   const usedIds = new Map<string, string>();
   const seen = new Set<string>();
 
-  for (let i = 0; i < graph.nodes.length; i++) {
-    const n = graph.nodes[i];
+  const emitNode = (n: FlowNode, i: number, indent: string) => {
     let id = sanitizeId(n.id, `N${i + 1}`);
     let suffix = 2;
     while (seen.has(id)) id = `${sanitizeId(n.id, `N${i + 1}`)}_${suffix++}`;
@@ -354,7 +416,29 @@ export function serializeMermaid(graph: FlowGraph): string {
     usedIds.set(n.id, id);
     const [open, close] = SHAPE_SYNTAX[n.shape] ?? SHAPE_SYNTAX.rect;
     const label = escapeLabel(n.label || id);
-    lines.push(`    ${id}${open}"${label}"${close}`);
+    lines.push(`${indent}${id}${open}"${label}"${close}`);
+  };
+
+  if (graph.groups?.length) {
+    const grouped = new Set<string>();
+    for (const grp of graph.groups) {
+      const members = graph.nodes.filter((n) => n.group === grp.id);
+      if (!members.length) continue;
+      const gid = sanitizeId(grp.id, 'Group');
+      lines.push(`    subgraph ${gid}["${escapeLabel(grp.label || gid)}"]`);
+      for (const n of members) {
+        grouped.add(n.id);
+        emitNode(n, graph.nodes.indexOf(n), '        ');
+      }
+      lines.push('    end');
+    }
+    graph.nodes.forEach((n, i) => {
+      if (!grouped.has(n.id)) emitNode(n, i, '    ');
+    });
+  } else {
+    for (let i = 0; i < graph.nodes.length; i++) {
+      emitNode(graph.nodes[i], i, '    ');
+    }
   }
 
   for (const e of graph.edges) {

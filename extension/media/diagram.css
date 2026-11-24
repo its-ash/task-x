@@ -114,6 +114,9 @@ body { display: flex; flex-direction: column; }
 .arrow-head { fill: var(--on-surface-variant); }
 .arrow-head.selected { fill: var(--accent); }
 
+.flow-group .group-box { fill: color-mix(in oklch, var(--accent) 5%, var(--surface)); stroke: var(--border-strong); stroke-width: 1.25; stroke-dasharray: 5 4; rx: 14; }
+.flow-group .group-title { fill: var(--on-surface-variant); font-size: 11px; font-weight: 700; letter-spacing: 0.02em; pointer-events: none; }
+
 .flow-node { cursor: move; }
 .flow-node .node-shape { fill: var(--surface); stroke: var(--border-strong); stroke-width: 1.4; filter: drop-shadow(0 2px 6px oklch(0.08 0.01 260 / 0.16)); transition: stroke 140ms var(--ease), fill 140ms var(--ease); }
 .flow-node:hover .node-shape { stroke: var(--accent); fill: var(--surface-high); }
