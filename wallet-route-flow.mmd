@@ -1,0 +1,111 @@
+flowchart TD
+  classDef route fill:#eef4ff,stroke:#3b6fd8,color:#1b2a4a;
+  classDef comp fill:#f7f7f7,stroke:#888,color:#222;
+  classDef api fill:#eaf7ee,stroke:#2f9a55,color:#123d22;
+  classDef dec fill:#fffbe6,stroke:#c9a400,color:#3d3200;
+  classDef ext fill:#fff4e5,stroke:#d98a1b,color:#4a3210;
+
+  %% ═════════════ ENTRY: /wealth/wallet ═════════════
+  Entry(["/wealth/wallet"]):::route --> WalletPage["routes/wallet/index.tsx"]:::route
+  WalletPage -.->|fetch| ApiSummary[["getWalletSummary<br/>GET /summary"]]:::api
+  ApiSummary --> DSummary{Summary loaded?}:::dec
+  DSummary -->|pending| WalletOverviewLoading[WalletOverview<br/>loading = true]:::comp
+  DSummary -->|failed| RetryCard[RetryCard]:::comp
+  DSummary -->|success| WalletOverview[WalletOverview<br/>loading = false]:::comp
+
+  WalletOverviewLoading -->|each card shows its skeleton| ActionsMain
+
+  %% ── Actions card ──
+  WalletOverview --> ActionsMain[WalletActionsCardMain]:::comp
+  ActionsMain --> DActLoad{loading?}:::dec
+  DActLoad -->|yes| ActionsLoader[WalletActionsCardLoader]:::comp
+  DActLoad -->|no| ActionsCard[WalletActionsCard]:::comp
+  ActionsCard --> DAction{User action}:::dec
+  DAction -->|Add money| PayDeposit["/payments/deposit"]:::ext
+  DAction -->|Withdraw| PayWithdraw["/payments/withdrawal"]:::ext
+  DAction -->|Move| PayTransfer["/payments/transfer"]:::ext
+
+  %% ── Summary card ──
+  WalletOverview --> SummaryCard[WalletSummaryCard]:::comp
+
+  %% ── Auto-deposit entry card ──
+  WalletOverview --> EntryCard[AutoDepositEntryCard]:::comp
+  EntryCard -.->|fetch up to 3 plans| ApiPlansPreview[["getAutoDeposits<br/>GET /recurring-plans"]]:::api
+  ApiPlansPreview --> DPlans{Plans found?}:::dec
+  DPlans -->|pending| EntrySkeleton[AutoDepositEntryCardSkeleton]:::comp
+  DPlans -->|yes| EntryList[AutoDepositEntryCardList]:::comp
+  DPlans -->|none or failed| EntryPrompt[AutoDepositEntryCardMain]:::comp
+  EntryList --> PlanRow["AutoDepositPlanRow (max 3)"]:::comp
+  EntryList -->|click header| ManageEntry
+  EntryPrompt -->|click card| ManageEntry
+
+  %% ── Recent activity card ──
+  WalletOverview --> RecentCard[RecentActivityCard]:::comp
+  RecentCard -.->|fetch latest 3| ApiRecent[["getRecentActivity<br/>GET /transactions"]]:::api
+  ApiRecent --> DRecent{Activity result?}:::dec
+  DRecent -->|pending| RecentLoader[RecentActivityLoader]:::comp
+  DRecent -->|failed| RetryCard
+  DRecent -->|empty| RecentEmpty[RecentActivityEmpty]:::comp
+  DRecent -->|has items| RecentRow[RecentActivityRow]:::comp
+  RecentRow -->|opens| OrderDrawer[OrderDetailDrawer]:::comp
+  RecentCard -->|click See all| ActivitiesEntry
+
+  %% ═════════════ /wealth/wallet/recent-activities ═════════════
+  ActivitiesEntry(["/wealth/wallet/recent-activities"]):::route --> ActivitiesPage["recent-activities/index.tsx"]:::route
+  ActivitiesPage -.->|"page 1, filters, ?isin"| ApiTxns[["getAccountTransactions<br/>GET /transactions"]]:::api
+  ActivitiesPage -.->|filter options| ApiFilters[["getRecentActivityFilters<br/>GET /transactions/filters"]]:::api
+  ApiTxns --> DInitial{Initial load done?}:::dec
+  DInitial -->|no| ActLoader[RecentActivityViewLoader]:::comp
+  DInitial -->|yes| DTxns{Result?}:::dec
+  DTxns -->|error| ActError["Could not load message"]:::comp
+  DTxns -->|empty| ActEmpty[RecentActivityViewEmpty]:::comp
+  DTxns -->|has items| ActRows[RecentActivityRow list]:::comp
+  ActRows --> DMore{More pages?}:::dec
+  DMore -->|yes, scroll or Load more| ApiTxns
+  DMore -->|no| CaughtUp[All caught up]:::comp
+
+  ApiFilters --> DDevice{Screen size}:::dec
+  DDevice -->|desktop| FilterPanel[FilterPanel]:::comp
+  FilterPanel --> FilterPanelContent[FilterPanelContent]:::comp
+  DDevice -->|mobile| SingleFilter["SingleFilterContent<br/>type / status"]:::comp
+  FilterPanelContent -->|apply, reset to page 1| ApiTxns
+  SingleFilter -->|apply, reset to page 1| ApiTxns
+  ActivitiesPage -->|Back| Entry
+
+  %% ═════════════ /wealth/wallet/manage ═════════════
+  ManageEntry(["/wealth/wallet/manage"]):::route --> ManagePage["manage/index.tsx"]:::route
+  ManagePage --> PageHeader[PageHeader]:::comp
+  ManagePage -.->|active, paused, pending| ApiPlans[["getAutoDeposits<br/>GET /recurring-plans"]]:::api
+  ApiPlans --> DManage{Plans loaded?}:::dec
+  DManage -->|pending| ManageLoader[AutoDepositManageLoader]:::comp
+  DManage -->|failed| PageError[PageError]:::comp
+  PageError -->|Try again| ApiPlans
+  DManage -->|success| ManageMain[AutoDepositManageMain]:::comp
+
+  ManageMain --> DActive{"Active count > 0?"}:::dec
+  DActive -->|yes| AdSummary[AutoDepositSummary]:::comp
+  AdSummary --> TreeGrow[TreeGrow]:::comp
+  ManageMain --> DSections{Which plans exist?}:::dec
+  DSections -->|active| SectionActive[AutoDepositSection<br/>active]:::comp
+  DSections -->|paused| SectionPaused[AutoDepositSection<br/>paused]:::comp
+  DSections -->|unlinked funds| InactiveCard[InactiveDepositCard]:::comp
+  DSections -->|no active and no paused| ManageEmpty[Empty state]:::comp
+  SectionActive --> AdBadge[AutoDepositBadge]:::comp
+  SectionPaused --> AdBadge
+  SectionActive --> AdCard[AutoDepositCard]:::comp
+  SectionPaused --> AdCard
+  AdCard -->|click plan| DetailEntry
+  InactiveCard -->|Set up| PayAutoDeposit["/payments/auto-deposit"]:::ext
+  PayAutoDeposit -->|returns to referrer| ManageEntry
+  ManagePage -->|Back or breadcrumb| Entry
+
+  %% ═════════════ /wealth/wallet/manage/:id ═════════════
+  DetailEntry(["/wealth/wallet/manage/:id"]):::route --> DetailPage["manage/[id]/index.tsx"]:::route
+  DetailPage -->|planId| AdDetail[AutoDepositDetail]:::comp
+  AdDetail -.->|fetch plan| ApiPlan[["getAutoDepositPlan<br/>GET /recurring-plans/:id"]]:::api
+  ApiPlan --> DPlan{Plan found?}:::dec
+  DPlan -->|pending| DetailSkeleton[AutoDepositDetailSkeleton]:::comp
+  DPlan -->|yes| DetailContent[AutoDepositDetailContent]:::comp
+  DPlan -->|no or failed| PlanUnavailable[PlanUnavailable]:::comp
+  PlanUnavailable -->|auto return| ManageEntry
+  DetailContent -->|Back| ManageEntry

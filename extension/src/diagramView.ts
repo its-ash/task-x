@@ -12,6 +12,7 @@ type Inbound =
   | { type: 'autoFlow'; level?: 'module' | 'file'; direction?: FlowDirection; focus?: string }
   | { type: 'askAgent'; prompt: string }
   | { type: 'openMermaid' }
+  | { type: 'refreshFile' }
   | { type: 'saveMermaid'; code: string }
   | { type: 'exportSvg'; svg: string }
   | { type: 'sendToChat'; code: string }
@@ -80,7 +81,7 @@ export class DiagramPanel {
     this.post({ type: 'load', graph, code: trimmed || serializeMermaid(graph) });
   }
 
-  private async openFile(uri: vscode.Uri): Promise<void> {
+  private async openFile(uri: vscode.Uri, refreshed = false): Promise<void> {
     try {
       const bytes = await vscode.workspace.fs.readFile(uri);
       let text = Buffer.from(bytes).toString('utf8');
@@ -88,7 +89,7 @@ export class DiagramPanel {
       if (fenced) text = fenced[1];
       this.setCurrentFile(uri);
       this.loadCode(text);
-      this.post({ type: 'status', text: `Opened ${vscode.workspace.asRelativePath(uri)}`, busy: false });
+      this.post({ type: 'status', text: `${refreshed ? 'Refreshed' : 'Opened'} ${vscode.workspace.asRelativePath(uri)}`, busy: false });
     } catch (e) {
       this.post({ type: 'status', text: `Could not open file: ${describeError(e)}`, busy: false });
     }
@@ -134,7 +135,7 @@ export class DiagramPanel {
         } else if (autoGenerate) {
           await this.loadAutoFlow('module', 'LR');
         } else {
-          await this.loadAutoFlow('module', 'LR');
+          this.post({ type: 'load', code: '' });
         }
         break;
       }
@@ -169,6 +170,14 @@ export class DiagramPanel {
         });
         if (!picked?.[0]) return;
         await this.openFile(picked[0]);
+        break;
+      }
+      case 'refreshFile': {
+        if (this.currentFile) {
+          await this.openFile(this.currentFile, true);
+        } else {
+          this.post({ type: 'rerender' });
+        }
         break;
       }
       case 'dropFiles': {
@@ -281,6 +290,7 @@ export class DiagramPanel {
     <button type="button" id="copyBtn" class="btn icon" title="Copy Mermaid code"><span class="codicon codicon-copy" aria-hidden="true"></span></button>
     <button type="button" id="chatBtn" class="btn icon" title="Insert Mermaid into Chat"><span class="codicon codicon-send" aria-hidden="true"></span></button>
     <button type="button" id="openBtn" class="btn icon" title="Open .mmd / .mermaid file"><span class="codicon codicon-folder-opened" aria-hidden="true"></span></button>
+    <button type="button" id="refreshBtn" class="btn icon" title="Refresh from opened file"><span class="codicon codicon-refresh" aria-hidden="true"></span></button>
     <button type="button" id="saveBtn" class="btn icon" title="Save .mmd / .md file"><span class="codicon codicon-save" aria-hidden="true"></span></button>
     <button type="button" id="svgBtn" class="btn icon" title="Export SVG"><span class="codicon codicon-export" aria-hidden="true"></span></button>
   </div>
@@ -290,6 +300,14 @@ export class DiagramPanel {
   <main class="canvas-wrap" id="canvasWrap">
     <div id="stage" class="stage">
       <div id="mermaidHost" class="mermaid-host"></div>
+    </div>
+    <div id="emptyState" class="empty-state" hidden>
+      <div class="empty-card">
+        <span class="codicon codicon-file-code empty-icon" aria-hidden="true"></span>
+        <div class="empty-title">Open a Mermaid file</div>
+        <div class="empty-sub">Open a .mmd or .mermaid file, drop one onto the canvas, or add a card to start.</div>
+        <button type="button" id="emptyOpenBtn" class="btn primary"><span class="codicon codicon-folder-opened" aria-hidden="true"></span><span>Open File</span></button>
+      </div>
     </div>
     <div id="statusBar" class="status-bar" role="status" aria-live="polite"></div>
 

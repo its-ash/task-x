@@ -184,6 +184,29 @@
     return raw.replace(/^flowchart-/, '').replace(/-\d+$/, '');
   }
 
+  function parseSafeSvg(svgText) {
+    const doc = new DOMParser().parseFromString(svgText, 'text/html');
+    const svg = doc.body.querySelector('svg');
+    if (!svg) return null;
+    svg.querySelectorAll('script, iframe, object, embed').forEach((n) => n.remove());
+    for (const n of svg.querySelectorAll('*')) {
+      for (const a of [...n.attributes]) {
+        if (/^on/i.test(a.name) || (/^(?:href|xlink:href)$/i.test(a.name) && /^\s*javascript:/i.test(a.value))) n.removeAttribute(a.name);
+      }
+    }
+    return document.importNode(svg, true);
+  }
+
+  function getSvgNaturalSize(svgEl) {
+    const vb = (svgEl.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(Number);
+    if (vb.length === 4 && vb[2] > 0 && vb[3] > 0) return { w: vb[2], h: vb[3] };
+    const w = parseFloat(svgEl.getAttribute('width') || '');
+    const h = parseFloat(svgEl.getAttribute('height') || '');
+    if (w > 0 && h > 0) return { w, h };
+    const bbox = svgEl.getBoundingClientRect();
+    return { w: bbox.width / pan.scale || 400, h: bbox.height / pan.scale || 300 };
+  }
+
   function applyTransform() {
     host.style.transform = `translate(${pan.x}px, ${pan.y}px) scale(${pan.scale})`;
     $('zoomVal').textContent = `${Math.round(pan.scale * 100)}%`;
@@ -193,11 +216,9 @@
     const svgEl = host.querySelector('svg');
     if (!svgEl) { pan = { x: 40, y: 40, scale: 1 }; applyTransform(); return; }
     const stageRect = stage.getBoundingClientRect();
-    const bbox = svgEl.getBoundingClientRect();
-    const rawW = bbox.width / pan.scale || 400;
-    const rawH = bbox.height / pan.scale || 300;
+    const { w: rawW, h: rawH } = getSvgNaturalSize(svgEl);
     const pad = 96;
-    const scale = Math.max(0.2, Math.min(1.35, Math.min((stageRect.width - pad) / Math.max(1, rawW), (stageRect.height - pad) / Math.max(1, rawH))));
+    const scale = Math.max(0.08, Math.min(1.35, Math.min((stageRect.width - pad) / Math.max(1, rawW), (stageRect.height - pad) / Math.max(1, rawH))));
     pan = {
       scale,
       x: Math.round((stageRect.width - rawW * scale) / 2 - 48 * scale),
@@ -249,6 +270,8 @@
     $('dirBtn').textContent = getDirection(code);
     if (document.activeElement !== mermaidText) mermaidText.value = code;
     const trimmed = code.trim();
+    const emptyState = $('emptyState');
+    if (emptyState) emptyState.hidden = !!trimmed;
     if (!trimmed) {
       host.replaceChildren();
       renderedSvg = '';
@@ -268,11 +291,15 @@
         res = await window.mermaid.render(`${id}-s`, fixed);
       }
       renderedSvg = res.svg;
-      const doc = new DOMParser().parseFromString(res.svg, 'image/svg+xml');
-      const svgEl = doc.documentElement;
-      if (svgEl && svgEl.nodeName.toLowerCase() === 'svg') {
+      const svgEl = parseSafeSvg(res.svg);
+      if (svgEl) {
         svgEl.removeAttribute('style');
-        host.replaceChildren(document.importNode(svgEl, true));
+        const vb = (svgEl.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(Number);
+        if (vb.length === 4 && vb[2] > 0 && vb[3] > 0) {
+          svgEl.setAttribute('width', String(Math.ceil(vb[2])));
+          svgEl.setAttribute('height', String(Math.ceil(vb[3])));
+        }
+        host.replaceChildren(svgEl);
         host.querySelectorAll('svg .node').forEach((nodeEl) => {
           nodeEl.addEventListener('click', (ev) => {
             ev.stopPropagation();
@@ -377,7 +404,7 @@
     const r = stage.getBoundingClientRect();
     const mx = e.clientX - r.left, my = e.clientY - r.top;
     const factor = e.deltaY < 0 ? 1.12 : 0.9;
-    const next = Math.max(0.2, Math.min(3, pan.scale * factor));
+    const next = Math.max(0.08, Math.min(3, pan.scale * factor));
     pan.x = mx - ((mx - pan.x) * next) / pan.scale;
     pan.y = my - ((my - pan.y) * next) / pan.scale;
     pan.scale = next;
@@ -541,7 +568,7 @@
     void renderDiagram(false);
   });
   $('delBtn').addEventListener('click', deleteSelected);
-  $('zoomOutBtn').addEventListener('click', () => { pan.scale = Math.max(0.2, pan.scale - 0.15); applyTransform(); });
+  $('zoomOutBtn').addEventListener('click', () => { pan.scale = Math.max(0.08, pan.scale - 0.15); applyTransform(); });
   $('zoomInBtn').addEventListener('click', () => { pan.scale = Math.min(3, pan.scale + 0.15); applyTransform(); });
   $('fitBtn').addEventListener('click', fitToView);
   $('codeToggleBtn').addEventListener('click', () => {
@@ -560,6 +587,8 @@
   $('copyBtn').addEventListener('click', () => vscode.postMessage({ type: 'copyText', text: code }));
   $('chatBtn').addEventListener('click', () => vscode.postMessage({ type: 'sendToChat', code }));
   $('openBtn').addEventListener('click', () => vscode.postMessage({ type: 'openMermaid' }));
+  $('emptyOpenBtn')?.addEventListener('click', () => vscode.postMessage({ type: 'openMermaid' }));
+  $('refreshBtn').addEventListener('click', () => vscode.postMessage({ type: 'refreshFile' }));
   $('saveBtn').addEventListener('click', () => vscode.postMessage({ type: 'saveMermaid', code }));
   $('svgBtn').addEventListener('click', () => {
     if (renderedSvg) vscode.postMessage({ type: 'exportSvg', svg: renderedSvg });
@@ -602,6 +631,13 @@
       selNodeId = prevId;
       void renderDiagram(true);
       setStatus(m.files.length === 1 ? `Added file step: ${m.files[0].path}` : `Added ${m.files.length} file steps`);
+    } else if (m.type === 'rerender') {
+      if (code.trim()) {
+        void renderDiagram(true);
+        setStatus('Refreshed diagram');
+      } else {
+        setStatus('Open a .mmd file to refresh');
+      }
     } else if (m.type === 'status') {
       setStatus(m.text);
     }
