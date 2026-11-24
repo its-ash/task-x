@@ -149,7 +149,7 @@
     return d === 'LR' || d === 'RL' ? 'LR' : 'TD';
   }
 
-  const EDGE_RE = /^(\s*)([a-zA-Z_][\w-]*)([^\n]*?)\s+(-->|-\.->|==>|--o|--x|<-->|---)\s*(?:\|([^|]*)\|\s*)?([a-zA-Z_][\w-]*)(.*)$/;
+  const EDGE_RE = /^(\s*)([a-zA-Z_][\w-]*)([^\n]*?)\s*(-->|-\.->|==>|--o|--x|<-->|---)\s*(?:\|([^|]*)\|\s*)?([a-zA-Z_][\w-]*)(.*)$/;
 
   function unquote(t) {
     const s = String(t || '').trim();
@@ -218,11 +218,11 @@
 
   function extractNodeIdFromDom(el) {
     const dataId = el?.getAttribute('data-id');
-    if (dataId && !/^flowchart-/.test(dataId)) return dataId;
+    if (dataId && !/flowchart-/.test(dataId)) return dataId;
     const raw = dataId || el?.id || '';
-    const m = /^flowchart-(.+)-\d+$/.exec(raw);
+    const m = /(?:^|-)flowchart-(.+)-\d+$/.exec(raw);
     if (m) return m[1];
-    return raw.replace(/^flowchart-/, '').replace(/-\d+$/, '');
+    return raw.replace(/^.*flowchart-/, '').replace(/-\d+$/, '');
   }
 
   function parseSafeSvg(svgText) {
@@ -347,20 +347,34 @@
     });
   }
 
-  function anchorOnBox(box, target) {
-    const dx = target.x - box.x;
-    const dy = target.y - box.y;
-    const hw = Math.max(10, box.w / 2);
-    const hh = Math.max(10, box.h / 2);
-    if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) return { x: box.x, y: box.y };
-    const t = Math.min(hw / Math.max(0.01, Math.abs(dx)), hh / Math.max(0.01, Math.abs(dy)));
-    return { x: box.x + dx * t, y: box.y + dy * t };
+  function resolveEdgeEndpoints(pathEl, idx, boxes, edges) {
+    const cls = pathEl.getAttribute('class') || '';
+    const ls = /\bLS_([^\s]+)/.exec(cls);
+    const le = /\bLE_([^\s]+)/.exec(cls);
+    if (ls && le && boxes.has(ls[1]) && boxes.has(le[1])) {
+      return { from: ls[1], to: le[1] };
+    }
+    const rawId = pathEl.getAttribute('data-id') || pathEl.id || '';
+    if (rawId) {
+      const stripped = rawId.replace(/^.*?(?:^|-)L[_-]/, '').replace(/[_-]\d+$/, '');
+      for (const k1 of boxes.keys()) {
+        for (const sep of ['_', '-']) {
+          const prefix = k1 + sep;
+          if (stripped.startsWith(prefix)) {
+            const rest = stripped.slice(prefix.length);
+            if (boxes.has(rest)) return { from: k1, to: rest };
+          }
+        }
+      }
+    }
+    const fallback = edges[idx];
+    return fallback ? { from: fallback.from, to: fallback.to } : null;
   }
 
   function applyNodeOffsets(svgEl, edgesList) {
     if (!svgEl) return;
     const boxes = new Map();
-    svgEl.querySelectorAll('.node').forEach((nodeEl) => {
+    svgEl.querySelectorAll('.node, g[data-id][id^="flowchart-"]').forEach((nodeEl) => {
       const nid = extractNodeIdFromDom(nodeEl);
       if (!nid) return;
       if (nodeEl.dataset.baseX === undefined) {
@@ -384,30 +398,61 @@
     });
     if (!nodeOffsets.size) return;
     const edges = edgesList || parseEdgesFromCode(code);
-    const paths = [...svgEl.querySelectorAll('.edgePaths path.flowchart-link')];
+    const paths = [...svgEl.querySelectorAll('path[data-edge="true"], .edgePaths path.flowchart-link, .edgePaths path')].filter((el, i, arr) => arr.indexOf(el) === i);
     const labels = [...svgEl.querySelectorAll('.edgeLabels .edgeLabel')];
-    const isLR = getDirection(code) === 'LR';
-    edges.forEach((edge, idx) => {
-      const fromOff = nodeOffsets.get(edge.from);
-      const toOff = nodeOffsets.get(edge.to);
+    const labelById = new Map();
+    labels.forEach((lbl) => {
+      const lid = lbl.getAttribute('data-id') || lbl.querySelector('[data-id]')?.getAttribute('data-id');
+      if (lid) labelById.set(lid, lbl);
+    });
+    const pairCounts = new Map();
+    paths.forEach((path, idx) => {
+      const ep = resolveEdgeEndpoints(path, idx, boxes, edges);
+      if (!ep) return;
+      const fromOff = nodeOffsets.get(ep.from);
+      const toOff = nodeOffsets.get(ep.to);
       if ((!fromOff || (fromOff.dx === 0 && fromOff.dy === 0)) && (!toOff || (toOff.dx === 0 && toOff.dy === 0))) return;
-      const fromBox = boxes.get(edge.from);
-      const toBox = boxes.get(edge.to);
-      const path = paths[idx];
-      if (!fromBox || !toBox || !path) return;
-      const p1 = anchorOnBox(fromBox, toBox);
-      const p2 = anchorOnBox(toBox, fromBox);
-      const dx = p2.x - p1.x;
-      const dy = p2.y - p1.y;
-      const c1x = isLR ? p1.x + dx * 0.45 : p1.x;
-      const c1y = isLR ? p1.y : p1.y + dy * 0.45;
-      const c2x = isLR ? p2.x - dx * 0.45 : p2.x;
-      const c2y = isLR ? p2.y : p2.y - dy * 0.45;
+      const fromBox = boxes.get(ep.from);
+      const toBox = boxes.get(ep.to);
+      if (!fromBox || !toBox) return;
+
+      const pairKey = [ep.from, ep.to].sort().join('::');
+      const seen = pairCounts.get(pairKey) || 0;
+      pairCounts.set(pairKey, seen + 1);
+      const spread = seen > 0 ? (seen % 2 === 1 ? 1 : -1) * Math.ceil(seen / 2) * 26 : 0;
+
+      const dx = toBox.x - fromBox.x;
+      const dy = toBox.y - fromBox.y;
+      const horiz = Math.abs(dx) >= Math.abs(dy);
+      let p1, p2, c1x, c1y, c2x, c2y;
+      if (ep.from === ep.to) {
+        const rx = fromBox.x + fromBox.w / 2;
+        const ry = fromBox.y;
+        p1 = { x: rx, y: ry - 8 };
+        p2 = { x: rx, y: ry + 8 };
+        c1x = rx + 64; c1y = ry - 48;
+        c2x = rx + 64; c2y = ry + 48;
+      } else if (horiz) {
+        const sgn = dx >= 0 ? 1 : -1;
+        p1 = { x: fromBox.x + sgn * (fromBox.w / 2), y: fromBox.y + spread * 0.25 };
+        p2 = { x: toBox.x - sgn * (toBox.w / 2 + 4), y: toBox.y + spread * 0.25 };
+        const span = Math.max(36, Math.abs(p2.x - p1.x) * 0.45);
+        c1x = p1.x + sgn * span; c1y = p1.y + spread;
+        c2x = p2.x - sgn * span; c2y = p2.y + spread;
+      } else {
+        const sgn = dy >= 0 ? 1 : -1;
+        p1 = { x: fromBox.x + spread * 0.25, y: fromBox.y + sgn * (fromBox.h / 2) };
+        p2 = { x: toBox.x + spread * 0.25, y: toBox.y - sgn * (toBox.h / 2 + 4) };
+        const span = Math.max(36, Math.abs(p2.y - p1.y) * 0.45);
+        c1x = p1.x + spread; c1y = p1.y + sgn * span;
+        c2x = p2.x + spread; c2y = p2.y - sgn * span;
+      }
       path.setAttribute('d', `M${p1.x.toFixed(1)},${p1.y.toFixed(1)}C${c1x.toFixed(1)},${c1y.toFixed(1)},${c2x.toFixed(1)},${c2y.toFixed(1)},${p2.x.toFixed(1)},${p2.y.toFixed(1)}`);
-      const lbl = labels[idx];
+      const edgeId = path.getAttribute('data-id') || path.id || '';
+      const lbl = (edgeId && labelById.get(edgeId)) || labels[idx];
       if (lbl) {
-        const mx = (p1.x + p2.x) / 2;
-        const my = (p1.y + p2.y) / 2;
+        const mx = 0.125 * p1.x + 0.375 * c1x + 0.375 * c2x + 0.125 * p2.x;
+        const my = 0.125 * p1.y + 0.375 * c1y + 0.375 * c2y + 0.125 * p2.y;
         lbl.setAttribute('transform', `translate(${mx.toFixed(1)}, ${my.toFixed(1)})`);
       }
     });
@@ -636,7 +681,8 @@
           highlightSelected();
           syncInspector();
         };
-        host.querySelectorAll('svg .edgePaths path.flowchart-link').forEach((p, idx) => {
+        const edgePaths = [...host.querySelectorAll('svg path[data-edge="true"], svg .edgePaths path.flowchart-link, svg .edgePaths path')].filter((el, i, arr) => arr.indexOf(el) === i);
+        edgePaths.forEach((p, idx) => {
           p.addEventListener('click', (ev) => selectEdgeByIdx(idx, ev));
         });
         host.querySelectorAll('svg .edgeLabels .edgeLabel').forEach((lbl, idx) => {
