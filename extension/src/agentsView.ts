@@ -12,6 +12,7 @@ type Source = {
   readonly onDidChangeLanes: vscode.Event<void>;
   laneAction(tabId: string, taskId: string, action: LaneAction, text?: string): Promise<void>;
   revealChatTab(tabId: string): Promise<boolean>;
+  cancel(tabId?: string): void;
 };
 
 type ChatNode = { kind: 'chat'; chat: AgentChat };
@@ -56,7 +57,7 @@ function laneIcon(l: Lane): vscode.ThemeIcon {
 function contextValue(l: Lane): string {
   const run = l.status === 'running';
   const control = run && l.stoppable !== false;
-  return ['lane', run && 'run', control && 'msg', control && 'stop', !run && l.status !== 'completed' && 'retry', pendingMerge(l) && 'merge'].filter(Boolean).join(':');
+  return ['lane', run && 'run', control && 'msg', run && 'stop', !run && l.status !== 'completed' && 'retry', pendingMerge(l) && 'merge'].filter(Boolean).join(':');
 }
 
 export class AgentsView implements vscode.TreeDataProvider<Node>, vscode.Disposable {
@@ -107,7 +108,7 @@ export class AgentsView implements vscode.TreeDataProvider<Node>, vscode.Disposa
       const runningChats = chats.filter((c) => c.running).length;
       const running = runningChats + runningSubagents;
       this.tree.badge = running ? { value: running, tooltip: `${running} active agent${running === 1 ? '' : 's'}` } : undefined;
-      void vscode.commands.executeCommand('setContext', 'task-x.agentsRunning', runningSubagents > 0);
+      void vscode.commands.executeCommand('setContext', 'task-x.agentsRunning', running > 0);
       if (running && !this.tick) this.tick = setInterval(() => this.changed.fire(), TICK_MS);
       if (!running && this.tick) {
         clearInterval(this.tick);
@@ -144,7 +145,7 @@ export class AgentsView implements vscode.TreeDataProvider<Node>, vscode.Disposa
         : chat.running
           ? 'Running'
           : 'Idle';
-      item.contextValue = 'chat';
+      item.contextValue = chat.running ? 'chat:run' : 'chat';
       item.command = { command: 'task-x.agents.showChat', title: 'Show Chat', arguments: [n] };
       return item;
     }
@@ -169,8 +170,19 @@ export class AgentsView implements vscode.TreeDataProvider<Node>, vscode.Disposa
 
   private async act(n: Node | undefined, action: LaneAction): Promise<void> {
     const node = n ?? this.tree.selection[0];
-    if (node?.kind !== 'lane') return;
-    await this.source.laneAction(node.tabId, node.lane.taskId, action);
+    if (!node) return;
+    if (node.kind === 'chat') {
+      if (action === 'stop') {
+        this.source.cancel(node.chat.tabId);
+        this.refresh();
+      }
+      return;
+    }
+    if (action === 'stop' && node.lane.stoppable === false) {
+      this.source.cancel(node.tabId);
+    } else {
+      await this.source.laneAction(node.tabId, node.lane.taskId, action);
+    }
     this.refresh();
   }
 
@@ -189,8 +201,10 @@ export class AgentsView implements vscode.TreeDataProvider<Node>, vscode.Disposa
   private async stopAll(): Promise<void> {
     const stops: Promise<void>[] = [];
     for (const chat of this.source.agentChats()) {
+      if (chat.running) this.source.cancel(chat.tabId);
       for (const l of chat.lanes) if (l.status === 'running' && l.stoppable !== false) stops.push(this.source.laneAction(chat.tabId, l.taskId, 'stop'));
     }
     await Promise.allSettled(stops);
+    this.refresh();
   }
 }

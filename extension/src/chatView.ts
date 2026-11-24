@@ -110,7 +110,7 @@ function sessionLimits() {
     return typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(0, v)) : def;
   };
   return {
-    stallMin: n('session.stallMinutes', 30, 24 * 60),
+    stallMin: n('session.stallMinutes', 60, 24 * 60),
     loopHours: n('session.loopMaxHours', 4, 72),
   };
 }
@@ -262,6 +262,7 @@ type Inbound =
   | { type: 'selectSandbox'; enabled: boolean }
   | { type: 'listMcp' }
   | { type: 'restoreTo'; id: string }
+  | { type: 'deletePrompt'; id?: string; promptIndex?: number }
   | { type: 'listTools' }
   | { type: 'toggleTool'; name: string; on: boolean }
   | { type: 'mcpAction'; action: string; name?: string; enable?: boolean }
@@ -280,6 +281,7 @@ type Inbound =
   | { type: 'listFiles'; query: string }
   | { type: 'toggleEditor'; include: boolean }
   | { type: 'showGraph' }
+  | { type: 'editDiagram'; code: string }
   | { type: 'listTasks' }
   | { type: 'openTask'; id: string }
   | { type: 'deleteTask'; id: string }
@@ -631,6 +633,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   onBusyChange?: (busy: boolean) => void;
   /** Opens the project graph panel. */
   onShowGraph?: () => void;
+  /** Opens a Mermaid diagram in the visual flow editor. */
+  onEditDiagram?: (code: string) => void;
   /** Opens the bottom Agents & Terminals panel. */
   onOpenActivity?: () => void;
   /** Opens the live terminal for a command run by an agent. */
@@ -661,9 +665,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.watchNight();
     this.agy = new AgyCli(getClient);
     this.claudeUsage = new ClaudeUsage(ctx.globalState);
-    this.claudeUsage.update();
     if (findClaude()) void this.claudeUsage.refreshUsage();
-    this.agy.update();
     if (findAgy()) void this.agy.refreshUsage();
     // New models or limits from agy / Claude redraw the model picker.
     ctx.subscriptions.push(
@@ -681,6 +683,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
+    const root = WorkspaceSync.root();
+    view.description = root ? path.basename(root) : undefined;
     const media = vscode.Uri.joinPath(this.ctx.extensionUri, 'media');
     view.webview.options = { enableScripts: true, localResourceRoots: [media] };
     view.webview.html = this.html(view.webview, media);
@@ -760,6 +764,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     clearTimeout(this.nightTimer);
     this.nightTimer = undefined;
     this.postQueue();
+  }
+
+  /** Puts text into the chat input box without sending it. */
+  insertPrompt(text: string): void {
+    this.post({ type: 'setInput', text });
   }
 
   /** Empties the current chat tab: a new task, no transcript, and the context meter reset. */
@@ -1015,11 +1024,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const eng = this.tabEngine(tab);
     const claude = eng === 'claudeCode';
     const agy = eng === AGY_KIND;
-    this.agy.update();
     if (findAgy()) void this.agy.refreshUsage();
-    this.claudeUsage.update();
     if (findClaude()) void this.claudeUsage.refreshUsage();
-    this.post({ type: 'status', provider: claude ? CLAUDE_LABEL : agy ? AGY_LABEL : refLabel(ref), model: this.tabModel(tab) || '(no model)', busy: this.runs.has(this.activeTab), sleeping: this.runs.get(this.activeTab)?.sleepingUntil ?? null, chrome: { on: !!this.reviewTab()?.chrome, ...this.chromeStatus }, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null, agent: windowChoice().agent ?? null });
+    const root = WorkspaceSync.root();
+    const workspaceName = root ? path.basename(root) : '';
+    if (this.view) this.view.description = workspaceName || undefined;
+    this.post({ type: 'status', workspaceName, provider: claude ? CLAUDE_LABEL : agy ? AGY_LABEL : refLabel(ref), model: this.tabModel(tab) || '(no model)', busy: this.runs.has(this.activeTab), sleeping: this.runs.get(this.activeTab)?.sleepingUntil ?? null, chrome: { on: !!this.reviewTab()?.chrome, ...this.chromeStatus }, mode: 'agent', editMode: editMode(), autoCommit: this.autoCommit, night: this.night, nightPlanner: nightModels().planner ?? null, nightWorker: nightModels().worker ?? null, refineModel: toolModels().refine ?? null, helperModel: toolModels().helper ?? null, effort: effort() ?? null, sandbox: sandboxOn(), chatMode: activeChatMode()?.name ?? null, agent: windowChoice().agent ?? null });
     void this.postModels();
   }
 
@@ -1576,6 +1586,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       case 'showGraph':
         this.onShowGraph?.();
         break;
+      case 'editDiagram':
+        if (typeof m.code === 'string' && m.code.trim()) this.onEditDiagram?.(m.code);
+        break;
       case 'listTasks':
         await this.postTasks();
         break;
@@ -1669,6 +1682,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         break;
       case 'restoreTo':
         if (typeof m.id === 'string') await this.restoreTo(m.id);
+        break;
+      case 'deletePrompt':
+        await this.deletePrompt(typeof m.id === 'string' ? m.id : undefined, typeof m.promptIndex === 'number' ? m.promptIndex : undefined);
         break;
       case 'listTools':
         await this.postTools();
@@ -2769,7 +2785,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.claudeUsage.recordRateLimit(e.info);
         break;
       case 'subagentStarted':
-        this.add({ kind: 'lane', taskId: e.taskId, name: e.name, role: e.role, agent: e.agent ?? null, objective: e.objective, model: e.model, step: e.step, status: 'running', steps: [], dir: e.dir, stoppable: e.kind !== 'claudeCode', startedMs: Date.now() });
+        this.add({ kind: 'lane', taskId: e.taskId, name: e.name, role: e.role, agent: e.agent ?? null, objective: e.objective, model: e.model, step: e.step, status: 'running', steps: [], dir: e.dir, stoppable: e.kind !== 'claudeCode' && e.kind !== 'antigravity', startedMs: Date.now() });
         this.openSubagentTab(e);
         break;
       case 'subagentFinished': {
@@ -3159,6 +3175,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private markUsed(tab: string): void {
     const t = this.tabs.find((x) => x.id === tab);
     if (t) t.lastUsed = Date.now();
+  }
+
+  private async clearCliSession(taskId: string): Promise<void> {
+    const claude = { ...this.ctx.workspaceState.get<Record<string, string>>(CLAUDE_SESSIONS_KEY, {}) };
+    if (taskId in claude) {
+      delete claude[taskId];
+      await this.ctx.workspaceState.update(CLAUDE_SESSIONS_KEY, claude);
+    }
+    const agy = { ...this.ctx.workspaceState.get<Record<string, string>>(AGY_CONVERSATIONS_KEY, {}) };
+    if (taskId in agy) {
+      delete agy[taskId];
+      await this.ctx.workspaceState.update(AGY_CONVERSATIONS_KEY, agy);
+    }
+  }
+
+  private async deletePrompt(id?: string, promptIndex?: number): Promise<void> {
+    const tab =
+      (id ? this.tabs.find((t) => t.kind === 'chat' && t.items.some((i) => i.kind === 'user' && i.id === id)) : undefined) ??
+      this.tabs.find((t) => t.id === this.activeTab && t.kind === 'chat') ??
+      this.chat;
+    let at = id ? tab.items.findIndex((i) => i.kind === 'user' && i.id === id) : -1;
+    if (at < 0 && typeof promptIndex === 'number' && promptIndex >= 0) {
+      let seen = 0;
+      for (let i = 0; i < tab.items.length; i++) {
+        if (tab.items[i].kind === 'user') {
+          if (seen === promptIndex) {
+            at = i;
+            break;
+          }
+          seen++;
+        }
+      }
+    }
+    if (at < 0) return;
+    const turnIdx = tab.items.slice(0, at).filter((i) => i.kind === 'user').length;
+    if (this.runs.has(tab.id)) this.cancel(tab.id);
+    const taskId = tab.taskId;
+    if (taskId) {
+      try {
+        const client = await this.getClient();
+        await client.request('agent/rewind', { taskId, checkpoint: turnIdx });
+      } catch {
+        // External CLI engines or unsaved runs have no runtime checkpoint.
+      }
+      await this.clearCliSession(taskId);
+    }
+    tab.items.splice(at);
+    if (!tab.items.some((i) => i.kind === 'user')) {
+      tab.taskId = undefined;
+      tab.usage = undefined;
+      tab.tokens = undefined;
+    }
+    await this.persist();
+    if (this.activeTab === tab.id) this.renderTab();
+    this.postTabs();
   }
 
   /** Remembers which edit operations a request made; its message then offers "Restore to here". */
@@ -3677,8 +3748,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const tokens = webview.asWebviewUri(vscode.Uri.joinPath(media, 'tokens.css'));
     const js = webview.asWebviewUri(vscode.Uri.joinPath(media, 'chat.js'));
     const hljs = webview.asWebviewUri(vscode.Uri.joinPath(media, 'vendor', 'highlight.min.js'));
+    const mermaid = webview.asWebviewUri(vscode.Uri.joinPath(media, 'vendor', 'mermaid.min.js'));
     const codicons = webview.asWebviewUri(vscode.Uri.joinPath(media, 'codicons', 'codicon.css'));
-    const csp = `default-src 'none'; style-src ${webview.cspSource}; font-src ${webview.cspSource}; img-src ${webview.cspSource} data:; script-src 'nonce-${nonce}';`;
+    const csp = `default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; font-src ${webview.cspSource}; img-src ${webview.cspSource} data:; script-src 'nonce-${nonce}';`;
     return /* html */ `<!doctype html>
 <html lang="en">
 <head>
@@ -3691,6 +3763,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 </head>
 <body>
 <nav id="views" class="views" aria-label="Chats">
+  <span id="folderChip" class="folder-chip" hidden></span>
   <div id="tabStrip" class="tab-strip" role="tablist" aria-label="Open chats"></div>
   <button type="button" id="newChat" class="action new-tab" title="New chat in a new tab" aria-label="New chat"><span class="codicon codicon-add" aria-hidden="true"></span></button>
   <span class="spacer"></span>
@@ -3737,6 +3810,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   </div>
 </form>
 <script nonce="${nonce}" src="${hljs}"></script>
+<script nonce="${nonce}" src="${mermaid}"></script>
 <script nonce="${nonce}" src="${js}"></script>
 </body>
 </html>`;

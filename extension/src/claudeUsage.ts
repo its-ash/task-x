@@ -2,7 +2,7 @@
 // mirroring AgyCli so Claude limits show in the same status bar slot, model picker note, and `/usage`.
 import { execFile } from 'node:child_process';
 import * as vscode from 'vscode';
-import { type LimitBarWindow, type LimitSummary, resetAt, resetIn, svgProgressBar, unicodeBar } from './agyUsageFormat.js';
+import { type LimitBarWindow, type LimitSummary, resetAt, resetIn } from './agyUsageFormat.js';
 import { CLAUDE_LABEL, findClaude } from './claudeCode.js';
 import { SECTION } from './config.js';
 import type { AgentSummary, ClaudeRateLimitInfo } from './protocol.js';
@@ -31,13 +31,19 @@ const fmtTokens = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)
 
 const windowLabel = (type: string): string => {
   switch (type) {
-    case 'five_hour': return '5h';
+    case 'five_hour': return '5-hour limit';
     case 'daily':
-    case 'one_day': return 'day';
-    case 'seven_day': return 'week';
-    case 'seven_day_opus': return 'week (Opus)';
-    case 'seven_day_sonnet': return 'week (Sonnet)';
-    default: return type.replace(/_/g, ' ');
+    case 'one_day': return 'Daily limit';
+    case 'seven_day': return 'Weekly limit (all models)';
+    case 'seven_day_opus': return 'Weekly limit (Opus)';
+    case 'seven_day_sonnet': return 'Weekly limit (Sonnet)';
+    default: {
+      if (type.startsWith('seven_day_')) {
+        const scope = type.slice('seven_day_'.length).replace(/_/g, ' ');
+        return `Weekly limit (${scope.charAt(0).toUpperCase()}${scope.slice(1)})`;
+      }
+      return type.replace(/_/g, ' ');
+    }
   }
 };
 
@@ -107,7 +113,6 @@ function parseClaudeUsageReport(stdout: string): Record<string, ClaudeRateLimitI
 }
 
 export class ClaudeUsage implements vscode.Disposable {
-  private readonly item = vscode.window.createStatusBarItem('task-x.claudeUsage', vscode.StatusBarAlignment.Right, 97);
   private readonly changedEmitter = new vscode.EventEmitter<void>();
   readonly onDidChange = this.changedEmitter.event;
   private data: StoredClaudeUsage;
@@ -115,8 +120,6 @@ export class ClaudeUsage implements vscode.Disposable {
   private usageLoad?: Promise<void>;
 
   constructor(private readonly state: vscode.Memento) {
-    this.item.name = 'Claude Code limits';
-    this.item.command = 'task-x.claudeUsage';
     this.data = this.load();
   }
 
@@ -152,7 +155,6 @@ export class ClaudeUsage implements vscode.Disposable {
     const key = info.rateLimitType || 'limit';
     this.data.limits[key] = info;
     this.save();
-    this.update();
     this.changedEmitter.fire();
   }
 
@@ -170,21 +172,14 @@ export class ClaudeUsage implements vscode.Disposable {
       }
     }
     this.save();
-    this.update();
     this.changedEmitter.fire();
   }
 
   refreshUsage(force = false): Promise<void> {
     const cliPath = findClaude();
-    if (!cliPath) {
-      this.update();
-      return Promise.resolve();
-    }
+    if (!cliPath) return Promise.resolve();
     if (this.usageLoad) return this.usageLoad;
-    if (!force && Date.now() - this.usageAt < USAGE_TTL_MS) {
-      this.update();
-      return Promise.resolve();
-    }
+    if (!force && Date.now() - this.usageAt < USAGE_TTL_MS) return Promise.resolve();
     this.usageLoad = new Promise<void>((resolve) => {
       execFile(
         cliPath,
@@ -199,7 +194,6 @@ export class ClaudeUsage implements vscode.Disposable {
           }
           this.usageAt = Date.now();
           this.usageLoad = undefined;
-          this.update();
           this.changedEmitter.fire();
           resolve();
         },
@@ -290,25 +284,30 @@ export class ClaudeUsage implements vscode.Disposable {
     return out;
   }
 
-  update(): void {
-    if (!findClaude()) return void this.item.hide();
-    const h5Raw = this.activeLimits().find((l) => l.key === 'five_hour');
-    if (!h5Raw || (h5Raw.remaining === undefined && h5Raw.status !== 'rejected')) return void this.item.hide();
-    const remaining = h5Raw.remaining ?? 0;
-    const remainingPct = Math.round(remaining * 100);
-    const usedPct = 100 - remainingPct;
-    if (remaining <= 0 || usedPct >= 100 || h5Raw.status === 'rejected') return void this.item.hide();
-    this.item.text = `$(pulse) claude 5h ${unicodeBar(usedPct)} ${usedPct}%${h5Raw.resetAt ? ` · ${h5Raw.resetAt}` : ''}`;
-    this.item.tooltip = new vscode.MarkdownString(
-      `**${CLAUDE_LABEL} (5h)**\n\n![${usedPct}%](${svgProgressBar(usedPct)})\n\n${usedPct}% used (${remainingPct}% left${h5Raw.resetAt ? `, resets at ${h5Raw.resetAt}` : ''}${h5Raw.reset ? ` · in ${h5Raw.reset}` : ''})`,
-    );
-    this.item.backgroundColor =
-      remaining < 0.1
-        ? new vscode.ThemeColor('statusBarItem.errorBackground')
-        : remaining < 0.25
-          ? new vscode.ThemeColor('statusBarItem.warningBackground')
-          : undefined;
-    this.item.show();
+  allLimits(): { key: string; label: string; usedPct: number; remainingPct: number; reset?: string; resetAt?: string }[] {
+    return this.activeLimits()
+      .filter((l) => l.remaining !== undefined || l.status === 'rejected')
+      .map((l) => {
+        const remaining = l.remaining ?? 0;
+        const remainingPct = Math.round(remaining * 100);
+        const is5h = l.key === 'five_hour';
+        return {
+          key: l.key,
+          label: l.label,
+          usedPct: 100 - remainingPct,
+          remainingPct,
+          ...(l.reset ? { reset: l.reset } : {}),
+          ...(is5h && l.resetAt ? { resetAt: l.resetAt } : {}),
+        };
+      });
+  }
+
+  dailySummary(): string | undefined {
+    this.ensureToday();
+    const d = this.data.daily;
+    const totalTok = d.inputTokens + d.outputTokens;
+    if (!d.runs && !totalTok && !d.costUsd) return undefined;
+    return `Today (${d.day}): ${d.runs} run${d.runs === 1 ? '' : 's'} · ${fmtTokens(totalTok)} tokens${d.costUsd > 0 ? ` · $${d.costUsd.toFixed(4)}` : ''}`;
   }
 
   async show(): Promise<void> {
@@ -326,7 +325,6 @@ export class ClaudeUsage implements vscode.Disposable {
   }
 
   dispose(): void {
-    this.item.dispose();
     this.changedEmitter.dispose();
   }
 }

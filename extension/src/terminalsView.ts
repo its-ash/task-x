@@ -201,7 +201,7 @@ export class TerminalsView implements vscode.TreeDataProvider<Node>, vscode.Disp
       this.open({ kind: 'proc', proc: match });
       return true;
     }
-    void vscode.commands.executeCommand('workbench.view.extension.task-x-activity');
+    void vscode.commands.executeCommand('task-x.terminals.focus');
     return false;
   }
 

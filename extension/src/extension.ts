@@ -2,10 +2,12 @@ import path from 'node:path';
 import * as vscode from 'vscode';
 import { AgentsView } from './agentsView.js';
 import { BackgroundTasks } from './background.js';
+import { LimitsView } from './limitsView.js';
 import { SymbolLens } from './codeLens.js';
 import { ChatViewProvider, ORIGINAL_SCHEME, OriginalContent, describeError } from './chatView.js';
 import { runBestOf } from './compareView.js';
 import { parseFindings } from './findings.js';
+import { DiagramPanel } from './diagramView.js';
 import { GraphPanel } from './graphView.js';
 import { claudeSignIn, claudeSignOut } from './claudeCode.js';
 import { LogView, levelOf } from './logView.js';
@@ -206,9 +208,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
   ctx.subscriptions.push(
     chat.onDidChangeLanes(syncActivityBadge),
     terminals.onDidChangeCount(syncActivityBadge),
-    vscode.commands.registerCommand('task-x.openActivity', () => vscode.commands.executeCommand('workbench.view.extension.task-x-activity')),
+    vscode.commands.registerCommand('task-x.openActivity', () => vscode.commands.executeCommand('task-x.agents.focus')),
   );
-  chat.onOpenActivity = () => void vscode.commands.executeCommand('workbench.view.extension.task-x-activity');
+  chat.onOpenActivity = () => void vscode.commands.executeCommand('task-x.agents.focus');
   chat.onOpenTerminal = (taskId, cmd) => terminals?.openForTask(taskId, cmd) ?? false;
   chat.foreignApproval = (req) => bg.approve(req);
   chat.onBusyChange = (busy) => {
@@ -285,6 +287,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
   };
   sync.onState(showIndex);
   chat.onShowGraph = () => GraphPanel.show(ctx, client, sync);
+  const sendFromDiagram = (text: string, submit = false) => {
+    if (submit) void chat.submit(text);
+    else chat.insertPrompt(text);
+  };
+  chat.onEditDiagram = (code) => DiagramPanel.show(ctx, client, sendFromDiagram, code);
   // The chips in the chat input follow the active editor and selection.
   let editorTimer: NodeJS.Timeout | undefined;
   const editorChanged = () => {
@@ -519,6 +526,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     chat,
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewId, chat, { webviewOptions: { retainContextWhenHidden: true } }),
     new AgentsView(chat),
+    (() => {
+      const limitsView = new LimitsView(chat.agy, chat.claudeUsage);
+      const reg = vscode.window.registerWebviewViewProvider(LimitsView.viewId, limitsView, { webviewOptions: { retainContextWhenHidden: true } });
+      return vscode.Disposable.from(reg, limitsView);
+    })(),
     new SymbolLens((text, mode) => chat.submit(text, mode)),
     vscode.commands.registerCommand('task-x.openChat', () => vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`)),
     vscode.commands.registerCommand('task-x.selectProvider', selectProvider),
@@ -573,6 +585,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.window.onDidChangeActiveTextEditor(editorChanged),
     vscode.window.onDidChangeTextEditorSelection(editorChanged),
     vscode.commands.registerCommand('task-x.showGraph', () => GraphPanel.show(ctx, client, sync)),
+    vscode.commands.registerCommand('task-x.openDiagram', () => {
+      const ed = vscode.window.activeTextEditor;
+      const selected = ed && !ed.selection.isEmpty ? ed.document.getText(ed.selection) : '';
+      const fromDoc = ed && /\.(?:mmd|mermaid)$/i.test(ed.document.fileName) ? ed.document.getText() : '';
+      DiagramPanel.show(ctx, client, sendFromDiagram, selected || fromDoc || undefined);
+    }),
+    vscode.commands.registerCommand('task-x.generateFlow', () => DiagramPanel.show(ctx, client, sendFromDiagram, undefined, true)),
     vscode.commands.registerCommand('task-x.showFileGraph', (uri?: vscode.Uri) => {
       const target = uri instanceof vscode.Uri ? uri : vscode.window.activeTextEditor?.document.uri;
       const rel = target && WorkspaceSync.relative(target);

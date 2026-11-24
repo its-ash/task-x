@@ -1,0 +1,94 @@
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; background: var(--bg); color: var(--on-surface); font-family: var(--vscode-font-family, system-ui, sans-serif); font-size: 12px; }
+body { display: flex; flex-direction: column; }
+
+.bar { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: var(--surface); border-bottom: 1px solid var(--border); flex: none; overflow-x: auto; }
+.bar-group { display: inline-flex; align-items: center; gap: 4px; flex: none; }
+.spacer { flex: 1; }
+.sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; flex: none; }
+
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 26px; padding: 0 9px; border: 1px solid transparent; border-radius: 6px; font: inherit; font-weight: 500; cursor: pointer; color: var(--on-surface); background: transparent; white-space: nowrap; }
+.btn:hover:not(:disabled) { background: color-mix(in srgb, var(--on-surface) 9%, transparent); }
+.btn:disabled { opacity: .4; cursor: default; }
+.btn.primary { background: var(--accent); color: var(--on-accent); }
+.btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
+.btn.secondary { background: var(--surface-high); border-color: var(--border); }
+.btn.icon { width: 26px; padding: 0; }
+.btn.small { height: 22px; padding: 0 8px; font-size: 11px; }
+
+.select { height: 26px; padding: 0 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-high); color: var(--on-surface); font: inherit; }
+.zoom-val { min-width: 38px; text-align: center; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--on-surface-variant); }
+
+.workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 148px 1fr 224px; }
+.pane-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 8px 10px 6px; }
+
+.palette { display: flex; flex-direction: column; gap: 4px; padding: 0 8px 10px; background: var(--surface); border-right: 1px solid var(--border); overflow-y: auto; }
+.pal-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-high); color: var(--on-surface); font: inherit; cursor: grab; text-align: left; }
+.pal-item:hover { border-color: var(--accent); }
+.pal-item:active { cursor: grabbing; }
+.pal-glyph { width: 18px; height: 12px; border: 1.5px solid var(--on-surface-variant); flex: none; display: inline-block; }
+.pal-glyph.round { border-radius: 4px; }
+.pal-glyph.stadium { border-radius: 999px; }
+.pal-glyph.diamond { width: 12px; height: 12px; transform: rotate(45deg); margin: 0 3px; }
+.pal-glyph.cylinder { border-radius: 9px / 4px; }
+.pal-glyph.subroutine { box-shadow: inset 2px 0 0 var(--on-surface-variant), inset -2px 0 0 var(--on-surface-variant); }
+.pal-glyph.trapezoid { transform: skewX(-16deg); }
+.pal-hint { margin-top: auto; padding: 8px 2px 0; font-size: 11px; line-height: 1.4; color: var(--muted); }
+
+.canvas-wrap { position: relative; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg); }
+.canvas { width: 100%; height: 100%; display: block; user-select: none; cursor: grab; }
+.canvas.panning { cursor: grabbing; }
+.canvas.connecting { cursor: crosshair; }
+.grid-dot { fill: color-mix(in srgb, var(--on-surface) 14%, transparent); }
+.arrow-head { fill: var(--on-surface-variant); }
+.arrow-head.selected { fill: var(--accent); }
+
+.flow-node { cursor: move; }
+.flow-node .node-shape { fill: var(--surface-high); stroke: var(--border); stroke-width: 1.5; transition: stroke 120ms ease; }
+.flow-node:hover .node-shape { stroke: var(--accent); }
+.flow-node.selected .node-shape { stroke: var(--accent); stroke-width: 2.2; filter: drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 35%, transparent)); }
+.flow-node .node-text { fill: var(--on-surface); font-size: 12px; font-weight: 500; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+.flow-node .port { fill: var(--accent); stroke: var(--bg); stroke-width: 2; opacity: 0; cursor: crosshair; transition: opacity 120ms ease; }
+.flow-node:hover .port, .flow-node.selected .port, .canvas.connecting .port { opacity: 1; }
+.flow-node .port:hover { r: 7; }
+
+.flow-edge .edge-hit { fill: none; stroke: transparent; stroke-width: 14; cursor: pointer; }
+.flow-edge .edge-path { fill: none; stroke: var(--on-surface-variant); stroke-width: 1.6; pointer-events: none; }
+.flow-edge.dashed .edge-path { stroke-dasharray: 6 4; }
+.flow-edge.thick .edge-path { stroke-width: 3; }
+.flow-edge.selected .edge-path { stroke: var(--accent); stroke-width: 2.4; }
+.flow-edge .edge-label-bg { fill: var(--bg); stroke: var(--border); stroke-width: 1; rx: 4; cursor: pointer; }
+.flow-edge.selected .edge-label-bg { stroke: var(--accent); }
+.flow-edge .edge-label { fill: var(--on-surface); font-size: 11px; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+.draft-edge { fill: none; stroke: var(--accent); stroke-width: 2; stroke-dasharray: 5 4; pointer-events: none; }
+
+.inline-edit { position: absolute; z-index: 10; min-width: 120px; padding: 4px 8px; border: 2px solid var(--accent); border-radius: 6px; background: var(--surface-highest); color: var(--on-surface); font: inherit; font-size: 12px; text-align: center; outline: none; box-shadow: 0 4px 16px var(--shadow); }
+.status-bar { position: absolute; left: 10px; bottom: 10px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px; background: color-mix(in srgb, var(--surface) 92%, transparent); color: var(--on-surface-variant); font-size: 11px; pointer-events: none; }
+.status-bar:empty { display: none; }
+
+.inspector { display: flex; flex-direction: column; background: var(--surface); border-left: 1px solid var(--border); overflow-y: auto; }
+.insp-empty { padding: 8px 12px; color: var(--muted); line-height: 1.5; }
+.insp-form { display: flex; flex-direction: column; gap: 10px; padding: 6px 12px 12px; }
+.insp-form[hidden] { display: none; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field > span { font-size: 11px; color: var(--on-surface-variant); font-weight: 500; }
+.field input, .field select { height: 28px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--on-surface); font: inherit; }
+.field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+
+.swatches { display: flex; gap: 6px; flex-wrap: wrap; }
+.swatch { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--border); background: var(--c, var(--surface-high)); cursor: pointer; padding: 0; }
+.swatch.none { background: repeating-linear-gradient(45deg, var(--surface-high) 0 4px, var(--border) 4px 8px); }
+.swatch.active { border-color: var(--on-surface); box-shadow: 0 0 0 2px var(--accent); }
+
+.code-drawer { flex: none; height: 190px; display: flex; flex-direction: column; border-top: 1px solid var(--border); background: var(--surface); }
+.code-drawer[hidden] { display: none; }
+.code-drawer-head { display: flex; align-items: center; gap: 6px; padding: 4px 8px 4px 12px; border-bottom: 1px solid var(--border); font-size: 11px; font-weight: 600; color: var(--on-surface-variant); }
+.code-drawer textarea { flex: 1; width: 100%; border: 0; padding: 8px 12px; resize: none; background: var(--bg); color: var(--on-surface); font-family: var(--mono); font-size: 12px; line-height: 1.5; outline: none; }
+
+.ai-dialog { width: min(460px, 90vw); padding: 0; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--on-surface); box-shadow: 0 12px 36px var(--shadow); }
+.ai-dialog::backdrop { background: rgb(0 0 0 / .55); }
+.ai-form { display: flex; flex-direction: column; gap: 10px; padding: 14px; }
+.ai-head { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
+.ai-form textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--on-surface); font: inherit; resize: vertical; }
+.ai-form textarea:focus { outline: none; border-color: var(--accent); }
+.ai-foot { display: flex; justify-content: flex-end; gap: 6px; }

@@ -11,3 +11,5 @@ const copy = (from, to, files) => {
 };
 copy(join(root, 'node_modules', '@vscode', 'codicons', 'dist'), join(root, 'media', 'codicons'), ['codicon.css', 'codicon.ttf']);
 copy(join(root, 'node_modules', '@highlightjs', 'cdn-assets'), join(root, 'media', 'vendor'), ['highlight.min.js', 'LICENSE']);
+copy(join(root, 'node_modules', 'mermaid', 'dist'), join(root, 'media', 'vendor'), ['mermaid.min.js']);
+copyFileSync(join(root, 'node_modules', 'mermaid', 'LICENSE'), join(root, 'media', 'vendor', 'MERMAID-LICENSE'));

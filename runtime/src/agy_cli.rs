@@ -18,6 +18,7 @@ use crate::provider::{ContentPart, Message, Role};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -164,6 +165,37 @@ async fn send_steers(stdin: &mut Option<ChildStdin>, texts: &[String], host: &Ho
     1
 }
 
+struct Subagent {
+    name: String,
+    role: &'static str,
+    agent: String,
+    log_path: Option<PathBuf>,
+    log_offset: u64,
+    tokens: u64,
+    call_seq: u64,
+    done: bool,
+}
+
+fn role_of(agent: &str, role_hint: &str) -> &'static str {
+    let s = format!("{agent} {role_hint}").to_ascii_lowercase();
+    if s.contains("test") || s.contains("qa") {
+        "testing"
+    } else if s.contains("review") || s.contains("audit") || s.contains("a11y") {
+        "review"
+    } else if s.contains("doc") {
+        "documentation"
+    } else if s.contains("research") || s.contains("explore") || s.contains("search") {
+        "research"
+    } else {
+        "implementation"
+    }
+}
+
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let p = uri.strip_prefix("file://")?;
+    (!p.is_empty()).then(|| PathBuf::from(p))
+}
+
 /// Turns agy's stream-json lines into `agent/event`s and the transcript.
 #[derive(Default)]
 pub struct Mapper {
@@ -184,6 +216,8 @@ pub struct Mapper {
     tools: HashSet<u64>,
     /// Actions denied this run (headless mode cannot ask), shown once each.
     denied: HashSet<String>,
+    /// Subagents spawned via `invoke_subagent`, keyed by subagent conversation id.
+    subagents: HashMap<String, Subagent>,
 }
 
 fn add(sum: &mut Option<u64>, n: Option<u64>) {
@@ -313,7 +347,157 @@ impl Mapper {
                     self.note(Role::User, ContentPart::ToolResult { tool_use_id: id, tool_name: Some(name), content: clip(&text, MAX_RECORD_OUTPUT), is_error: !ok });
                 }
             }
+            Some("subagent") => {
+                if !done {
+                    return out;
+                }
+                let subs = s["subagent_info"]["subagents"].as_array();
+                for (i, sub) in subs.into_iter().flatten().enumerate() {
+                    let id = sub["conversation_id"]
+                        .as_str()
+                        .filter(|c| !c.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("agy-sub-{idx}-{i}"));
+                    if self.subagents.contains_key(&id) {
+                        continue;
+                    }
+                    let agent = sub["type_name"].as_str().filter(|t| !t.trim().is_empty()).unwrap_or("subagent").to_owned();
+                    let name = sub["role"].as_str().map(str::trim).filter(|r| !r.is_empty()).unwrap_or(agent.as_str()).to_owned();
+                    let role = role_of(&agent, &name);
+                    let objective = clip(sub["initial_prompt"].as_str().unwrap_or_default().trim(), 500);
+                    let model = self.model.clone().unwrap_or_default();
+                    let log_path = sub["log_uri"].as_str().and_then(file_uri_to_path);
+                    out.push(json!({
+                        "type": "subagentStarted",
+                        "name": name,
+                        "taskId": id,
+                        "role": role,
+                        "agent": agent,
+                        "objective": objective,
+                        "kind": KIND,
+                        "model": model,
+                        "dir": null,
+                        "step": null,
+                    }));
+                    let failed = state != "DONE";
+                    if failed {
+                        out.push(json!({
+                            "type": "subagentFinished",
+                            "name": name,
+                            "taskId": id,
+                            "role": role,
+                            "agent": agent,
+                            "status": if state == "CANCELLED" { "cancelled" } else { "failed" },
+                            "error": null,
+                            "worktree": null,
+                        }));
+                    }
+                    self.subagents.insert(
+                        id,
+                        Subagent { name, role, agent, log_path, log_offset: 0, tokens: 0, call_seq: 0, done: failed },
+                    );
+                }
+            }
             _ => {}
+        }
+        out
+    }
+
+    pub fn has_active_subagents(&self) -> bool {
+        self.subagents.values().any(|s| !s.done && s.log_path.is_some())
+    }
+
+    /// Reads newly appended lines from each active subagent's `transcript.jsonl` and maps them to
+    /// `subagent` / `subagentFinished` events.
+    pub fn poll_subagents(&mut self) -> Vec<Value> {
+        let mut out = Vec::new();
+        for (id, sub) in &mut self.subagents {
+            if sub.done {
+                continue;
+            }
+            let Some(path) = &sub.log_path else { continue };
+            let Ok(mut f) = std::fs::File::open(path) else { continue };
+            if f.seek(SeekFrom::Start(sub.log_offset)).is_err() {
+                continue;
+            }
+            let mut buf = Vec::new();
+            if f.read_to_end(&mut buf).is_err() || buf.is_empty() {
+                continue;
+            }
+            let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else { continue };
+            let chunk = &buf[..=last_nl];
+            sub.log_offset += chunk.len() as u64;
+            for line in String::from_utf8_lossy(chunk).lines() {
+                let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                if v["type"].as_str() != Some("PLANNER_RESPONSE") {
+                    continue;
+                }
+                sub.tokens += v["input_tokens"].as_u64().unwrap_or(0) + v["output_tokens"].as_u64().unwrap_or(0);
+                let calls = v["tool_calls"].as_array();
+                if let Some(calls) = calls.filter(|c| !c.is_empty()) {
+                    for tc in calls {
+                        sub.call_seq += 1;
+                        let call_id = format!("agy-sub-call-{}", sub.call_seq);
+                        let tool = tc["name"].as_str().unwrap_or("tool").to_owned();
+                        let input = tc["args"].clone();
+                        out.push(json!({
+                            "type": "subagent",
+                            "name": sub.name,
+                            "taskId": id,
+                            "event": { "type": "toolStarted", "callId": call_id, "tool": tool, "input": input, "permission": KIND },
+                        }));
+                        out.push(json!({
+                            "type": "subagent",
+                            "name": sub.name,
+                            "taskId": id,
+                            "event": { "type": "toolFinished", "callId": call_id, "tool": tool, "ok": true, "output": "" },
+                        }));
+                    }
+                } else if v["status"].as_str() == Some("DONE") {
+                    if let Some(text) = v["content"].as_str().filter(|t| !t.trim().is_empty()) {
+                        out.push(json!({
+                            "type": "subagent",
+                            "name": sub.name,
+                            "taskId": id,
+                            "event": { "type": "textDelta", "text": text },
+                        }));
+                    }
+                    sub.done = true;
+                    out.push(json!({
+                        "type": "subagentFinished",
+                        "name": sub.name,
+                        "taskId": id,
+                        "role": sub.role,
+                        "agent": sub.agent,
+                        "status": "completed",
+                        "error": null,
+                        "tokens": sub.tokens,
+                        "worktree": null,
+                    }));
+                }
+            }
+        }
+        out
+    }
+
+    pub fn finish_subagents(&mut self, status: &str) -> Vec<Value> {
+        let mut out = Vec::new();
+        for (id, sub) in &mut self.subagents {
+            if sub.done {
+                continue;
+            }
+            sub.done = true;
+            out.push(json!({
+                "type": "subagentFinished",
+                "name": sub.name,
+                "taskId": id,
+                "role": sub.role,
+                "agent": sub.agent,
+                "status": status,
+                "error": null,
+                "tokens": sub.tokens,
+                "worktree": null,
+            }));
         }
         out
     }
@@ -454,12 +638,16 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
                 cancelled = true;
                 break;
             }
-            _ = tick.tick(), if stdin.is_some() || closed_at.is_some() => {
+            _ = tick.tick(), if stdin.is_some() || closed_at.is_some() || mapper.has_active_subagents() => {
                 if closed_at.is_some_and(|t| t.elapsed() > EXIT_GRACE) {
                     closed_at = None;
                     stopped_after_end = true;
                     (host.emit)(&p.task_id, json!({ "type": "warning", "message": "Antigravity did not exit after the task ended; task-x stopped it." }));
                     let _ = child.start_kill();
+                }
+                for ev in mapper.poll_subagents() {
+                    proc_tracker.observe(&ev);
+                    (host.emit)(&p.task_id, ev);
                 }
                 let texts = inbox.take();
                 pending += send_steers(&mut stdin, &texts, &host, &p.task_id).await;
@@ -493,6 +681,10 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
     drop(inbox);
     let status = child.wait().await.ok();
     let stderr_text = stderr_task.await.unwrap_or_default();
+    for ev in mapper.poll_subagents() {
+        proc_tracker.observe(&ev);
+        (host.emit)(&p.task_id, ev);
+    }
 
     let (changed, operations) = record_changes(&host, &p.task_id, &before, "agy_cli").await?;
 
@@ -504,6 +696,9 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
     } else {
         "completed"
     };
+    for ev in mapper.finish_subagents(status_name) {
+        (host.emit)(&p.task_id, ev);
+    }
     snap(&root, &p.task_id, format!("End: {status_name}"), &host).await;
     let error = (status_name == "failed").then(|| {
         let msg = r["error"]

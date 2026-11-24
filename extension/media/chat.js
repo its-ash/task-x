@@ -64,7 +64,7 @@
   const nearBottom = () => log.scrollHeight - log.scrollTop - log.clientHeight < 80;
   // Sticks to the bottom until the user scrolls up; any later growth of the log keeps it pinned.
   let stick = true;
-  const scroll = (force) => { if (force) stick = true; if (stick) log.scrollTop = log.scrollHeight; };
+  const scroll = (force) => { if (force) stick = true; if (stick) log.scrollTo({ top: log.scrollHeight, behavior: 'instant' }); };
   log.addEventListener('scroll', () => { stick = nearBottom(); }, { passive: true });
   const pin = () => scroll();
   new MutationObserver(pin).observe(log, { childList: true, subtree: true, characterData: true });
@@ -894,9 +894,18 @@
       if (fence) {
         flush(); stack.length = 0;
         const body = [];
-        for (i++; i < lines.length && !lines[i].trim().startsWith(fence[1]); i++) body.push(lines[i]);
+        let closed = false;
+        for (i++; i < lines.length; i++) {
+          if (lines[i].trim().startsWith(fence[1])) { closed = true; break; }
+          body.push(lines[i]);
+        }
         const code = body.join('\n');
+        const lang = fence[2].trim().split(/\s/)[0] || '';
         if (/^(?:task-x|anvil)-findings$/.test(fence[2].trim())) { container.append(findingsChip(code)); continue; }
+        if (isDiagramBlock(lang, code)) {
+          out.append(diagramCard(code, closed));
+          continue;
+        }
         const wrap = el('div', 'code'), head = el('div', 'code-head');
         head.append(el('span', null, fence[2].trim() || 'code'));
         const copy = button('action', icon('copy'), () => navigator.clipboard.writeText(code).then(() => {
@@ -904,9 +913,18 @@
         }), 'Copy');
         head.append(copy);
         const pre = el('pre');
-        pre.append(highlight(code, fence[2].trim().split(/\s/)[0]));
+        pre.append(highlight(code, lang));
         wrap.append(head, pre);
         out.append(wrap);
+        continue;
+      }
+      const inlineDiagram = matchInlineDiagram(lines, i);
+      if (inlineDiagram) {
+        if (inlineDiagram.before) para.push(inlineDiagram.before);
+        flush(); stack.length = 0;
+        out.append(diagramCard(inlineDiagram.code, inlineDiagram.closed));
+        if (inlineDiagram.after) para.push(inlineDiagram.after);
+        i = inlineDiagram.end;
         continue;
       }
       // A table: a row of cells, then a line of dashes (`|---|:--:|`) that also sets each column's alignment.
@@ -1029,6 +1047,289 @@
     first.textContent = first.textContent.slice(q[0].length);
     node.insertBefore(s, first);
   }
+  // ---------- Mermaid diagrams ----------
+  const MERMAID_HEADER = /^(?:sequenceDiagram|flowchart(?:\s|$)|graph(?:\s|$)|classDiagram(?:-v2)?(?:\s|$)|stateDiagram(?:-v2)?(?:\s|$)|erDiagram(?:\s|$)|gantt(?:\s|$)|pie(?:\s|$)|gitGraph(?:\s|$)|journey(?:\s|$)|mindmap(?:\s|$)|timeline(?:\s|$)|quadrantChart(?:\s|$)|requirementDiagram(?:\s|$)|C4(?:Context|Container|Component|Dynamic|Deployment)(?:\s|$)|sankey-beta(?:\s|$)|xychart-beta(?:\s|$)|block-beta(?:\s|$)|packet-beta(?:\s|$)|kanban(?:\s|$)|architecture-beta(?:\s|$)|zenuml(?:\s|$)|radar-beta(?:\s|$)|treemap-beta(?:\s|$))/;
+  const DIAGRAM_LABELS = {
+    sequenceDiagram: 'Sequence diagram', flowchart: 'Flowchart', graph: 'Graph',
+    classDiagram: 'Class diagram', stateDiagram: 'State diagram', erDiagram: 'ER diagram',
+    gantt: 'Gantt chart', pie: 'Pie chart', gitGraph: 'Git graph', journey: 'User journey',
+    mindmap: 'Mindmap', timeline: 'Timeline', quadrantChart: 'Quadrant chart',
+    requirementDiagram: 'Requirement diagram',
+  };
+  const MAX_DIAGRAM_CACHE = 64;
+  const diagramCache = new Map();
+  let diagramSeq = 0;
+  let diagramThemeKey = '';
+  let diagramModal = null;
+
+  function mermaidHeader(code) {
+    const ls = code.replace(/\r\n?/g, '\n').split('\n');
+    let j = 0;
+    while (j < ls.length && !ls[j].trim()) j++;
+    if (ls[j]?.trim() === '---') {
+      for (j++; j < ls.length && ls[j].trim() !== '---'; j++);
+      j++;
+    }
+    while (j < ls.length && (!ls[j].trim() || ls[j].trim().startsWith('%%'))) j++;
+    return (ls[j] || '').trim();
+  }
+  const isMermaidSource = (code) => MERMAID_HEADER.test(mermaidHeader(code));
+  const isDiagramBlock = (lang, code) => /^(?:mermaid|mmd|diagram)$/i.test(lang) || (!lang && isMermaidSource(code));
+  function diagramLabel(code) {
+    const head = mermaidHeader(code).split(/\s/)[0].replace(/-v2$/, '');
+    return DIAGRAM_LABELS[head] || 'Diagram';
+  }
+  function matchInlineDiagram(lines, start) {
+    const line = lines[start];
+    const open = line.indexOf('`');
+    if (open < 0 || line.slice(open).startsWith('```')) return null;
+    const rest = line.slice(open + 1);
+    if (rest.includes('`') || !MERMAID_HEADER.test(rest.trim())) return null;
+    const body = [rest];
+    let closed = false;
+    let end = start;
+    let after = '';
+    for (let k = start + 1; k < lines.length; k++) {
+      const idx = lines[k].indexOf('`');
+      if (idx >= 0) {
+        if (idx > 0) body.push(lines[k].slice(0, idx));
+        after = lines[k].slice(idx + 1).trim();
+        closed = true;
+        end = k;
+        break;
+      }
+      body.push(lines[k]);
+      end = k;
+    }
+    if (!closed && body.length < 2) return null;
+    return { before: line.slice(0, open).trim(), code: body.join('\n'), after, closed, end };
+  }
+  function currentThemeKey() {
+    const b = document.body;
+    return b.classList.contains('vscode-light') || b.classList.contains('vscode-high-contrast-light') ? 'light' : 'dark';
+  }
+  function initMermaid(force = false) {
+    const m = window.mermaid;
+    if (!m) return false;
+    const key = currentThemeKey();
+    if (!force && diagramThemeKey === key) return true;
+    diagramThemeKey = key;
+    const cs = getComputedStyle(document.body);
+    const css = (v, fallback) => cs.getPropertyValue(v).trim() || fallback;
+    const dark = key === 'dark';
+    const bg = css('--bg', dark ? '#1e1e1e' : '#ffffff');
+    const surface = css('--surface-high', dark ? '#2a2a2a' : '#f3f3f3');
+    const fg = css('--on-surface', dark ? '#e5e5e5' : '#1f1f1f');
+    const muted = css('--on-surface-variant', dark ? '#a3a3a3' : '#616161');
+    const border = css('--border', dark ? '#454545' : '#d4d4d4');
+    const accent = css('--accent', dark ? '#9fcaff' : '#0061a4');
+    const font = css('--vscode-font-family', 'system-ui, sans-serif');
+    m.initialize({
+      startOnLoad: false,
+      securityLevel: 'strict',
+      suppressErrorRendering: true,
+      theme: 'base',
+      fontFamily: font,
+      themeVariables: {
+        darkMode: dark,
+        background: bg,
+        primaryColor: surface,
+        primaryTextColor: fg,
+        primaryBorderColor: border,
+        secondaryColor: css('--surface', surface),
+        secondaryTextColor: fg,
+        secondaryBorderColor: border,
+        tertiaryColor: css('--surface-highest', surface),
+        tertiaryTextColor: fg,
+        tertiaryBorderColor: border,
+        lineColor: muted,
+        textColor: fg,
+        mainBkg: surface,
+        nodeBorder: border,
+        clusterBkg: css('--surface', surface),
+        clusterBorder: border,
+        titleColor: fg,
+        edgeLabelBackground: bg,
+        actorBkg: surface,
+        actorBorder: accent,
+        actorTextColor: fg,
+        actorLineColor: muted,
+        signalColor: fg,
+        signalTextColor: fg,
+        labelBoxBkgColor: surface,
+        labelBoxBorderColor: border,
+        labelTextColor: fg,
+        loopTextColor: fg,
+        noteBkgColor: css('--accent-container', surface),
+        noteTextColor: css('--on-accent-container', fg),
+        noteBorderColor: accent,
+        activationBkgColor: css('--surface-highest', surface),
+        activationBorderColor: accent,
+        sequenceNumberColor: bg,
+      },
+      sequence: { useMaxWidth: false, showSequenceNumbers: false, wrap: true },
+      flowchart: { useMaxWidth: true, htmlLabels: true },
+    });
+    return true;
+  }
+  function parseSafeSvg(svgText) {
+    const doc = new DOMParser().parseFromString(svgText, 'text/html');
+    const svg = doc.body.querySelector('svg');
+    if (!svg) return null;
+    svg.querySelectorAll('script, iframe, object, embed').forEach((n) => n.remove());
+    for (const n of svg.querySelectorAll('*')) {
+      for (const a of [...n.attributes]) {
+        if (/^on/i.test(a.name) || (/^(?:href|xlink:href)$/i.test(a.name) && /^\s*javascript:/i.test(a.value))) n.removeAttribute(a.name);
+      }
+    }
+    return document.importNode(svg, true);
+  }
+  function openDiagramModal(title, svgText) {
+    diagramModal?.remove();
+    const dlg = el('dialog', 'diagram-modal');
+    dlg.setAttribute('aria-label', title);
+    let scale = 1;
+    const zoomLabel = el('span', 'diagram-zoom-val', '100%');
+    const stage = el('div', 'diagram-modal-stage');
+    const inner = el('div', 'diagram-modal-inner');
+    const svg = parseSafeSvg(svgText);
+    if (svg) inner.append(svg);
+    stage.append(inner);
+    const applyZoom = (next) => {
+      scale = Math.max(0.25, Math.min(4, next));
+      zoomLabel.textContent = `${Math.round(scale * 100)}%`;
+      inner.style.transform = `scale(${scale})`;
+    };
+    const head = el('div', 'diagram-modal-head');
+    head.append(
+      icon('type-hierarchy'),
+      el('span', 'diagram-title', title),
+      el('span', 'spacer'),
+      button('action', icon('zoom-out'), () => applyZoom(scale - 0.2), 'Zoom out'),
+      zoomLabel,
+      button('action', icon('zoom-in'), () => applyZoom(scale + 0.2), 'Zoom in'),
+      button('action', icon('screen-normal'), () => applyZoom(1), 'Reset zoom'),
+      button('action', icon('close'), () => dlg.close(), 'Close'),
+    );
+    dlg.append(head, stage);
+    dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); });
+    dlg.addEventListener('close', () => { dlg.remove(); if (diagramModal === dlg) diagramModal = null; });
+    stage.addEventListener('wheel', (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      applyZoom(scale + (e.deltaY < 0 ? 0.15 : -0.15));
+    }, { passive: false });
+    document.body.append(dlg);
+    diagramModal = dlg;
+    dlg.showModal();
+  }
+  function cacheDiagram(key, val) {
+    if (diagramCache.size >= MAX_DIAGRAM_CACHE) diagramCache.delete(diagramCache.keys().next().value);
+    diagramCache.set(key, val);
+  }
+  function diagramCard(code, closed = true) {
+    const trimmed = code.trim();
+    const title = diagramLabel(trimmed);
+    const wrap = el('div', 'diagram');
+    wrap.dataset.code = trimmed;
+    const head = el('div', 'diagram-head');
+    const left = el('span', 'diagram-label');
+    left.append(icon('type-hierarchy'), el('span', null, title));
+    const body = el('div', 'diagram-body');
+    const pre = el('pre', 'diagram-code');
+    pre.append(highlight(code, 'mermaid'));
+    pre.hidden = true;
+    let showingCode = false;
+    let renderedSvg = '';
+    const toggleBtn = button('action', icon('code'), () => {
+      showingCode = !showingCode;
+      body.hidden = showingCode;
+      pre.hidden = !showingCode;
+      toggleBtn.replaceChildren(icon(showingCode ? 'preview' : 'code'));
+      toggleBtn.title = showingCode ? 'Show diagram' : 'Show source';
+      toggleBtn.setAttribute('aria-label', toggleBtn.title);
+    }, 'Show source');
+    const expandBtn = button('action', icon('screen-full'), () => {
+      if (renderedSvg) openDiagramModal(title, renderedSvg);
+    }, 'Expand diagram');
+    expandBtn.hidden = true;
+    const editBtn = button('action', icon('edit'), () => vscode.postMessage({ type: 'editDiagram', code }), 'Edit in Flow Editor');
+    const copy = button('action', icon('copy'), () => navigator.clipboard.writeText(code).then(() => {
+      copy.replaceChildren(icon('check')); setTimeout(() => copy.replaceChildren(icon('copy')), 1200);
+    }), 'Copy source');
+    const acts = el('span', 'diagram-acts');
+    acts.append(editBtn, expandBtn, toggleBtn, copy);
+    head.append(left, acts);
+    wrap.append(head, body, pre);
+
+    if (!closed || !window.mermaid) {
+      body.hidden = true;
+      pre.hidden = false;
+      showingCode = true;
+      toggleBtn.hidden = true;
+      return wrap;
+    }
+
+    const mountSvg = (svgText) => {
+      const svg = parseSafeSvg(svgText);
+      if (!svg) return false;
+      renderedSvg = svgText;
+      body.classList.remove('loading', 'failed');
+      body.replaceChildren(svg);
+      expandBtn.hidden = false;
+      return true;
+    };
+    const showError = (msg) => {
+      body.classList.remove('loading');
+      body.classList.add('failed');
+      const err = el('div', 'diagram-error');
+      err.append(icon('warning'), el('span', null, msg || 'Could not render diagram'));
+      body.replaceChildren(err);
+      pre.hidden = false;
+      toggleBtn.hidden = true;
+    };
+
+    const key = `${currentThemeKey()}\0${trimmed}`;
+    const cached = diagramCache.get(key);
+    if (cached?.svg) {
+      mountSvg(cached.svg);
+      return wrap;
+    }
+    if (cached?.error) {
+      showError(cached.error);
+      return wrap;
+    }
+
+    body.classList.add('loading');
+    body.append(el('span', 'diagram-status', 'Rendering diagram…'));
+    initMermaid();
+    const id = `mmd-${++diagramSeq}`;
+    Promise.resolve()
+      .then(() => window.mermaid.render(id, trimmed))
+      .then(({ svg }) => {
+        cacheDiagram(key, { svg });
+        if (!wrap.isConnected) return;
+        if (!mountSvg(svg)) showError('Empty SVG output');
+      })
+      .catch((e) => {
+        document.getElementById(`d${id}`)?.remove();
+        const msg = e instanceof Error ? e.message.split('\n')[0] : String(e);
+        cacheDiagram(key, { error: msg });
+        if (wrap.isConnected) showError(msg);
+      });
+    return wrap;
+  }
+  new MutationObserver(() => {
+    const next = currentThemeKey();
+    if (!diagramThemeKey || next === diagramThemeKey) return;
+    diagramCache.clear();
+    initMermaid(true);
+    log.querySelectorAll('.diagram').forEach((card) => {
+      const code = card.dataset.code;
+      if (code) card.replaceWith(diagramCard(code, true));
+    });
+  }).observe(document.body, { attributes: true, attributeFilter: ['class'] });
+
   // Syntax highlighting with highlight.js (common languages). Its output escapes all source text,
   // so the HTML it returns holds only its own <span class="hljs-…"> markup around escaped text.
   const MAX_HIGHLIGHT = 20_000;
@@ -1215,14 +1516,22 @@
         // Your message keeps its line breaks and shows `code`, ``` blocks, and tables like a reply.
         const body = el('div', 'request-text md');
         renderMarkdown(body, it.text);
-        req.append(body, button('action copy-msg', icon('copy'), () => copyText(it.text), 'Copy message'));
+        const actions = el('div', 'request-actions');
+        actions.append(
+          button('action copy-msg', icon('copy'), () => copyText(it.text), 'Copy message'),
+          button('action delete-msg', icon('trash'), () => {
+            const promptIndex = older.filter((x) => x.kind === 'user').length + [...log.querySelectorAll('.request')].indexOf(req);
+            vscode.postMessage({ type: 'deletePrompt', id: it.id, promptIndex });
+          }, 'Delete prompt from chat and context'),
+        );
         // #11: put the files back as they were before this request (and the ones after it).
         if (it.id) {
           req.dataset.id = it.id;
           const restore = button('action restore-msg', icon('discard'), () => vscode.postMessage({ type: 'restoreTo', id: it.id }), 'Restore to here: undo the edits of this request and every later one');
           restore.hidden = !it.operations?.length;
-          req.append(restore);
+          actions.append(restore);
         }
+        req.append(body, actions);
         if (it.images) {
           const n = el('div', 'request-images');
           n.append(icon('file-media'), document.createTextNode(`${it.images} image${it.images > 1 ? 's' : ''} attached`));
@@ -3016,7 +3325,7 @@
         const savedScroll = activeTab ? tabScrolls.get(activeTab) : undefined;
         if (savedScroll && !savedScroll.stick) {
           stick = false;
-          log.scrollTop = savedScroll.top;
+          log.scrollTo({ top: savedScroll.top, behavior: 'instant' });
         } else {
           scroll(true);
         }
@@ -3024,6 +3333,17 @@
       }
       case 'status':
         state = { ...state, busy: m.busy, sleeping: m.sleeping ?? null, chrome: m.chrome ?? state.chrome, editMode: m.editMode ?? state.editMode, autoCommit: m.autoCommit ?? state.autoCommit, night: m.night ?? state.night, nightPlanner: m.nightPlanner ?? state.nightPlanner, nightWorker: m.nightWorker ?? state.nightWorker, refineModel: 'refineModel' in m ? m.refineModel : state.refineModel, helperModel: 'helperModel' in m ? m.helperModel : state.helperModel, agent: 'agent' in m ? m.agent : state.agent, effort: 'effort' in m ? m.effort : state.effort, sandbox: m.sandbox ?? state.sandbox, chatMode: 'chatMode' in m ? m.chatMode : state.chatMode };
+        if ('workspaceName' in m) {
+          const fc = $('folderChip');
+          const name = String(m.workspaceName || '').trim();
+          if (fc) {
+            fc.hidden = !name;
+            if (name) {
+              fc.replaceChildren(icon('folder'), el('span', 'folder-chip-name', name));
+              fc.title = `Workspace: ${name}`;
+            }
+          }
+        }
         renderToolbar();
         fillSettings();
         break;

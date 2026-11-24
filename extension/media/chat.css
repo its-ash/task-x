@@ -88,6 +88,10 @@ body {
 
 /* Tabs at the top, like browser tabs: open chats (main agent, accent colour) and subagents (role colour), then History. */
 .views { flex: none; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.folder-chip { display: inline-flex; align-items: center; gap: 5px; flex: none; max-width: 160px; height: 26px; padding: 0 10px; border-radius: 999px; background: var(--accent); color: var(--on-accent); font-size: 12px; font-weight: 700; letter-spacing: 0.01em; user-select: none; }
+.folder-chip[hidden] { display: none; }
+.folder-chip .codicon { font-size: 13px; flex: none; }
+.folder-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tab-strip { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 0 1 auto; padding: 2px; overflow-x: auto; scrollbar-width: none; }
 .tab-strip::-webkit-scrollbar { display: none; }
 .chat-tab { --tab: var(--accent); --tab-container: var(--accent-container); --on-tab-container: var(--on-accent-container); display: inline-flex; align-items: center; gap: 6px; flex: 0 1 160px; min-width: 64px; max-width: 180px; height: 28px; padding: 0 4px 0 10px; border: 1px solid transparent; border-radius: 10px; font-size: 12px; color: var(--on-surface-variant); background: color-mix(in srgb, var(--tab) 10%, var(--surface-high)); cursor: pointer; user-select: none; transition: color var(--md-duration-short4) ease, background-color var(--md-duration-short4) ease, border-color var(--md-duration-short4) ease, box-shadow var(--md-duration-short4) ease; }
@@ -252,6 +256,30 @@ body[data-view="history"] #log, body[data-view="history"] #changes, body[data-vi
 .code-head { display: flex; justify-content: space-between; align-items: center; padding: 3px 4px 3px 12px; font-size: 11px; font-weight: 600; color: var(--on-surface-variant); background: var(--surface-high); }
 .code pre { margin: 0; padding: 10px 12px; overflow-x: auto; }
 .code pre code { background: none; padding: 0; color: var(--vscode-editor-foreground); white-space: pre; }
+
+/* Mermaid diagrams: theme-matched card with scroll, source toggle, and fullscreen zoom dialog. */
+.diagram { margin: 8px 0 12px; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
+.diagram-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 4px 3px 10px; font-size: 11px; font-weight: 600; color: var(--on-surface-variant); background: var(--surface-high); border-bottom: 1px solid var(--border); }
+.diagram-label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.diagram-acts { display: inline-flex; align-items: center; gap: 2px; flex: none; }
+.diagram-body { padding: 12px; overflow: auto; max-height: 460px; background: var(--vscode-editor-background); text-align: center; }
+.diagram-body[hidden] { display: none; }
+.diagram-body svg { display: block; margin: 0 auto; height: auto; max-width: none; }
+.diagram-body.loading { display: flex; align-items: center; justify-content: center; min-height: 72px; }
+.diagram-status { font-size: 12px; color: var(--muted); }
+.diagram-error { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--warn); text-align: left; }
+.diagram-code { margin: 0; padding: 10px 12px; overflow-x: auto; background: var(--vscode-editor-background); border-top: 1px solid var(--border); }
+.diagram-code[hidden] { display: none; }
+.diagram-code code { background: none; padding: 0; color: var(--vscode-editor-foreground); white-space: pre; }
+.diagram-modal { width: min(94vw, 1280px); height: min(88vh, 900px); max-width: none; max-height: none; padding: 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--vscode-editor-background); color: var(--on-surface); box-shadow: 0 16px 48px var(--shadow); overflow: hidden; }
+.diagram-modal[open] { display: flex; flex-direction: column; }
+.diagram-modal::backdrop { background: rgb(0 0 0 / .6); backdrop-filter: blur(2px); }
+.diagram-modal-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px 6px 12px; font-size: 12px; font-weight: 600; color: var(--on-surface); background: var(--surface-high); border-bottom: 1px solid var(--border); flex: none; }
+.diagram-modal-head .spacer { flex: 1; }
+.diagram-zoom-val { min-width: 38px; text-align: center; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--on-surface-variant); }
+.diagram-modal-stage { flex: 1; min-height: 0; overflow: auto; padding: 20px; display: flex; align-items: flex-start; justify-content: center; }
+.diagram-modal-inner { transform-origin: top center; transition: transform var(--md-duration-short2) ease; }
+.diagram-modal-inner svg { display: block; height: auto; max-width: none; }
 
 /* Progress rows (tools and notes). A successful file edit shows as an edit card instead. */
 .row { display: flex; gap: 6px; align-items: center; min-width: 0; margin: 3px 0; font-size: 12px; color: var(--muted); }
@@ -493,7 +521,7 @@ button:disabled { opacity: .38; cursor: default; }
 
 /* Input box: one container, like the Copilot chat input */
 /* Redesigned Chat View: airy layout, frosted header, elevated user bubbles & floating composer. */
-#log { flex: 1; overflow-y: auto; padding: 8px 14px 18px; scroll-behavior: smooth; }
+#log { flex: 1; overflow-y: auto; padding: 8px 14px 18px; }
 .views { flex: none; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 8px 10px; border-bottom: 1px solid color-mix(in srgb, var(--border) 75%, transparent); background: color-mix(in srgb, var(--surface) 70%, var(--vscode-sideBar-background)); }
 .activity-btn.live { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); color: var(--on-surface); }
 .activity-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 16px; height: 16px; padding: 0 5px; border-radius: 999px; font-size: 10px; font-weight: 700; font-family: var(--mono); color: var(--on-accent); background: var(--accent); }
@@ -502,9 +530,11 @@ button:disabled { opacity: .38; cursor: default; }
 .row.tool:hover .tool-term, .tool-term:focus-visible { opacity: 1; color: var(--accent); }
 .turn { padding: 14px 0 8px; }
 .turn + .turn { border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent); }
-.request { position: relative; margin: 0 0 12px; padding: 10px 36px 10px 14px; border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border)); border-radius: 14px; color: var(--vscode-foreground); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); box-shadow: 0 1px 3px -2px var(--shadow); }
-.request .copy-msg { top: 6px; right: 6px; }
-.request .restore-msg { top: 34px; right: 6px; }
+.request { position: relative; margin: 0 0 12px; padding: 10px 68px 10px 14px; border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border)); border-radius: 14px; color: var(--vscode-foreground); background: color-mix(in srgb, var(--accent) 7%, var(--surface)); box-shadow: 0 1px 3px -2px var(--shadow); }
+.request-actions { position: absolute; top: 6px; right: 6px; display: inline-flex; align-items: center; gap: 2px; opacity: 0; transition: opacity var(--md-duration-short4) ease; }
+.request:hover .request-actions, .request:focus-within .request-actions { opacity: 1; }
+.request-actions .action { position: static; opacity: 1; color: inherit; }
+.request-actions .delete-msg:hover, .request-actions .restore-msg:hover { color: var(--bad); }
 .message { position: relative; padding: 2px 2px 4px; }
 .md { line-height: 1.65; word-break: break-word; }
 #form { position: relative; flex: none; margin: 4px 10px 10px; padding: 10px 12px 9px; border: 1px solid color-mix(in srgb, var(--border) 90%, transparent); border-radius: 16px; color: var(--on-surface); background: var(--surface-high); box-shadow: 0 4px 16px -8px var(--shadow); display: flex; flex-direction: column; gap: 8px; transition: border-color var(--md-duration-short4) ease, box-shadow var(--md-duration-short4) ease; }

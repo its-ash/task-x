@@ -16,8 +16,8 @@ export interface McpServer {
   disabled?: boolean;
 }
 
-export type ImportSource = 'claude' | 'vscode' | 'copilotCli';
-export const IMPORT_SOURCES: ImportSource[] = ['claude', 'vscode', 'copilotCli'];
+export type ImportSource = 'claude' | 'vscode' | 'copilotCli' | 'gemini';
+export const IMPORT_SOURCES: ImportSource[] = ['claude', 'vscode', 'copilotCli', 'gemini'];
 
 /** One config file to read: the key that holds the servers, and whether it belongs to the workspace. */
 interface ConfigFile {
@@ -81,10 +81,13 @@ export function configFiles(o: ImportOptions): ConfigFile[] {
   // ~/.claude.json: user servers, then this project's servers.
   add('claude', 'Claude Code', join(o.home, '.claude.json'), (j) => ({ ...obj(j.mcpServers), ...(o.root ? obj(obj(obj(j.projects)?.[o.root])?.mcpServers) : undefined) }));
   add('copilotCli', 'Copilot CLI', join(o.home, '.copilot', 'mcp-config.json'), (j) => j.mcpServers);
+  add('gemini', 'Gemini CLI', join(o.home, '.gemini', 'config', 'mcp_config.json'), (j) => j.mcpServers);
+  add('gemini', 'Gemini CLI', join(o.home, '.gemini', 'settings.json'), (j) => j.mcpServers);
   add('vscode', 'VS Code', o.vscodeUserDir && join(o.vscodeUserDir, 'mcp.json'), (j) => j.servers);
   // The older Copilot setup keeps servers in the `mcp.servers` setting.
   if (o.vscodeSettingServers) add('vscode', 'VS Code settings', SETTING, (j) => j.servers);
   add('claude', 'Claude Code project', o.root && join(o.root, '.mcp.json'), (j) => j.mcpServers, true);
+  add('gemini', 'Gemini CLI workspace', o.root && join(o.root, '.gemini', 'settings.json'), (j) => j.mcpServers, true);
   add('vscode', 'VS Code workspace', o.root && join(o.root, '.vscode', 'mcp.json'), (j) => j.servers, true);
   return files;
 }

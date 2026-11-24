@@ -27,14 +27,24 @@
           "id": "task-x",
           "title": "task-x",
           "icon": "media/logo-mono.svg"
+        },
+        {
+          "id": "task-x-agents",
+          "title": "task-x Agents",
+          "icon": "media/agents.svg"
+        },
+        {
+          "id": "task-x-terminals",
+          "title": "task-x Terminals",
+          "icon": "media/terminals.svg"
+        },
+        {
+          "id": "task-x-limits",
+          "title": "task-x Limits",
+          "icon": "media/limits.svg"
         }
       ],
       "panel": [
-        {
-          "id": "task-x-activity",
-          "title": "task-x Agents & Terminals",
-          "icon": "media/logo-mono.svg"
-        },
         {
           "id": "task-x-logs",
           "title": "task-x Logs",
@@ -50,18 +60,28 @@
           "name": "Chat"
         }
       ],
-      "task-x-activity": [
+      "task-x-agents": [
         {
           "type": "tree",
           "id": "task-x.agents",
           "name": "Agents",
           "icon": "$(organization)"
-        },
+        }
+      ],
+      "task-x-terminals": [
         {
           "type": "tree",
           "id": "task-x.terminals",
           "name": "Terminals",
           "icon": "$(terminal)"
+        }
+      ],
+      "task-x-limits": [
+        {
+          "type": "webview",
+          "id": "task-x.limits",
+          "name": "Limits",
+          "icon": "$(pulse)"
         }
       ],
       "task-x-logs": [
@@ -536,6 +556,12 @@
         "icon": "$(pulse)"
       },
       {
+        "command": "task-x.limits.refresh",
+        "title": "Refresh",
+        "category": "task-x Limits",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "task-x.bestOf",
         "title": "Best of N: Compare Models on a Task…",
         "category": "task-x",
@@ -556,6 +582,18 @@
         "command": "task-x.showFileGraph",
         "title": "Show in Project Graph",
         "category": "task-x"
+      },
+      {
+        "command": "task-x.openDiagram",
+        "title": "Open Flow Diagram Editor",
+        "category": "task-x",
+        "icon": "$(type-hierarchy-sub)"
+      },
+      {
+        "command": "task-x.generateFlow",
+        "title": "Auto-Generate Flow Diagram",
+        "category": "task-x",
+        "icon": "$(sparkle)"
       }
     ],
     "menus": {
@@ -636,6 +674,11 @@
           "group": "navigation@5"
         },
         {
+          "command": "task-x.openDiagram",
+          "when": "view == task-x.chat",
+          "group": "overflow@11"
+        },
+        {
           "command": "task-x.agents.stopAll",
           "when": "view == task-x.agents && task-x.agentsRunning",
           "group": "navigation@1"
@@ -659,6 +702,11 @@
           "command": "task-x.terminals.refresh",
           "when": "view == task-x.terminals",
           "group": "navigation@3"
+        },
+        {
+          "command": "task-x.limits.refresh",
+          "when": "view == task-x.limits",
+          "group": "navigation@1"
         }
       ],
       "view/item/context": [
@@ -694,7 +742,7 @@
         },
         {
           "command": "task-x.agents.stop",
-          "when": "view == task-x.agents && viewItem =~ /:stop/",
+          "when": "view == task-x.agents && (viewItem =~ /:stop/ || viewItem == 'chat:run')",
           "group": "inline@2"
         },
         {
@@ -734,7 +782,7 @@
         },
         {
           "command": "task-x.agents.stop",
-          "when": "view == task-x.agents && viewItem =~ /:stop/",
+          "when": "view == task-x.agents && (viewItem =~ /:stop/ || viewItem == 'chat:run')",
           "group": "2_act@2"
         },
         {
@@ -1116,7 +1164,7 @@
         },
         "task-x.session.stallMinutes": {
           "type": "number",
-          "default": 30,
+          "default": 60,
           "minimum": 0,
           "maximum": 1440,
           "description": "Stop a request that makes no progress for this many minutes (waiting for your answer, or sleeping until a wake-up or wait_until check, does not count). 0 never stops it."
@@ -1168,14 +1216,16 @@
             "enum": [
               "claude",
               "vscode",
-              "copilotCli"
+              "copilotCli",
+              "gemini"
             ]
           },
           "uniqueItems": true,
           "default": [
             "claude",
             "vscode",
-            "copilotCli"
+            "copilotCli",
+            "gemini"
           ],
           "markdownDescription": "Use the MCP servers you already set up in other tools. `claude`: Claude Desktop, Claude Code (`~/.claude.json`), and the workspace `.mcp.json`. `vscode`: GitHub Copilot in VS Code (the user `mcp.json`, the `mcp.servers` setting, and the workspace `.vscode/mcp.json`). `copilotCli`: `~/.copilot/mcp-config.json`. Workspace files are read only in a trusted workspace. With the Claude Code engine, Claude loads its own servers, so task-x adds only the others.",
           "scope": "machine-overridable"
@@ -1453,6 +1503,7 @@
     "@types/node": "^24.19.2",
     "@types/vscode": "~1.100.0",
     "@vscode/codicons": "^0.0.46-24",
+    "mermaid": "^12.3.0",
     "typescript": "^7.0.2"
   }
 }
