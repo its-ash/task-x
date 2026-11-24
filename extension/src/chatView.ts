@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import * as vscode from 'vscode';
-import { EDIT_MODES, type EditMode, type ProviderRef, activeRef, editMode, effort, sandboxOn, setSandbox, windowChoice, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, setEditMode, toolModels, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setWindowChoice, settings, SECTION } from './config.js';
+import { EDIT_MODES, type EditMode, type ProviderRef, activeRef, editMode, effort, sandboxOn, setSandbox, useTaskXTools, windowChoice, hasApiKey, isProviderKind, isProviderRef, modelFor, nightModels, setEditMode, toolModels, providerConfig, providerConfigWith, providerRefs, refKind, refLabel, refNeedsKey, setWindowChoice, settings, SECTION } from './config.js';
 import {
   type AgentEvent,
   type AgentEventParams,
@@ -3621,6 +3621,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return `Follow these skill instructions for this request:\n\n${blocks}\n\n${body}`;
   }
 
+  /** Generic context hints so any external CLI engine uses task-x's MCP tools and Chrome bridge. */
+  private withTaskXHints(prompt: string, opts: { useTaskTools: boolean; chrome: boolean }): string {
+    let out = prompt;
+    if (opts.useTaskTools) {
+      out +=
+        '\n\n(The `task-x` MCP server is connected for this workspace. Prefer its Rust tools for indexed search, symbol/dependency graph (`find_symbol`, `find_definition`, `find_references`, `get_dependencies`, `search_regex`, `get_file_tree`), project memory (`remember`, `recall`), and safe edits (`read_range`, `replace_text`).)';
+    }
+    if (opts.chrome) {
+      out += '\n\n(Chrome mode is enabled: use the `task-x` MCP `browser` tool to inspect, click, type, screenshot, and navigate in the user\'s Chrome browser.)';
+    }
+    return out;
+  }
+
   /** Runs the request through the Claude Code CLI; follow-ups resume the same Claude session. */
   private async sendClaude(text: string, mode: ChatMode, signal: AbortSignal, setOff: (off: () => void) => void, task = text, images: ImageInput[] = []): Promise<void> {
     const cliPath = findClaude();
@@ -3665,7 +3678,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         subagentModel: claudeSubagentModel(),
         sessionId: sessions[taskId],
         maxBudgetUsd: budget > 0 ? budget : undefined,
-        useTaskTools: c.get<boolean>('claudeCode.useTaskXTools', true),
+        useTaskTools: useTaskXTools(),
         images,
         mcpServers: claudeMcpServers(this.ctx),
         // MCP servers turned off, and task-x tools turned off in the Tools chip (`mcp__task-x__<tool>`).
@@ -3699,10 +3712,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const conversations = this.ctx.workspaceState.get<Record<string, string>>(AGY_CONVERSATIONS_KEY, {});
     const ed = this.editorContext();
     const perms = agyPermissions(mode);
+    const useTaskTools = useTaskXTools();
     let prompt = task;
     if (ed.selection) prompt += `\n\nSelected code in ${ed.selection.path} (lines ${ed.selection.startLine}-${ed.selection.endLine}):\n\`\`\`\n${ed.selection.text}\n\`\`\``;
     else if (ed.activeFile) prompt += `\n\n(Active file: ${ed.activeFile})`;
     if (perms.sandbox === false) prompt += '\n\n(Terminal sandbox is disabled for this session; run commands directly without passing BypassSandbox.)';
+    prompt = this.withTaskXHints(prompt, { useTaskTools, chrome: !!this.chat.chrome });
     prompt = await this.withSkills(client, prompt, [ed.selection?.path, ed.activeFile].filter((p): p is string => !!p));
     const state: { assistant?: Extract<Item, { kind: 'assistant' }> } = {};
     setOff(
@@ -3724,6 +3739,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       model: model === 'default' ? undefined : model,
       conversationId: conversations[taskId],
       effort: effort(),
+      useTaskTools,
+      ...(this.chat.chrome ? { chrome: true } : {}),
       images,
       ...perms,
     };

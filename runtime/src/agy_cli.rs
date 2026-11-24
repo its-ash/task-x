@@ -63,6 +63,12 @@ pub struct Params {
     /// `--sandbox=true` / `--sandbox=false`: syncs agy's terminal restrictions with the extension setting.
     #[serde(default)]
     pub sandbox: Option<bool>,
+    /// Use task-x's Rust MCP server tools (workspace index, graph, memory, safe edits).
+    #[serde(default = "default_true")]
+    pub use_task_tools: bool,
+    /// Chrome mode: drive the user's Chrome via the task-x `browser` MCP tool.
+    #[serde(default)]
+    pub chrome: bool,
     /// Images attached to the prompt; saved to a per-run temp dir passed via `--add-dir`.
     #[serde(default)]
     pub images: Vec<crate::provider::types::ImageInput>,
@@ -70,6 +76,10 @@ pub struct Params {
 
 fn default_mode() -> String {
     "default".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A value passed as a CLI argument: never empty, never read as a flag.
@@ -593,15 +603,28 @@ pub async fn run(host: Host, p: Params, cancel: CancellationToken) -> Result<Val
             prompt.push_str(&format!("\n- {}", path.display()));
         }
     }
-    let mut child = Command::new(&p.cli_path)
-        .args(&cli_args)
+    if p.use_task_tools {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            crate::cli_common::ensure_mcp_server_registered(&home.join(".gemini").join("config").join("mcp_config.json"));
+        }
+    }
+    let mut cmd = Command::new(&p.cli_path);
+    cmd.args(&cli_args)
         .current_dir(&root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("could not start Antigravity: {e}"))?;
+        .kill_on_drop(true);
+    if p.sandbox == Some(false) {
+        cmd.env("TASK_X_SANDBOX", "0");
+    }
+    if p.chrome {
+        cmd.env("TASK_X_CHROME", "1");
+    }
+    if !p.use_task_tools {
+        cmd.env("TASK_X_TOOLS", "0");
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("could not start Antigravity: {e}"))?;
     let mut stdin = child.stdin.take();
     if !write_user(&mut stdin, &prompt).await {
         return Err("could not send the prompt to Antigravity".into());

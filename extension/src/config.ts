@@ -111,6 +111,15 @@ export const nightModels = (): { planner?: NightModel; worker?: NightModel } => 
 export const toolModels = (): { refine?: NightModel; helper?: NightModel } => ({ refine: choice.refineModel, helper: choice.helperModel });
 /** `task-x.sandbox.enabled`: commands run in the OS sandbox (default on). */
 export const sandboxOn = (): boolean => cfg().get<boolean>('sandbox.enabled', true) !== false;
+/** `task-x.useTaskXTools`: give every CLI engine (Claude, Antigravity/Gemini, etc.) task-x's Rust MCP tools (default on). */
+export const useTaskXTools = (): boolean => {
+  const c = cfg();
+  const ins = c.inspect<boolean>('useTaskXTools');
+  if (ins?.workspaceFolderValue !== undefined) return ins.workspaceFolderValue;
+  if (ins?.workspaceValue !== undefined) return ins.workspaceValue;
+  if (ins?.globalValue !== undefined) return ins.globalValue;
+  return c.get<boolean>('claudeCode.useTaskXTools', true) !== false;
+};
 export async function setSandbox(on: boolean): Promise<void> {
   const c = cfg();
   const cur = c.inspect<boolean>('sandbox.enabled');

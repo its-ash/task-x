@@ -149,6 +149,37 @@ impl Drop for ProcTracker {
     }
 }
 
+/// Ensures an external CLI's MCP config file (`mcpServers` JSON map) registers the running
+/// `task-x-runtime --mcp-server` binary under `"task-x"` so any external LLM gets task-x tools.
+pub fn ensure_mcp_server_registered(config_path: &Path) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let exe_str = exe.to_string_lossy().into_owned();
+    let mut root: Value = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !root.is_object() {
+        return;
+    }
+    let servers = root
+        .as_object_mut()
+        .unwrap()
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}));
+    let Some(map) = servers.as_object_mut() else { return };
+    let desired = json!({ "command": exe_str, "args": ["--mcp-server"] });
+    if map.get(crate::mcp_server::SERVER_NAME) == Some(&desired) {
+        return;
+    }
+    map.insert(crate::mcp_server::SERVER_NAME.to_owned(), desired);
+    if let Some(parent) = config_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&root) {
+        let _ = std::fs::write(config_path, text);
+    }
+}
+
 /// A timeline snapshot of the workspace for this run (`timelineSnapshot`); a failure is a warning.
 pub async fn snap(root: &Path, task_id: &str, label: String, host: &Host) {
     let (root, id) = (root.to_path_buf(), task_id.to_owned());

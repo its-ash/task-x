@@ -338,6 +338,10 @@ export interface AgyRunParams {
   effort?: Effort;
   /** `--sandbox`: agy's terminal restrictions. */
   sandbox?: boolean;
+  /** Prefer task-x's Rust MCP tools (index, graph, memory, browser, safe edits). */
+  useTaskTools?: boolean;
+  /** Chrome mode: drive the user's Chrome through the task-x `browser` MCP tool. */
+  chrome?: boolean;
   /** Images attached to the prompt; saved to a temp folder exposed via `--add-dir`. */
   images?: ImageInput[];
 }

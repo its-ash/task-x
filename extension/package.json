@@ -1468,10 +1468,15 @@
           "maximum": 95,
           "description": "Compress the conversation when it uses this percent of the context window: old tool results are shortened first, then earlier turns are summarized."
         },
+        "task-x.useTaskXTools": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Expose task-x's Rust tools (workspace index, symbol/dependency graph, memory, Chrome browser bridge, and safe atomic edits) over the `task-x` MCP server to every external CLI engine (Claude Code, Antigravity/Gemini, etc.). Built-in providers always use them natively."
+        },
         "task-x.claudeCode.useTaskXTools": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "With Claude Code, read, search, and edit files through task-x's Rust tools (served over MCP) instead of Claude Code's own file tools. Shell commands that rewrite files (`python3 - <<EOF`, `python -c`, `sed -i`, `perl -i`, `cat >`, `tee`) are blocked; Bash stays available for builds, tests, and git. Edits keep task-x's checks: workspace-only paths, no secret files, and no edits to files that changed since they were read."
+          "markdownDescription": "Legacy alias for `task-x.useTaskXTools`."
         }
       }
     },
