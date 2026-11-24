@@ -179,12 +179,67 @@
 
   const elk = typeof window.ELK === 'function' ? new window.ELK() : null;
 
+  function resolveOverlaps(nodes, edges, direction) {
+    if (nodes.length < 2) return false;
+    const padX = 36, padY = 32;
+    let anyMoved = false;
+    for (let iter = 0; iter < 50; iter++) {
+      let moved = false;
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          const a = nodes[i], b = nodes[j];
+          const wa = nodeW(a), wb = nodeW(b);
+          const cax = a.x + wa / 2, cay = a.y + NODE_H / 2;
+          const cbx = b.x + wb / 2, cby = b.y + NODE_H / 2;
+          const ox = (wa + wb) / 2 + padX - Math.abs(cax - cbx);
+          const oy = NODE_H + padY - Math.abs(cay - cby);
+          if (ox > 0 && oy > 0) {
+            moved = true;
+            anyMoved = true;
+            const preferY = direction === 'LR' ? oy <= ox * 1.4 : oy < ox * 0.7;
+            if (preferY) {
+              const shift = Math.ceil(oy / 2);
+              if (cay <= cby) { a.y -= shift; b.y += shift; }
+              else { b.y -= shift; a.y += shift; }
+            } else {
+              const shift = Math.ceil(ox / 2);
+              if (cax <= cbx) { a.x -= shift; b.x += shift; }
+              else { b.x -= shift; a.x += shift; }
+            }
+          }
+        }
+      }
+      if (!moved) break;
+    }
+    if (anyMoved) {
+      const minX = Math.min(...nodes.map((n) => n.x));
+      const minY = Math.min(...nodes.map((n) => n.y));
+      const dx = minX < 48 ? 48 - minX : 0;
+      const dy = minY < 48 ? 48 - minY : 0;
+      nodes.forEach((n) => { n.x = Math.round(n.x + dx); n.y = Math.round(n.y + dy); });
+      if (edges) edges.forEach((e) => { e.points = null; });
+    }
+    return anyMoved;
+  }
+
   async function elkLayout(g) {
     if (!elk || !g.nodes.length) return autoLayout(g);
     const nodes = g.nodes.map((n) => ({ ...n, w: nodeW(n) }));
     const nodeIds = new Set(nodes.map((n) => n.id));
     const edges = g.edges.map((e) => ({ ...e, points: null }));
-    const validEdges = edges.filter((e) => nodeIds.has(e.from) && nodeIds.has(e.to) && e.from !== e.to);
+    const elkEdges = [];
+    const edgeIdxByElkId = new Map();
+    edges.forEach((e, idx) => {
+      if (!nodeIds.has(e.from) || !nodeIds.has(e.to) || e.from === e.to) return;
+      const eid = `__e_${idx}`;
+      edgeIdxByElkId.set(eid, idx);
+      elkEdges.push({
+        id: eid,
+        sources: [e.from],
+        targets: [e.to],
+        ...(e.label ? { labels: [{ text: e.label, width: Math.min(200, Math.max(36, e.label.length * 6.8 + 16)), height: 22 }] } : {}),
+      });
+    });
     try {
       const res = await elk.layout({
         id: 'root',
@@ -192,22 +247,19 @@
           'elk.algorithm': 'layered',
           'elk.direction': g.direction === 'TD' ? 'DOWN' : 'RIGHT',
           'elk.edgeRouting': 'ORTHOGONAL',
-          'elk.spacing.nodeNode': '48',
-          'elk.layered.spacing.nodeNodeBetweenLayers': '76',
-          'elk.layered.spacing.edgeNodeBetweenLayers': '32',
-          'elk.layered.spacing.edgeEdgeBetweenLayers': '22',
+          'elk.separateConnectedComponents': 'true',
+          'elk.spacing.componentComponent': '72',
+          'elk.spacing.nodeNode': '64',
+          'elk.layered.spacing.nodeNodeBetweenLayers': '96',
+          'elk.layered.spacing.edgeNodeBetweenLayers': '40',
+          'elk.layered.spacing.edgeEdgeBetweenLayers': '26',
           'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
           'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
           'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
           'elk.padding': '[top=48,left=48,bottom=48,right=48]',
         },
         children: nodes.map((n) => ({ id: n.id, width: nodeW(n), height: NODE_H })),
-        edges: validEdges.map((e) => ({
-          id: e.id,
-          sources: [e.from],
-          targets: [e.to],
-          ...(e.label ? { labels: [{ text: e.label, width: Math.min(200, Math.max(36, e.label.length * 6.8 + 16)), height: 22 }] } : {}),
-        })),
+        edges: elkEdges,
       });
       const posMap = new Map((res.children || []).map((c) => [c.id, c]));
       nodes.forEach((n) => {
@@ -217,14 +269,14 @@
           n.y = Math.round(c.y);
         }
       });
-      const edgeMap = new Map((res.edges || []).map((e) => [e.id, e]));
-      edges.forEach((e) => {
-        const re = edgeMap.get(e.id);
+      (res.edges || []).forEach((re) => {
+        const idx = edgeIdxByElkId.get(re.id);
         const sec = re?.sections?.[0];
-        if (sec?.startPoint && sec?.endPoint) {
-          e.points = [sec.startPoint, ...(sec.bendPoints || []), sec.endPoint].map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }));
+        if (idx != null && sec?.startPoint && sec?.endPoint) {
+          edges[idx].points = [sec.startPoint, ...(sec.bendPoints || []), sec.endPoint].map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }));
         }
       });
+      resolveOverlaps(nodes, edges, g.direction);
       return { direction: g.direction, nodes, edges };
     } catch {
       return autoLayout(g);
@@ -371,6 +423,7 @@
       });
       primary += depths[li] + (horiz ? GAP_X : GAP_Y);
     });
+    resolveOverlaps(nodes, edges, g.direction);
     return { direction: g.direction, nodes, edges };
   }
 
@@ -823,7 +876,15 @@
   });
 
   // Toolbar actions
-  $('autoBtn').addEventListener('click', () => {
+  $('autoBtn').addEventListener('click', async () => {
+    if (graph.nodes.length > 0) {
+      pushUndo();
+      graph = await elkLayout(graph);
+      render();
+      fitToView();
+      setStatus('Refined current flow with ELK');
+      return;
+    }
     vscode.postMessage({ type: 'autoFlow', level: $('autoLevel').value, direction: graph.direction });
   });
   $('aiBtn').addEventListener('click', () => { $('aiPrompt').value = ''; $('aiDialog').showModal(); $('aiPrompt').focus(); });

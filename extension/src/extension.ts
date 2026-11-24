@@ -589,7 +589,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       if (uri instanceof vscode.Uri) {
         try {
           const text = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
-          DiagramPanel.show(ctx, client, sendFromDiagram, text);
+          DiagramPanel.show(ctx, client, sendFromDiagram, text, false, uri);
           return;
         } catch {
           // Fall through to active editor.
@@ -597,8 +597,9 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
       const ed = vscode.window.activeTextEditor;
       const selected = ed && !ed.selection.isEmpty ? ed.document.getText(ed.selection) : '';
-      const fromDoc = ed && /\.(?:mmd|mermaid)$/i.test(ed.document.fileName) ? ed.document.getText() : '';
-      DiagramPanel.show(ctx, client, sendFromDiagram, selected || fromDoc || undefined);
+      const isMmd = !!(ed && /\.(?:mmd|mermaid)$/i.test(ed.document.fileName));
+      const fromDoc = isMmd ? ed.document.getText() : '';
+      DiagramPanel.show(ctx, client, sendFromDiagram, selected || fromDoc || undefined, false, !selected && isMmd ? ed.document.uri : undefined);
     }),
     vscode.commands.registerCommand('task-x.generateFlow', () => DiagramPanel.show(ctx, client, sendFromDiagram, undefined, true)),
     vscode.commands.registerCommand('task-x.showFileGraph', (uri?: vscode.Uri) => {

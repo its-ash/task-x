@@ -41,9 +41,11 @@ export class DiagramPanel {
     onSendToChat?: (text: string, submit?: boolean) => void,
     initialCode?: string,
     autoGenerate = false,
+    initialFile?: vscode.Uri,
   ): void {
     if (DiagramPanel.current) {
       DiagramPanel.current.panel.reveal();
+      if (initialFile) DiagramPanel.current.setCurrentFile(initialFile);
       if (initialCode) DiagramPanel.current.loadCode(initialCode);
       else if (autoGenerate) void DiagramPanel.current.loadAutoFlow('module', 'LR');
       return;
@@ -57,6 +59,7 @@ export class DiagramPanel {
     panel.iconPath = vscode.Uri.joinPath(media, 'icon.png');
     const view = new DiagramPanel(panel, getClient, onSendToChat);
     view.pendingCode = initialCode;
+    if (initialFile) view.setCurrentFile(initialFile);
     DiagramPanel.current = view;
     panel.webview.html = view.html(panel.webview, media);
     const sub = panel.webview.onDidReceiveMessage((m: Inbound) => view.onMessage(m, autoGenerate));
@@ -64,6 +67,11 @@ export class DiagramPanel {
       sub.dispose();
       DiagramPanel.current = undefined;
     });
+  }
+
+  private setCurrentFile(uri: vscode.Uri | undefined): void {
+    this.currentFile = uri;
+    this.panel.title = uri ? `task-x: ${path.basename(uri.fsPath)}` : 'task-x: Flow Editor';
   }
 
   loadCode(code: string): void {
@@ -77,7 +85,7 @@ export class DiagramPanel {
       let text = Buffer.from(bytes).toString('utf8');
       const fenced = /```(?:mermaid|mmd)\s*\r?\n([\s\S]*?)```/i.exec(text);
       if (fenced) text = fenced[1];
-      this.currentFile = uri;
+      this.setCurrentFile(uri);
       this.loadCode(text);
       this.post({ type: 'status', text: `Opened ${vscode.workspace.asRelativePath(uri)}`, busy: false });
     } catch (e) {
@@ -204,7 +212,7 @@ export class DiagramPanel {
           saveLabel: 'Save Flow Diagram',
         });
         if (!uri) return;
-        this.currentFile = uri;
+        this.setCurrentFile(uri);
         const content = uri.fsPath.endsWith('.md') ? `\`\`\`mermaid\n${m.code.trim()}\n\`\`\`\n` : `${m.code.trim()}\n`;
         await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
         this.post({ type: 'status', text: `Saved ${vscode.workspace.asRelativePath(uri)}`, busy: false });
@@ -245,7 +253,7 @@ export class DiagramPanel {
 <body>
 <header class="bar">
   <div class="bar-group">
-    <button type="button" id="autoBtn" class="btn primary" title="Auto-generate flow from workspace modules"><span class="codicon codicon-sparkle" aria-hidden="true"></span><span>Auto Flow</span></button>
+    <button type="button" id="autoBtn" class="btn primary" title="Refine and auto-arrange the opened flow diagram (or generate from workspace when empty)"><span class="codicon codicon-sparkle" aria-hidden="true"></span><span>Auto Flow</span></button>
     <select id="autoLevel" class="select" aria-label="Auto flow scope">
       <option value="module">Modules</option>
       <option value="file">Files</option>

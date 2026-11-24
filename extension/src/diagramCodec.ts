@@ -198,6 +198,42 @@ export function layoutFlow(graph: FlowGraph): FlowGraph {
     }
     primary += layerDepths[li] + (horizontal ? GAP_X : GAP_Y);
   }
+  const padX = 36;
+  const padY = 32;
+  for (let iter = 0; iter < 50; iter++) {
+    let moved = false;
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        const wa = a.w ?? MIN_NODE_W, wb = b.w ?? MIN_NODE_W;
+        const cax = a.x + wa / 2, cay = a.y + NODE_H / 2;
+        const cbx = b.x + wb / 2, cby = b.y + NODE_H / 2;
+        const ox = (wa + wb) / 2 + padX - Math.abs(cax - cbx);
+        const oy = NODE_H + padY - Math.abs(cay - cby);
+        if (ox > 0 && oy > 0) {
+          moved = true;
+          const preferY = horizontal ? oy <= ox * 1.4 : oy < ox * 0.7;
+          if (preferY) {
+            const shift = Math.ceil(oy / 2);
+            if (cay <= cby) { a.y -= shift; b.y += shift; }
+            else { b.y -= shift; a.y += shift; }
+          } else {
+            const shift = Math.ceil(ox / 2);
+            if (cax <= cbx) { a.x -= shift; b.x += shift; }
+            else { b.x -= shift; a.x += shift; }
+          }
+        }
+      }
+    }
+    if (!moved) break;
+  }
+  const minX = Math.min(...nodes.map((n) => n.x));
+  const minY = Math.min(...nodes.map((n) => n.y));
+  if (minX < 48 || minY < 48) {
+    const dx = minX < 48 ? 48 - minX : 0;
+    const dy = minY < 48 ? 48 - minY : 0;
+    for (const n of nodes) { n.x = Math.round(n.x + dx); n.y = Math.round(n.y + dy); }
+  }
   return { direction: graph.direction, nodes, edges };
 }
 
