@@ -623,6 +623,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private lastBrowser: string | undefined;
   private readonly wired = new WeakSet<JsonRpcClient>();
   private changesTimer: NodeJS.Timeout | undefined;
+  /** Coalesces streaming text deltas per tab to cut webview IPC overhead. */
+  private readonly deltaBuf = new Map<string, string>();
+  private deltaTimer: NodeJS.Timeout | undefined;
   /** Approvals for runtime tasks that are not this chat's (background tasks, best-of-N). */
   foreignApproval?: (req: ApprovalRequest) => Promise<{ decision: ApprovalDecision }>;
   /** Called with every finished chat task (review findings, notifications). */
@@ -990,11 +993,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /** Draws the chat again when it is the tab on screen. */
   private renderChat(): void {
+    this.flushDeltas(this.chat.id, false);
     if (this.activeTab === this.chat.id) this.renderTab();
+  }
+
+  /** Flushes buffered streaming text deltas to the webview (or drops them before a full redraw). */
+  private flushDeltas(tabId?: string, emit = true): void {
+    if (tabId !== undefined) {
+      const text = this.deltaBuf.get(tabId);
+      if (text !== undefined) {
+        this.deltaBuf.delete(tabId);
+        if (emit && this.activeTab === tabId) this.post({ type: 'delta', text, tabId });
+      }
+      if (!this.deltaBuf.size && this.deltaTimer) {
+        clearTimeout(this.deltaTimer);
+        this.deltaTimer = undefined;
+      }
+      return;
+    }
+    if (this.deltaTimer) {
+      clearTimeout(this.deltaTimer);
+      this.deltaTimer = undefined;
+    }
+    for (const [id, text] of this.deltaBuf) {
+      if (emit && this.activeTab === id) this.post({ type: 'delta', text, tabId: id });
+    }
+    this.deltaBuf.clear();
+  }
+
+  /** Buffers a streaming delta for the active chat tab and flushes within one frame (~20ms). */
+  private postDelta(text: string): void {
+    const id = this.chat.id;
+    if (this.activeTab !== id || !text) return;
+    this.deltaBuf.set(id, (this.deltaBuf.get(id) ?? '') + text);
+    if (!this.deltaTimer) {
+      this.deltaTimer = setTimeout(() => this.flushDeltas(), 20);
+    }
   }
 
   /** Posts a message about the chat only while its tab is on screen; the tab's items draw it later. */
   private postChat(msg: object): void {
+    this.flushDeltas(this.chat.id);
     if (this.activeTab === this.chat.id) this.post({ ...msg, tabId: this.chat.id });
   }
 
@@ -1039,6 +1078,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   dispose(): void {
     clearInterval(this.nightWatch);
     clearInterval(this.chromeWatch);
+    clearTimeout(this.deltaTimer);
+    this.deltaBuf.clear();
     this.cancelAll();
     this.lanesChanged.dispose();
   }
@@ -2707,7 +2748,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           this.add(state.assistant);
         }
         state.assistant.text += e.text;
-        this.postChat({ type: 'delta', text: e.text });
+        this.postDelta(e.text);
         break;
       case 'assistantMessage': {
         // The whole text of the model turn. When it did not arrive as deltas (a provider that sends
@@ -3831,20 +3872,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <div id="ctx" class="ctx" aria-label="Context sent with the message"></div>
   <div id="attachments" class="attachments" aria-label="Attached images" hidden></div>
   <label for="input" class="sr-only">Message</label>
-  <textarea id="input" rows="1"></textarea>
+  <div id="composerWrap" class="composer-wrap">
+    <div id="inputBackdrop" class="composer-backdrop" aria-hidden="true"></div>
+    <textarea id="input" rows="1" spellcheck="true"></textarea>
+  </div>
   <div class="toolbar" role="toolbar" aria-label="Chat options">
-    <button type="button" id="modelBtn" class="pick"></button>
-    <button type="button" id="agentBtn" class="pick agent-pick"></button>
-    <button type="button" id="nightPlanBtn" class="pick" hidden></button>
-    <button type="button" id="nightLoopBtn" class="pick" hidden></button>
-    <button type="button" id="settingsBtn" class="pick settings-pick"></button>
-    <button type="button" id="effortBtn" class="pick effort-pick"></button>
-    <button type="button" id="mcpBtn" class="pick mcp-pick"></button>
-    <button type="button" id="chromeBtn" class="pick chrome-pick" aria-pressed="true" hidden></button>
+    <div class="toolbar-picks">
+      <button type="button" id="modelBtn" class="pick model-pick"></button>
+      <button type="button" id="agentBtn" class="pick agent-pick"></button>
+      <button type="button" id="nightPlanBtn" class="pick" hidden></button>
+      <button type="button" id="nightLoopBtn" class="pick" hidden></button>
+      <button type="button" id="settingsBtn" class="pick settings-pick"></button>
+      <button type="button" id="effortBtn" class="pick effort-pick"></button>
+      <button type="button" id="mcpBtn" class="pick mcp-pick"></button>
+      <button type="button" id="chromeBtn" class="pick chrome-pick" aria-pressed="true" hidden></button>
+    </div>
     <span class="toolbar-end">
-    <span id="ctxMeter" class="meter" role="meter" aria-valuemin="0" aria-valuemax="100" hidden></span>
-    <button type="button" id="refineBtn" class="action" title="Refine: rewrite the prompt with the routed model (task-x.routing), else the active model. Ctrl+Z restores your text." aria-label="Refine prompt"><span class="codicon codicon-sparkle" aria-hidden="true"></span></button>
-    <button type="button" id="send" class="action primary"></button>
+      <span id="ctxMeter" class="meter" role="meter" aria-valuemin="0" aria-valuemax="100" hidden></span>
+      <button type="button" id="codeBtn" class="action fmt-btn" title="Wrap selection in backticks or insert a code block (Ctrl/Cmd+E)" aria-label="Insert code formatting"><span class="codicon codicon-code" aria-hidden="true"></span></button>
+      <button type="button" id="refineBtn" class="action" title="Refine: rewrite the prompt with the routed model (task-x.routing), else the active model. Ctrl+Z restores your text." aria-label="Refine prompt"><span class="codicon codicon-sparkle" aria-hidden="true"></span></button>
+      <button type="button" id="send" class="action primary"></button>
     </span>
   </div>
 </form>

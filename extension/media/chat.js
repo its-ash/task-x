@@ -3,6 +3,7 @@
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
   const log = $('log'), input = $('input'), send = $('send'), progress = $('progress');
+  const composerWrap = $('composerWrap'), inputBackdrop = $('inputBackdrop'), codeBtn = $('codeBtn');
   const modelBtn = $('modelBtn'), agentBtn = $('agentBtn'), settingsBtn = $('settingsBtn'), effortBtn = $('effortBtn'), mcpBtn = $('mcpBtn'), chromeBtn = $('chromeBtn');
   const nightPlanBtn = $('nightPlanBtn'), nightLoopBtn = $('nightLoopBtn');
   const refineBtn = $('refineBtn');
@@ -62,12 +63,20 @@
     return b;
   };
   const nearBottom = () => log.scrollHeight - log.scrollTop - log.clientHeight < 80;
-  // Sticks to the bottom until the user scrolls up; any later growth of the log keeps it pinned.
-  let stick = true;
-  const scroll = (force) => { if (force) stick = true; if (stick) log.scrollTo({ top: log.scrollHeight, behavior: 'instant' }); };
+  // Sticks to the bottom until the user scrolls up; rAF-coalesced so rapid DOM updates never thrash layout.
+  let stick = true, scrollQueued = false;
+  const scroll = (force) => {
+    if (force) stick = true;
+    if (!stick || scrollQueued) return;
+    scrollQueued = true;
+    requestAnimationFrame(() => {
+      scrollQueued = false;
+      if (stick) log.scrollTop = log.scrollHeight;
+    });
+  };
   log.addEventListener('scroll', () => { stick = nearBottom(); }, { passive: true });
-  const pin = () => scroll();
-  new MutationObserver(pin).observe(log, { childList: true, subtree: true, characterData: true });
+  const pin = () => { if (!replaying && stick) scroll(); };
+  new MutationObserver(pin).observe(log, { childList: true, subtree: true });
   new ResizeObserver(pin).observe(log);
   log.addEventListener('load', pin, true);
   log.addEventListener('toggle', pin, true);
@@ -849,14 +858,14 @@
     if (/^\d+$/.test(m)) return { tag: 'ol', type: '1', start: Number(m) };
     return { tag: 'ol', type: m === m.toUpperCase() ? 'A' : 'a', start: m.toLowerCase().charCodeAt(0) - 96 };
   }
-  function renderMarkdown(container, text) {
-    container.replaceChildren();
+  function renderMarkdown(container, text, streaming = false) {
+    const frag = document.createDocumentFragment();
     const lines = text.replace(/\r\n?/g, '\n').split('\n');
     // Open lists, outermost first: { indent, tag, type, el, li }. A deeper item nests in the last item.
     const stack = [];
     let para = [];
     // Where blocks go: the message, or the card of the section being read.
-    let out = container, ask = false;
+    let out = frag, ask = false;
     const flush = () => { if (para.length) { const p = el('p'); renderInline(p, para.join('\n'), { ask }); out.append(p); para = []; } };
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
@@ -901,7 +910,7 @@
         }
         const code = body.join('\n');
         const lang = fence[2].trim().split(/\s/)[0] || '';
-        if (/^(?:task-x|anvil)-findings$/.test(fence[2].trim())) { container.append(findingsChip(code)); continue; }
+        if (/^(?:task-x|anvil)-findings$/.test(fence[2].trim())) { frag.append(findingsChip(code)); continue; }
         if (isDiagramBlock(lang, code)) {
           out.append(diagramCard(code, closed));
           continue;
@@ -913,7 +922,7 @@
         }), 'Copy');
         head.append(copy);
         const pre = el('pre');
-        pre.append(highlight(code, lang));
+        pre.append(highlight(code, lang, streaming && !closed));
         wrap.append(head, pre);
         out.append(wrap);
         continue;
@@ -958,18 +967,18 @@
       const h = line.match(/^(#{1,6})\s+(.*)$/) || line.match(/^\s*()\*\*([^*\n]{2,80})\*\*:?\s*$/);
       const li = line.match(LIST_ITEM);
       if (h) {
-        flush(); stack.length = 0; out = container; ask = false;
+        flush(); stack.length = 0; out = frag; ask = false;
         const title = h[2].trim().replace(/:$/, '');
         const kind = ASK_HEADING.test(title) ? 'question' : WARN_HEADING.test(title) ? 'warning' : null;
         if (kind) {
           const { card, body } = callout(kind, title);
-          container.append(card);
+          frag.append(card);
           out = body;
           ask = kind === 'question';
         } else {
           const e = el(h[1] ? 'h' + Math.min(6, h[1].length + 2) : 'h4');
           renderInline(e, title);
-          container.append(e);
+          frag.append(e);
         }
       } else if (li) {
         flush();
@@ -1020,6 +1029,7 @@
       } else { stack.length = 0; para.push(line); }
     }
     flush();
+    container.replaceChildren(frag);
   }
   // The cells of a table row: split at | outside `code`, without the outer pipes. \| is a literal pipe.
   function cells(line) {
@@ -1368,19 +1378,33 @@
     });
   }).observe(document.body, { attributes: true, attributeFilter: ['class'] });
 
-  // Syntax highlighting with highlight.js (common languages). Its output escapes all source text,
-  // so the HTML it returns holds only its own <span class="hljs-…"> markup around escaped text.
+  // Syntax highlighting with highlight.js (common languages). Cached by (lang, code) so streaming
+  // re-renders and tab switches never re-run highlight.js on unchanged code blocks.
   const MAX_HIGHLIGHT = 20_000;
+  const MAX_HL_CACHE = 250;
+  const hlCache = new Map();
   const LANG_ALIAS = { sh: 'bash', zsh: 'bash', shell: 'bash', console: 'bash', ts: 'typescript', js: 'javascript', py: 'python', rs: 'rust', yml: 'yaml', md: 'markdown', jsonc: 'json', tsx: 'typescript', jsx: 'javascript' };
-  function highlight(code, lang) {
+  function highlight(code, lang, skipAuto = false) {
     const c = el('code', null, code);
     const hl = window.hljs;
     if (!hl || code.length > MAX_HIGHLIGHT) return c;
-    const name = LANG_ALIAS[lang?.toLowerCase()] || lang?.toLowerCase();
+    const name = LANG_ALIAS[lang?.toLowerCase()] || lang?.toLowerCase() || '';
+    const key = `${name}\0${code}`;
+    const hit = hlCache.get(key);
+    if (hit !== undefined) {
+      if (hit) { c.innerHTML = hit; c.classList.add('hljs'); }
+      return c;
+    }
     try {
-      const res = name && hl.getLanguage(name) ? hl.highlight(code, { language: name, ignoreIllegals: true }) : code.length < 4_000 && code.includes('\n') ? hl.highlightAuto(code) : null;
-      if (res && res.relevance !== 0) {
-        c.innerHTML = res.value;
+      const hasLang = Boolean(name && hl.getLanguage(name));
+      const res = hasLang ? hl.highlight(code, { language: name, ignoreIllegals: true }) : (!skipAuto && code.length < 4_000 && code.includes('\n')) ? hl.highlightAuto(code) : null;
+      const html = res && res.relevance !== 0 ? res.value : '';
+      if (!skipAuto || hasLang) {
+        if (hlCache.size >= MAX_HL_CACHE) hlCache.delete(hlCache.keys().next().value);
+        hlCache.set(key, html);
+      }
+      if (html) {
+        c.innerHTML = html;
         c.classList.add('hljs');
       }
     } catch { /* plain text */ }
@@ -1396,20 +1420,32 @@
     if (n) chip.append(button('link', 'Show', () => vscode.postMessage({ type: 'showProblems' })));
     return chip;
   }
-  // Replies with text not drawn yet. Each is drawn on the next frame even when another row (a tool
-  // call) arrived in between and the reply is no longer `current`; else its last text showed only
-  // after a reload.
+  // Replies with text not drawn yet, coalesced at ~32ms during rapid streaming to keep frames smooth.
   const dirty = new Set();
+  let lastRenderMs = 0;
+  let renderTimer = 0;
+  function flushRender() {
+    renderQueued = false;
+    renderTimer = 0;
+    lastRenderMs = performance.now();
+    for (const r of dirty) if (r.body.isConnected) renderMarkdown(r.body, r.text, r === current);
+    dirty.clear();
+    scroll();
+  }
   function scheduleRender() {
     if (current) dirty.add(current);
-    if (renderQueued) return;
-    renderQueued = true;
-    requestAnimationFrame(() => {
-      renderQueued = false;
-      for (const r of dirty) if (r.body.isConnected) renderMarkdown(r.body, r.text);
-      dirty.clear();
-      scroll();
-    });
+    if (renderQueued || renderTimer) return;
+    const wait = 32 - (performance.now() - lastRenderMs);
+    if (wait <= 0) {
+      renderQueued = true;
+      requestAnimationFrame(flushRender);
+    } else {
+      renderTimer = setTimeout(() => {
+        renderTimer = 0;
+        renderQueued = true;
+        requestAnimationFrame(flushRender);
+      }, wait);
+    }
   }
 
   // ---------- Transcript ----------
@@ -2270,7 +2306,7 @@
       ? 'The agent is sleeping. Enter wakes it with your message; Stop on the tab ends the task.'
       : working ? 'Enter steers the running task. Ctrl+Enter queues the next message. Stop ends the task.' : `${PLACEHOLDER} (Enter to send, Shift+Enter for a new line)`;
   }
-  for (const b of [modelBtn, agentBtn, nightPlanBtn, nightLoopBtn]) { b.setAttribute('aria-haspopup', 'menu'); b.setAttribute('aria-expanded', 'false'); }
+  for (const b of [modelBtn, agentBtn, nightPlanBtn, nightLoopBtn, settingsBtn, effortBtn, mcpBtn]) { b.setAttribute('aria-haspopup', b === settingsBtn || b === effortBtn || b === mcpBtn ? 'dialog' : 'menu'); b.setAttribute('aria-expanded', 'false'); }
 
   // ---------- Context chips: the active file and selection that go with the message ----------
   const ctxRow = $('ctx'), indexBtn = $('indexBtn');
@@ -2815,8 +2851,91 @@
     if (text) { e.preventDefault(); copyText(text); }
   });
 
-  // ---------- Input ----------
-  const autosize = () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, innerHeight * 0.4) + 'px'; };
+  // ---------- Input & live backtick/markdown formatting ----------
+  const FENCE = '```';
+  const fenceOpen = (text) => (text.split(FENCE).length - 1) % 2 === 1;
+  const inlineCodeOpen = (text) => {
+    const clean = text.replace(/```[\s\S]*?(?:```|$)/g, '');
+    return (clean.split('`').length - 1) % 2 === 1;
+  };
+  let lastBackdropVal = null;
+  let lastInputHeight = '';
+  const appendInlineFmt = (frag, line) => {
+    // Highlights `inline code`, **bold**, and /slash @mention #context without changing glyph metrics.
+    const re = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|((?:^|\s)(?:\/[\w.:-]+|@[\w./:-]+|#[\w:.-]+))/g;
+    let last = 0, m;
+    while ((m = re.exec(line))) {
+      if (m.index > last) frag.append(document.createTextNode(line.slice(last, m.index)));
+      if (m[1]) {
+        const inner = m[1].slice(1, -1);
+        frag.append(el('span', 'fmt-tick', '`'), el('span', 'fmt-code', inner), el('span', 'fmt-tick', '`'));
+      } else if (m[2]) {
+        frag.append(el('span', 'fmt-bold', m[2]));
+      } else if (m[3]) {
+        const lead = /^\s/.exec(m[3])?.[0] || '';
+        if (lead) frag.append(document.createTextNode(lead));
+        frag.append(el('span', 'fmt-token', m[3].slice(lead.length)));
+      }
+      last = re.lastIndex;
+    }
+    if (last < line.length) frag.append(document.createTextNode(line.slice(last)));
+  };
+  const syncBackdropScroll = () => {
+    if (!inputBackdrop) return;
+    inputBackdrop.scrollTop = input.scrollTop;
+    inputBackdrop.scrollLeft = input.scrollLeft;
+  };
+  const syncCodeBtn = () => {
+    if (!codeBtn) return;
+    const before = input.value.slice(0, input.selectionStart);
+    codeBtn.classList.toggle('active', fenceOpen(before) || inlineCodeOpen(before));
+  };
+  const syncBackdrop = () => {
+    if (!inputBackdrop || !composerWrap) return;
+    const val = input.value;
+    const hasRich = val.length > 0 && val.length <= 24_000 && /[`*/@#]/.test(val);
+    composerWrap.classList.toggle('rich', hasRich);
+    if (!hasRich) {
+      if (lastBackdropVal !== '') { inputBackdrop.replaceChildren(); lastBackdropVal = ''; }
+      syncCodeBtn();
+      return;
+    }
+    if (val === lastBackdropVal) { syncCodeBtn(); return; }
+    lastBackdropVal = val;
+    const frag = document.createDocumentFragment();
+    const lines = val.split('\n');
+    let inFence = false;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const f = /^(\s*)(`{3,}|~{3,})(.*)$/.exec(line);
+      if (f) {
+        if (f[1]) frag.append(document.createTextNode(f[1]));
+        frag.append(el('span', 'fmt-fence', f[2]));
+        if (f[3]) frag.append(el('span', 'fmt-lang', f[3]));
+        inFence = !inFence;
+      } else if (inFence) {
+        if (line) frag.append(el('span', 'fmt-block', line));
+      } else {
+        appendInlineFmt(frag, line);
+      }
+      if (i < lines.length - 1) frag.append(document.createTextNode('\n'));
+    }
+    if (val.endsWith('\n')) frag.append(document.createTextNode('\u200b'));
+    inputBackdrop.replaceChildren(frag);
+    syncBackdropScroll();
+    syncCodeBtn();
+  };
+  const autosize = () => {
+    input.style.height = 'auto';
+    const next = Math.min(input.scrollHeight, innerHeight * 0.4) + 'px';
+    if (next !== lastInputHeight) { lastInputHeight = next; }
+    input.style.height = next;
+    if (inputBackdrop) inputBackdrop.style.height = next;
+    syncBackdrop();
+  };
+  input.addEventListener('scroll', syncBackdropScroll, { passive: true });
+  input.addEventListener('keyup', syncCodeBtn);
+  input.addEventListener('click', syncCodeBtn);
   // Enter steers a running task (or sends when idle); Ctrl/Cmd+Enter queues the message for after it.
   // The button stops a running task.
   let queueNext = false;
@@ -3241,12 +3360,19 @@
   });
 
   // A code block in the prompt: typing ``` at a line start adds the closing fence and puts the caret inside.
-  // Enter inside an open block adds a line; Ctrl/Cmd+Enter still sends.
-  const FENCE = '```';
-  const fenceOpen = (text) => (text.split(FENCE).length - 1) % 2 === 1;
+  // Enter inside an open block adds a line (preserving indentation); Ctrl/Cmd+Enter still sends.
   input.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
-    if (!(e.ctrlKey || e.metaKey) && fenceOpen(input.value.slice(0, input.selectionStart))) return;
+    const before = input.value.slice(0, input.selectionStart);
+    if (!(e.ctrlKey || e.metaKey) && fenceOpen(before)) {
+      const curLine = before.slice(before.lastIndexOf('\n') + 1);
+      const indent = /^[ \t]+/.exec(curLine)?.[0] || '';
+      if (indent) {
+        e.preventDefault();
+        insert(`\n${indent}`, 1 + indent.length);
+      }
+      return;
+    }
     e.preventDefault();
     queueNext = e.ctrlKey || e.metaKey;
     $('form').requestSubmit();
@@ -3261,8 +3387,42 @@
     input.setSelectionRange(start + caretFrom, start + caretTo);
     autosize();
   };
+  const wrapWithBackticks = () => {
+    input.focus();
+    const { value: v, selectionStart: s, selectionEnd: t } = input;
+    const sel = v.slice(s, t);
+    const lineHead = v.slice(v.lastIndexOf('\n', s - 1) + 1, s);
+    if (sel) {
+      if (sel.includes('\n')) return insert(`${lineHead ? '\n' : ''}${FENCE}\n${sel.replace(/\n$/, '')}\n${FENCE}\n`, (lineHead ? 1 : 0) + FENCE.length);
+      return insert(`\`${sel}\``, 1, 1 + sel.length);
+    }
+    if (!lineHead.trim()) return insert(`${FENCE}\n\n${FENCE}`, FENCE.length + 1);
+    return insert('``', 1);
+  };
+  codeBtn?.addEventListener('click', wrapWithBackticks);
   input.addEventListener('keydown', (e) => {
-    if (e.key !== '`' || e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.isComposing) return;
+    // Ctrl/Cmd+E wraps selection in backticks or inserts a code block.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'e') {
+      e.preventDefault();
+      return wrapWithBackticks();
+    }
+    // Tab inside a fenced code block inserts two spaces instead of leaving the input.
+    if (e.key === 'Tab' && !e.ctrlKey && !e.metaKey && !e.altKey && !slashOpen && fenceOpen(input.value.slice(0, input.selectionStart))) {
+      e.preventDefault();
+      return insert('  ', 2);
+    }
+    // Backspace between empty paired backticks `` removes both cleanly.
+    if (e.key === 'Backspace' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      const { value: v, selectionStart: s, selectionEnd: t } = input;
+      if (s === t && s > 0 && v[s - 1] === '`' && v[s] === '`') {
+        e.preventDefault();
+        input.setSelectionRange(s - 1, s + 1);
+        return insert('', 0);
+      }
+      return;
+    }
+    if (e.key !== '`' || e.ctrlKey || e.metaKey || e.altKey) return;
     const { value: v, selectionStart: s, selectionEnd: t } = input;
     const sel = v.slice(s, t);
     const lineHead = v.slice(v.lastIndexOf('\n', s - 1) + 1, s);
@@ -3352,9 +3512,14 @@
         for (const it of m.items) if (it.kind === 'lane') lanes.set(it.taskId, it);
         const start = pageStart(m.items);
         older = m.items.slice(0, start);
-        replaying = true;
-        m.items.slice(start).forEach(renderItem);
-        replaying = false;
+        const frag = document.createDocumentFragment();
+        sink = frag; replaying = true;
+        try {
+          m.items.slice(start).forEach(renderItem);
+        } finally {
+          sink = log; replaying = false;
+        }
+        log.append(frag);
         renderBoard();
         // A tab drawn while its answer streams keeps the last message open for the text still to come.
         if (!m.streaming) current = null;
@@ -3394,7 +3559,7 @@
       case 'changes': renderChanges(m.files); break;
       case 'item': renderItem(m.item); scroll(); break;
       // A delta with no reply on screen (a row came in between) starts one, so no text is lost.
-      case 'delta': if (!current) renderItem({ kind: 'assistant', text: '' }); current.text += m.text; liveTokens(m.text); scheduleRender(); scroll(); break;
+      case 'delta': if (!current) renderItem({ kind: 'assistant', text: '' }); current.text += m.text; liveTokens(m.text); scheduleRender(); break;
       case 'toolDone': {
         const row = log.querySelector(`.row.tool[data-id="${CSS.escape(m.id)}"]`);
         if (row) {
